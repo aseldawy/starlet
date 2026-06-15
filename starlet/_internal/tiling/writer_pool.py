@@ -20,12 +20,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import shapely
 from shapely import from_wkb
 
 from .utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
+
+# Per-geometry bounding-box "covering" columns written alongside each tile so
+# that the on-demand tile server can prune row groups and rows at read time
+# (pyarrow predicate pushdown) instead of decoding the whole partition.
+BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
+
+# Rows per Parquet row group.  Tiles are spatially sorted (Z-order) before
+# writing, so bounding the row-group size makes each row group spatially
+# coherent — its min/max bbox statistics become a tight filter the reader can
+# use to skip row groups that don't intersect a requested tile.
+DEFAULT_ROW_GROUP_SIZE = 16384
 
 # ------------------------- Sorting configuration -------------------------
 
@@ -86,62 +99,68 @@ def _maybe_sort_and_bbox(
     sort_keys: List[SortKey],
     sfc_bits: int,
     global_extent: Optional[Tuple[float, float, float, float]],
-) -> Tuple[Tuple[float, float, float, float], pa.Table]:
-    """Compute bounding box and optionally sort rows by Z-order or columns."""
+) -> Tuple[Tuple[float, float, float, float], pa.Table, np.ndarray]:
+    """Compute the tile bbox, optionally sort rows, and return per-row bounds.
+
+    Returns ``(bbox, table, per_row_bounds)`` where ``per_row_bounds`` is an
+    ``(N, 4)`` float64 array of ``[xmin, ymin, xmax, ymax]`` aligned with the
+    rows of the **returned** (possibly sorted) table; rows with no geometry are
+    ``NaN``.  The aggregate bbox and per-row bounds come from a single
+    vectorised ``shapely.bounds`` call (no per-geometry Python loop).
+    """
+    N = tbl.num_rows
     geoms = from_wkb(tbl[geom_col].to_numpy(zero_copy_only=False))
+    per = shapely.bounds(geoms)  # (N, 4), NaN rows for None/empty geometries
+    per = np.asarray(per, dtype=np.float64).reshape(N, 4)
+    valid = np.isfinite(per[:, 0])
 
-    minx = np.inf; miny = np.inf; maxx = -np.inf; maxy = -np.inf
-    has_geom = False
-    centers_x = []; centers_y = []
-
-    for g in geoms:
-        if g is None or g.is_empty:
-            continue
-        bxmin, bymin, bxmax, bymax = g.bounds
-        minx, miny = min(minx, bxmin), min(miny, bymin)
-        maxx, maxy = max(maxx, bxmax), max(maxy, bymax)
-        c = g.centroid
-        centers_x.append(float(c.x))
-        centers_y.append(float(c.y))
-        has_geom = True
-
-    if not has_geom:
+    if not valid.any():
         bbox = (np.inf, np.inf, -np.inf, -np.inf)
-        return bbox, tbl
+        return bbox, tbl, per
 
-    bbox = (float(minx), float(miny), float(maxx), float(maxy))
+    bbox = (
+        float(np.nanmin(per[:, 0])), float(np.nanmin(per[:, 1])),
+        float(np.nanmax(per[:, 2])), float(np.nanmax(per[:, 3])),
+    )
 
     if sort_mode == SortMode.NONE:
-        return bbox, tbl
+        return bbox, tbl, per
 
     if sort_mode == SortMode.COLUMNS:
         if not sort_keys:
-            return bbox, tbl
-        spec = [{"column": sk.column, "order": "ascending" if sk.ascending else "descending"}
-                for sk in sort_keys]
+            return bbox, tbl, per
+        spec = [(sk.column, "ascending" if sk.ascending else "descending") for sk in sort_keys]
         logger.debug("Sorting by columns: %s", spec)
-        return bbox, tbl.sort_by(spec)
+        order = np.asarray(pc.sort_indices(tbl, sort_keys=spec), dtype=np.int64)
+        return bbox, tbl.take(pa.array(order, type=pa.int64())), per[order]
 
     if sort_mode in (SortMode.ZORDER, SortMode.HILBERT):
-        cx = np.asarray(centers_x, dtype=np.float64)
-        cy = np.asarray(centers_y, dtype=np.float64)
+        cen = shapely.centroid(geoms)
+        cx = np.nan_to_num(shapely.get_x(cen), nan=0.0)
+        cy = np.nan_to_num(shapely.get_y(cen), nan=0.0)
         gxmin, gymin, gxmax, gymax = global_extent or bbox
 
         X = _scale_to_uint(cx, gxmin, gxmax, sfc_bits)
         Y = _scale_to_uint(cy, gymin, gymax, sfc_bits)
         z = _interleave_bits_2d(X, Y, sfc_bits)
 
-        N = tbl.num_rows
         max_code = np.uint64((1 << (2 * min(sfc_bits, 31))) - 1)
-        zfull = np.full(N, max_code, dtype=np.uint64)
-        valid_idx = [i for i, g in enumerate(geoms) if g and not g.is_empty]
-        if valid_idx:
-            zfull[np.asarray(valid_idx, dtype=np.int64)] = z
+        zfull = np.where(valid, z, max_code).astype(np.uint64, copy=False)
         order = np.argsort(zfull, kind="mergesort")
         logger.debug(f"Sorting {N} rows by Z-order (sfc_bits={sfc_bits})")
-        return bbox, tbl.take(pa.array(order, type=pa.int64()))
+        return bbox, tbl.take(pa.array(order, type=pa.int64())), per[order]
 
-    return bbox, tbl
+    return bbox, tbl, per
+
+
+def _append_bbox_columns(tbl: pa.Table, per_bounds: np.ndarray) -> pa.Table:
+    """Append the per-row bbox covering columns used for read-time pruning."""
+    if tbl.num_rows == 0:
+        return tbl
+    for i, name in enumerate(BBOX_COLS):
+        col = pa.array(np.ascontiguousarray(per_bounds[:, i], dtype=np.float64), type=pa.float64())
+        tbl = tbl.append_column(name, col)
+    return tbl
 
 
 def _with_updated_geo_metadata(tbl: pa.Table, bbox: Tuple[float, float, float, float]) -> pa.Table:
@@ -179,7 +198,7 @@ def _finalize_one_tile(tile_id: int, batches: List[pa.Table], config: _WriterPoo
         logger.debug(f"[{label}] Dropping internal column 'geo_parquet_tile_num'")
         full = full.drop(["geo_parquet_tile_num"])
 
-    bbox, full = _maybe_sort_and_bbox(
+    bbox, full, per_bounds = _maybe_sort_and_bbox(
         full,
         geom_col=config.geom_col,
         sort_mode=config.sort_mode,
@@ -187,6 +206,7 @@ def _finalize_one_tile(tile_id: int, batches: List[pa.Table], config: _WriterPoo
         sfc_bits=config.sfc_bits,
         global_extent=config.global_extent,
     )
+    full = _append_bbox_columns(full, per_bounds)
     full = _with_updated_geo_metadata(full, bbox)
     minx, miny, maxx, maxy = bbox
     safe = lambda v: f"{v:.6f}".replace(".", "_")
@@ -195,8 +215,15 @@ def _finalize_one_tile(tile_id: int, batches: List[pa.Table], config: _WriterPoo
     filename = f"{label}__{bbox_str}.parquet"
     out_path = os.path.join(config.outdir, filename)
 
+    # Bound the row-group size so a spatially-sorted tile is split into several
+    # spatially-coherent row groups; combined with the bbox columns this lets
+    # the server skip row groups that don't intersect a requested tile.
+    write_kwargs = dict(config.pq_args)
+    if full.num_rows:
+        write_kwargs.setdefault("row_group_size", min(full.num_rows, DEFAULT_ROW_GROUP_SIZE))
+
     logger.info(f"[{label}] Writing to disk → {out_path}")
-    pq.write_table(full, out_path, compression=config.compression, **config.pq_args)
+    pq.write_table(full, out_path, compression=config.compression, **write_kwargs)
     logger.debug(f"[{label}] Flush complete, rows={full.num_rows}")
     return out_path
 

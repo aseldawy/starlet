@@ -5,27 +5,38 @@ bounding box is parsed from the filename to enable fast MBR intersection
 filtering without reading file metadata.
 
 On-the-fly tile generation only needs the geometries that fall inside the
-requested tile.  This module therefore:
+requested tile.  Two layers of pruning make that cheap:
 
-  1. parses every partition's filename bbox once, at construction time;
-  2. caches decoded partitions (in their native CRS) in a small LRU so that
-     consecutive tile requests over the same area avoid re-reading the file;
-  3. spatially pre-filters a partition to the tile's bbox *before* the
-     expensive reprojection / validity-repair steps run.
+  1. **Partition pruning** — the filename bbox selects which partitions can
+     intersect a tile (``find_intersecting_files``).
+  2. **Row-group + row pruning** — tiles written by the current tiling stage
+     carry per-row bbox "covering" columns (``_bbox_*``) and are split into
+     spatially-coherent row groups.  ``load_and_reproject`` then uses pyarrow
+     predicate pushdown to read only the row groups and rows whose bbox
+     overlaps the tile, decoding a handful of geometries instead of the whole
+     partition.
 
-That last step turns per-tile cost from O(partition size) into
-O(geometries actually inside the tile), which is the difference between
-multi-second and millisecond on-demand tiles for dense datasets.
+Older tiles without the ``_bbox_*`` columns fall back to a cached full read +
+in-memory bbox pre-filter, so the server stays correct on legacy datasets.
 """
 from __future__ import annotations
 
+import json
+import logging
 from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import geopandas as gpd
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+logger = logging.getLogger(__name__)
 
 BBox = Tuple[float, float, float, float]
+
+# Per-row bbox covering columns written by the tiling stage (see writer_pool).
+BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 
 
 def parse_parquet_bbox(fname: str) -> Optional[BBox]:
@@ -60,11 +71,12 @@ def bbox_intersects(a: BBox, b: BBox) -> bool:
 
 
 class ParquetIndex:
-    """Spatial index over GeoParquet tiles with partition-level caching.
+    """Spatial index over GeoParquet tiles with read-time pruning.
 
-    Filename bounding boxes are parsed once at construction.  Decoded
-    partitions are kept in a bounded LRU cache (``partition_cache_size``) so
-    that panning/zooming within one region does not re-read the same file.
+    Filename bounding boxes are parsed once at construction.  For legacy tiles
+    (no bbox columns) decoded partitions are kept in a bounded LRU cache
+    (``partition_cache_size``) so panning/zooming in one region does not
+    re-read the file.
     """
 
     def __init__(self, folder: Path, partition_cache_size: int = 4) -> None:
@@ -78,6 +90,8 @@ class ParquetIndex:
         self._partition_cache_size = partition_cache_size
         # key -> (native GeoDataFrame, cached per-geometry bounds DataFrame)
         self._partition_cache: "OrderedDict[str, Tuple[gpd.GeoDataFrame, object]]" = OrderedDict()
+        # key -> (column_names, geometry_column, has_bbox_columns)
+        self._schema_cache: dict = {}
 
     # Kept for backward compatibility with callers that used the static helper.
     parse_parquet_bbox = staticmethod(parse_parquet_bbox)
@@ -86,11 +100,38 @@ class ParquetIndex:
         """Partitions whose filename bbox overlaps ``bbox_4326`` (WGS84)."""
         return [pf for pf, pbbox in self._entries if bbox_intersects(pbbox, bbox_4326)]
 
+    # ------------------------------------------------------------------ schema
+
+    def _schema_info(self, path: Path):
+        """Return ``(names, geometry_column, has_bbox)`` for a partition (cached)."""
+        key = str(path)
+        info = self._schema_cache.get(key)
+        if info is not None:
+            return info
+        schema = pq.ParquetFile(path).schema_arrow
+        names = list(schema.names)
+        has_bbox = all(c in names for c in BBOX_COLS)
+        geom_col = "geometry"
+        if geom_col not in names:
+            geom_col = names[-1] if names else "geometry"
+            meta = schema.metadata or {}
+            raw = meta.get(b"geo")
+            if raw:
+                try:
+                    geom_col = json.loads(raw).get("primary_column", geom_col)
+                except Exception:
+                    pass
+        info = (names, geom_col, has_bbox)
+        self._schema_cache[key] = info
+        return info
+
+    # ------------------------------------------------------------------ reads
+
     def _read_native(self, path: Path):
         """Read a partition in its native CRS (defaulting to EPSG:4326).
 
-        Returns ``(gdf, bounds_df)`` where ``bounds_df`` is the per-geometry
-        envelope used for spatial pre-filtering.  Results are LRU-cached.
+        Returns ``(gdf, bounds_df)`` with a per-geometry envelope for spatial
+        pre-filtering.  Used for legacy tiles; results are LRU-cached.
         """
         if self._partition_cache_size <= 0:
             gdf = gpd.read_parquet(path)
@@ -114,15 +155,47 @@ class ParquetIndex:
             self._partition_cache.popitem(last=False)
         return entry
 
-    def load_and_reproject(self, path: Path, bbox_4326: Optional[BBox] = None) -> gpd.GeoDataFrame:
-        """Load a partition in EPSG:3857, optionally pre-filtered to a tile.
+    def _pushdown_read(self, path: Path, geom_col: str, bbox_4326: BBox) -> gpd.GeoDataFrame:
+        """Read only rows whose bbox overlaps ``bbox_4326``, reprojected to 3857.
 
-        When ``bbox_4326`` is given, geometries whose envelope does not overlap
-        the tile bbox are dropped *before* reprojection, so only the handful of
-        geometries inside the tile are ever reprojected and repaired.  The
-        result is identical to filtering after reprojection (the downstream
-        clip is exact); it is only much cheaper.
+        Uses pyarrow predicate pushdown on the ``_bbox_*`` columns; row groups
+        whose statistics miss the tile are skipped entirely.
         """
+        minx, miny, maxx, maxy = bbox_4326
+        flt = (
+            (pc.field("_bbox_xmax") >= minx)
+            & (pc.field("_bbox_xmin") <= maxx)
+            & (pc.field("_bbox_ymax") >= miny)
+            & (pc.field("_bbox_ymin") <= maxy)
+        )
+        table = pq.read_table(path, filters=flt)
+        drop = [c for c in BBOX_COLS if c in table.column_names]
+        if drop:
+            table = table.drop(drop)
+        df = table.to_pandas()
+        if geom_col not in df.columns or len(df) == 0:
+            return gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=4326))
+        geom = gpd.GeoSeries.from_wkb(df[geom_col].to_numpy(), crs=4326)
+        gdf = gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geom, crs=4326)
+        return gdf.to_crs(3857)
+
+    def load_and_reproject(self, path: Path, bbox_4326: Optional[BBox] = None) -> gpd.GeoDataFrame:
+        """Load a partition in EPSG:3857, pruned to ``bbox_4326`` when given.
+
+        When the tile carries ``_bbox_*`` columns this uses pyarrow row-group +
+        row pushdown (cost ~ geometries in the tile).  Otherwise it falls back
+        to a cached full read plus an in-memory bbox pre-filter.  Both paths
+        produce identical geometry sets — the downstream clip is exact.
+        """
+        if bbox_4326 is not None:
+            try:
+                _, geom_col, has_bbox = self._schema_info(path)
+            except Exception:
+                has_bbox = False
+                geom_col = "geometry"
+            if has_bbox:
+                return self._pushdown_read(path, geom_col, bbox_4326)
+
         gdf, bounds = self._read_native(path)
         if bbox_4326 is not None and len(gdf):
             minx, miny, maxx, maxy = bbox_4326
@@ -133,6 +206,9 @@ class ParquetIndex:
                 | (bounds["miny"] > maxy)
             )
             gdf = gdf.loc[mask]
+        drop = [c for c in BBOX_COLS if c in gdf.columns]
+        if drop:
+            gdf = gdf.drop(columns=drop)
         if len(gdf) and gdf.crs is not None and gdf.crs.to_epsg() != 3857:
             gdf = gdf.to_crs(3857)
         return gdf

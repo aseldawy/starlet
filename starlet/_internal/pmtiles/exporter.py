@@ -96,13 +96,29 @@ def export_to_pmtiles(
 
     logger.info(f"Found {len(tiles)} tiles to export")
 
+    # Compress each tile to match the codec declared in the header. The pmtiles
+    # Writer stores bytes verbatim, so callers must compress: a header that
+    # declares GZIP while storing raw MVT yields a malformed archive that clients
+    # fail to decode.
+    def _compress(raw: bytes) -> bytes:
+        if comp == Compression.GZIP:
+            import gzip
+            return gzip.compress(raw)
+        if comp == Compression.ZSTD:
+            import zstandard
+            return zstandard.ZstdCompressor().compress(raw)
+        if comp == Compression.BROTLI:
+            import brotli
+            return brotli.compress(raw)
+        return raw  # Compression.NONE
+
     # Write PMTiles archive
     with open(output_path, "wb") as f:
         writer = Writer(f)
 
         for z, x, y, data in sorted(tiles):
             tileid = zxy_to_tileid(z, x, y)
-            writer.write_tile(tileid, data)
+            writer.write_tile(tileid, _compress(data))
 
         # Header with tile type and compression
         header = {

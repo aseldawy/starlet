@@ -124,6 +124,13 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/MyDataset/0/0/0.m
 > Bind to `127.0.0.1` so only the local Apache (next section) can reach it. Use
 > `--host 0.0.0.0` only if you intend to expose the port directly.
 
+> **Restart after changing datasets.** The server builds its spatial index
+> (`ParquetIndex`) once, when a dataset is first requested, and caches it. If you
+> add a dataset or rebuild a dataset's `parquet_tiles/` while the server is
+> running, **restart `serve`** (or re-run `serve_start.sh` after `pkill -f
+> "starlet serve"`) so the new files are picked up — otherwise on-the-fly tiles
+> for the changed dataset come back empty.
+
 ## 5. Expose it behind Apache without root (CGI bridge)
 
 `mod_wsgi` and `ProxyPass` both require editing the Apache vhost (root). If you
@@ -229,7 +236,8 @@ map.addLayer({
 | Symptom | Cause / Fix |
 |---|---|
 | `No geometries sampled to build RSGrove index` | Wrong geometry column — pass `--geom-col wkb_geometry` (or rename to `geometry`). |
-| Map shows only the basemap; tiles are empty (`15 b`, 0 features) at mid zooms | Sparse pyramid — rebuild MVTs with a low `--threshold` (e.g. `1`) so all zooms are populated. Restart `serve` afterwards to drop cached empty tiles. |
+| Map shows only the basemap; tiles are empty (`15 b`, 0 features) at mid zooms | Either a sparse pyramid (rebuild MVTs with a low `--threshold`, e.g. `1`) **or** a stale index: the server built its `ParquetIndex` before `parquet_tiles/` was fully in place. **Restart `serve`** after the dataset directory is complete. |
+| On-the-fly tiles (beyond the pre-generated zooms) are empty even though `parquet_tiles/` exist | Stale `ParquetIndex` — restart `serve` (the index is built once at startup; files added afterward aren't seen). |
 | Blank beyond a certain zoom | Viewer source `maxzoom` is higher than the pre-generated pyramid. Set `maxzoom` to the pyramid's max so MapLibre overzooms instead of requesting missing tiles. |
 | `Failed to construct 'Request': Failed to parse URL …/{z}/{x}/{y}.mvt` | Tile URL is relative — make it absolute (`window.location.origin + …`). |
 | Browser shows stale behavior after an edit | Bump a cache-buster on JS/CSS (`view.js?v=N`) or hard-reload. |

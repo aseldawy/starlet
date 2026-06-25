@@ -15,6 +15,7 @@ from shapely.geometry import (
 )
 from pyproj import Transformer
 
+from starlet._internal.progress import iter_with_progress
 from starlet._internal.tiling.datasource import GeoParquetSource
 
 logger = logging.getLogger(__name__)
@@ -259,7 +260,12 @@ def build_histograms_for_dir(
             for split_group in split_groups
         }
 
-        for f in as_completed(futures):
+        for f in iter_with_progress(
+            as_completed(futures),
+            total=len(futures),
+            logger=logger,
+            label="histogram",
+        ):
             tile_outputs.append(f.result())
 
     _sum_all_tiles(tile_outputs, outdir_p, dtype=dtype)

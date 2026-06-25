@@ -3,8 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import errno
+import gc
 import heapq
 import logging
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -22,19 +25,34 @@ from starlet._internal.tiling.writer_pool import (
     _finalize_one_tile,
 )
 from starlet._internal.stats import write_attribute_stats, AttributeStatsCollector
+from starlet._internal.progress import iter_with_progress
 
 logger = logging.getLogger(__name__)
 
 _TILE_COL = "_tile_id"
+_MIN_MERGE_FAN_IN = 16
+_OPEN_FILE_RESERVE = 32
 
 
 @dataclass(frozen=True)
 class _ShardManifest:
+    """Summary returned by one assignment-stage worker.
+
+    The parent process uses these manifests to stitch mapper output files into
+    reducer work queues and to aggregate assignment-stage accounting.
+    """
+    # Index of the source split this mapper processed; useful for tracing files
+    # back to the split directory that produced them.
     split_index: int
+    # Input accounting reported to the assignment-stage log line.
     rows_read: int
     rows_assigned: int
     batches_read: int
+    # Reducer id -> sorted parquet file for this split. Each file contains only
+    # rows owned by that reducer and is already sorted by tile id for k-way merge.
     intermediate_by_reducer: Dict[int, str]
+    # Optional per-split attribute stats; the parent merges these after all
+    # mapper workers finish so stats are collected without re-reading input.
     stats: Optional[AttributeStatsCollector] = None
 
 
@@ -47,27 +65,19 @@ def _executor_class(kind: str):
     raise ValueError(f"executor must be 'process' or 'thread' (got {kind!r})")
 
 
-def _partition_table_to_values(partition_table) -> List[int]:
-    if isinstance(partition_table, pa.Table):
-        if partition_table.num_columns != 1:
-            raise ValueError("partition table must have exactly one column")
-        return [int(value) for value in partition_table.column(0).to_pylist()]
-    return [int(value) for value in partition_table.to_pylist()]
-
-
-def _table_with_partition_column(original_table: pa.Table, partition_table) -> pa.Table:
-    pid_values = _partition_table_to_values(partition_table)
-    if len(pid_values) != original_table.num_rows:
+def _table_with_partition_column(original_table: pa.Table, partition_table: pa.Table) -> pa.Table:
+    if partition_table.num_columns != 1:
+        raise ValueError("partition table must have exactly one column")
+    if partition_table.num_rows != original_table.num_rows:
         raise ValueError(
             "partition assignment row count does not match input table: "
-            f"{len(pid_values)} != {original_table.num_rows}"
+            f"{partition_table.num_rows} != {original_table.num_rows}"
         )
-
     if _TILE_COL in original_table.column_names:
-        original_table = original_table.drop([_TILE_COL])
+        raise ValueError(f"input table already contains internal column {_TILE_COL!r}")
     return original_table.append_column(
         _TILE_COL,
-        pa.array(pid_values, type=pa.int64()),
+        partition_table.column(0).cast(pa.int64()),
     )
 
 
@@ -105,33 +115,86 @@ def _iter_partition_groups(path: str, batch_size: int = 64_000) -> Iterator[Tupl
         current_tables = []
         return result
 
-    for batch in parquet_file.iter_batches(batch_size=batch_size):
-        table = pa.Table.from_batches([batch])
-        partition_ids = table[_TILE_COL].to_pylist()
-        if not partition_ids:
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            table = pa.Table.from_batches([batch])
+            partition_ids = table[_TILE_COL].to_pylist()
+            if not partition_ids:
+                continue
+
+            run_start = 0
+            while run_start < len(partition_ids):
+                partition_id = int(partition_ids[run_start])
+                run_end = run_start + 1
+                while run_end < len(partition_ids) and int(partition_ids[run_end]) == partition_id:
+                    run_end += 1
+
+                if current_partition is not None and partition_id != current_partition:
+                    flushed = flush_current()
+                    if flushed is not None:
+                        yield flushed
+
+                current_partition = partition_id
+                current_tables.append(
+                    table.slice(run_start, run_end - run_start)
+                )
+                run_start = run_end
+
+        flushed = flush_current()
+        if flushed is not None:
+            yield flushed
+    finally:
+        close = getattr(parquet_file, "close", None)
+        if close is not None:
+            close()
+
+
+def _is_too_many_open_files_error(error: BaseException) -> bool:
+    if not isinstance(error, OSError):
+        return False
+    if error.errno == errno.EMFILE:
+        return True
+    return "Too many open files" in str(error) or "errno 24" in str(error)
+
+
+def _open_file_soft_limit() -> Optional[int]:
+    try:
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, OSError, ValueError):
+        return None
+
+    if soft_limit == resource.RLIM_INFINITY:
+        return None
+    return int(soft_limit)
+
+
+def _current_open_file_count() -> int:
+    for fd_dir in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return len(os.listdir(fd_dir))
+        except OSError:
             continue
+    return 0
 
-        run_start = 0
-        while run_start < len(partition_ids):
-            partition_id = int(partition_ids[run_start])
-            run_end = run_start + 1
-            while run_end < len(partition_ids) and int(partition_ids[run_end]) == partition_id:
-                run_end += 1
 
-            if current_partition is not None and partition_id != current_partition:
-                flushed = flush_current()
-                if flushed is not None:
-                    yield flushed
+def _default_merge_fan_in(num_inputs: int) -> int:
+    if num_inputs <= 1:
+        return max(0, num_inputs)
 
-            current_partition = partition_id
-            current_tables.append(
-                table.slice(run_start, run_end - run_start)
-            )
-            run_start = run_end
+    soft_limit = _open_file_soft_limit()
+    if soft_limit is None:
+        return min(num_inputs, 128)
 
-    flushed = flush_current()
-    if flushed is not None:
-        yield flushed
+    available = soft_limit - _current_open_file_count() - _OPEN_FILE_RESERVE
+    if available <= 0:
+        return min(num_inputs, 2)
+
+    fan_in = int(available * 0.75)
+    if available >= _MIN_MERGE_FAN_IN:
+        fan_in = max(_MIN_MERGE_FAN_IN, fan_in)
+    return max(2, min(num_inputs, fan_in))
 
 
 def _merge_sorted_partition_files(
@@ -174,6 +237,106 @@ def _merge_sorted_partition_files(
             writer.close()
 
     return output_path
+
+
+def _iter_merged_partition_groups(input_paths: Sequence[str]) -> Iterator[Tuple[int, List[pa.Table]]]:
+    iterators = [iter(_iter_partition_groups(path)) for path in input_paths]
+    heap: List[Tuple[int, int, pa.Table]] = []
+
+    for iterator_id, iterator in enumerate(iterators):
+        try:
+            partition_id, table = next(iterator)
+        except StopIteration:
+            continue
+        heapq.heappush(heap, (partition_id, iterator_id, table))
+
+    current_partition: Optional[int] = None
+    current_tables: List[pa.Table] = []
+
+    while heap:
+        partition_id, iterator_id, table = heapq.heappop(heap)
+        if current_partition is not None and partition_id != current_partition:
+            yield current_partition, current_tables
+            current_tables = []
+
+        current_partition = partition_id
+        current_tables.append(table)
+
+        try:
+            next_partition_id, next_table = next(iterators[iterator_id])
+        except StopIteration:
+            continue
+        heapq.heappush(heap, (next_partition_id, iterator_id, next_table))
+
+    if current_partition is not None and current_tables:
+        yield current_partition, current_tables
+
+
+def _merge_sorted_partition_files_to_fan_in(
+    input_paths: Sequence[str],
+    compression: Optional[str],
+    temp_dir: str,
+    max_fan_in: Optional[int] = None,
+) -> List[str]:
+    paths = list(input_paths)
+    if not paths:
+        return []
+
+    fan_in = max_fan_in if max_fan_in is not None else _default_merge_fan_in(len(paths))
+    fan_in = max(2, min(len(paths), fan_in))
+    if len(paths) <= fan_in:
+        return paths
+
+    merge_dir = Path(temp_dir)
+    merge_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Merging %d sorted partition files with fan-in %d",
+        len(paths),
+        fan_in,
+    )
+
+    attempt = 0
+    while True:
+        level = 0
+        level_paths = paths
+        attempt_dir = merge_dir / f"attempt_{attempt:02d}_fan_in_{fan_in:04d}"
+        try:
+            while len(level_paths) > fan_in:
+                next_paths: List[str] = []
+                level_dir = attempt_dir / f"level_{level:02d}"
+                level_dir.mkdir(parents=True, exist_ok=True)
+
+                for chunk_start in range(0, len(level_paths), fan_in):
+                    chunk = level_paths[chunk_start:chunk_start + fan_in]
+                    chunk_path = level_dir / f"run_{len(next_paths):06d}.parquet"
+                    merged = _merge_sorted_partition_files(chunk, str(chunk_path), compression)
+                    if merged is not None:
+                        next_paths.append(merged)
+
+                logger.info(
+                    "Merge level %d reduced %d files to %d files",
+                    level,
+                    len(level_paths),
+                    len(next_paths),
+                )
+                level_paths = next_paths
+                level += 1
+
+            if not level_paths:
+                return []
+            return level_paths
+        except OSError as error:
+            if not _is_too_many_open_files_error(error) or fan_in <= 2:
+                raise
+            next_fan_in = max(2, fan_in // 2)
+            logger.warning(
+                "Merge fan-in %d exceeded open file limit; retrying with fan-in %d",
+                fan_in,
+                next_fan_in,
+            )
+            fan_in = next_fan_in
+            attempt += 1
+            gc.collect()
 
 
 def _assignment_stage_worker(
@@ -252,16 +415,43 @@ def _reduce_stage_worker(
     written: List[str] = []
     reducer_dir = Path(temp_dir) / f"reducer_{reducer_id:06d}"
     reducer_dir.mkdir(parents=True, exist_ok=True)
-    merged_path = reducer_dir / f"reducer_{reducer_id:06d}_merged.parquet"
+    merge_runs_dir = reducer_dir / "merge_runs"
 
-    merged = _merge_sorted_partition_files(intermediate_paths, str(merged_path), config.compression)
-    if merged is None:
-        return written
+    fan_in = _default_merge_fan_in(len(intermediate_paths))
+    attempt = 0
+    while True:
+        merge_inputs = _merge_sorted_partition_files_to_fan_in(
+            intermediate_paths,
+            config.compression,
+            str(merge_runs_dir / f"final_attempt_{attempt:02d}"),
+            max_fan_in=fan_in,
+        )
+        if not merge_inputs:
+            return written
 
-    for partition_id, table in _iter_partition_groups(merged):
-        written.append(_finalize_one_tile(partition_id, [table], config))
+        try:
+            for partition_id, tables in _iter_merged_partition_groups(merge_inputs):
+                written.append(_finalize_one_tile(partition_id, tables, config))
+            return written
+        except OSError as error:
+            if (
+                not _is_too_many_open_files_error(error)
+                or fan_in <= 2
+                or written
+            ):
+                raise
+            next_fan_in = max(2, fan_in // 2)
+            logger.warning(
+                "Reducer %d final merge fan-in %d exceeded open file limit; "
+                "retrying with fan-in %d",
+                reducer_id,
+                fan_in,
+                next_fan_in,
+            )
+            fan_in = next_fan_in
+            attempt += 1
+            gc.collect()
 
-    return written
 
 
 class TwoStageOrchestrator:
@@ -408,7 +598,12 @@ class TwoStageOrchestrator:
                 )
                 for split_index, split in enumerate(splits)
             ]
-            for future in as_completed(futures):
+            for future in iter_with_progress(
+                as_completed(futures),
+                total=len(futures),
+                logger=logger,
+                label="two-stage-orchestrator: map",
+            ):
                 manifests.append(future.result())
 
         intermediate_by_reducer: Dict[int, List[str]] = defaultdict(list)
@@ -471,7 +666,12 @@ class TwoStageOrchestrator:
                 executor.submit(_reduce_stage_worker, reducer_id, paths, config, str(temp_root)): reducer_id
                 for reducer_id, paths in intermediate_by_reducer.items()
             }
-            for future in as_completed(futures):
+            for future in iter_with_progress(
+                as_completed(futures),
+                total=len(futures),
+                logger=logger,
+                label="two-stage-orchestrator: reduce",
+            ):
                 reducer_id = futures[future]
                 try:
                     future.result()

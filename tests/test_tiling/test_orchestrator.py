@@ -10,11 +10,13 @@ Tests cover:
 Note: These are template tests. The actual implementation may vary.
 Adapt based on the real orchestrator API.
 """
+import errno
 import pytest
 from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 
+import starlet._internal.tiling.two_stage_orchestrator as two_stage_module
 from starlet._internal.tiling import (
     GeoParquetSource,
     RSGroveAssigner,
@@ -102,6 +104,30 @@ class TestRoundOrchestrator:
 
 class TestTwoStageOrchestrator:
     """Test the two-stage split assignment/write orchestrator."""
+
+    def test_merge_fan_in_retries_on_open_file_limit(self, monkeypatch, temp_dir):
+        input_paths = [str(temp_dir / f"input_{index:02d}.parquet") for index in range(9)]
+        observed_chunk_sizes = []
+
+        def fake_merge(chunk, output_path, compression):
+            observed_chunk_sizes.append(len(chunk))
+            if len(chunk) > 2:
+                raise OSError(errno.EMFILE, "Too many open files")
+            Path(output_path).touch()
+            return output_path
+
+        monkeypatch.setattr(two_stage_module, "_default_merge_fan_in", lambda _: 8)
+        monkeypatch.setattr(two_stage_module, "_merge_sorted_partition_files", fake_merge)
+
+        result = two_stage_module._merge_sorted_partition_files_to_fan_in(
+            input_paths,
+            compression=None,
+            temp_dir=str(temp_dir / "merge_runs"),
+        )
+
+        assert observed_chunk_sizes[:3] == [8, 4, 2]
+        assert len(result) == 2
+        assert all(Path(path).exists() for path in result)
 
     def test_two_stage_orchestrator_writes_all_rows(self, sample_parquet_file, sample_polygons, temp_dir):
         source = GeoParquetSource(str(sample_parquet_file))

@@ -1,0 +1,1357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Starlet Map Runtime</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <link
+    href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+    rel="stylesheet"
+  />
+
+  <style>
+    html, body, #map {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #08101f;
+      overflow: hidden;
+      font-family: Inter, system-ui, sans-serif;
+    }
+
+    .hud-left {
+      position: absolute;
+      left: 14px;
+      top: 14px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: 640px;
+      pointer-events: none;
+    }
+
+    .hud-right {
+      position: absolute;
+      right: 14px;
+      bottom: 14px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: min(340px, calc(100vw - 28px));
+      pointer-events: none;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      width: fit-content;
+      max-width: 100%;
+      background: rgba(10, 15, 32, 0.92);
+      color: #dce8ff;
+      border: 1px solid rgba(140, 167, 224, 0.24);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+      pointer-events: auto;
+    }
+
+    .panel {
+      background: rgba(10, 15, 32, 0.90);
+      color: #dce8ff;
+      border: 1px solid rgba(140, 167, 224, 0.24);
+      border-radius: 14px;
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      backdrop-filter: blur(8px);
+      white-space: pre-wrap;
+      pointer-events: auto;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.24);
+    }
+
+    .legend {
+      display: none;
+    }
+
+    .legend.visible {
+      display: block;
+    }
+
+    .legend-title {
+      font-size: 13px;
+      font-weight: 700;
+      margin: 0 0 10px 0;
+      color: #eef4ff;
+    }
+
+    .legend-subtitle {
+      font-size: 11px;
+      color: #9eb6df;
+      margin: -4px 0 10px 0;
+    }
+
+    .legend-list {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .legend-row {
+      display: grid;
+      grid-template-columns: 18px 1fr;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .legend-swatch {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      border: 1px solid rgba(255, 255, 255, 0.20);
+      box-sizing: border-box;
+      flex: 0 0 auto;
+    }
+
+    .legend-line {
+      width: 18px;
+      height: 0;
+      border-top-width: 3px;
+      border-top-style: solid;
+      border-radius: 999px;
+      box-sizing: border-box;
+    }
+
+    .legend-point {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      margin-left: 2px;
+      box-sizing: border-box;
+    }
+
+    .legend-label {
+      color: #dce8ff;
+      font-size: 12px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .legend-gradient {
+      margin-top: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .legend-gradient-bar {
+      width: 100%;
+      height: 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+    }
+
+    .legend-gradient-scale {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: #dce8ff;
+      font-size: 11px;
+    }
+
+    .legend-note {
+      margin-top: 8px;
+      font-size: 11px;
+      color: #9eb6df;
+      line-height: 1.4;
+    }
+
+    .maplibregl-popup-content {
+      background: #0f1730;
+      color: #eef4ff;
+      border: 1px solid rgba(140, 167, 224, 0.24);
+      border-radius: 12px;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
+      padding: 10px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      max-width: 340px;
+    }
+
+    .maplibregl-popup-anchor-top .maplibregl-popup-tip,
+    .maplibregl-popup-anchor-top-left .maplibregl-popup-tip,
+    .maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+      border-bottom-color: #0f1730;
+    }
+
+    .maplibregl-popup-anchor-bottom .maplibregl-popup-tip,
+    .maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,
+    .maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+      border-top-color: #0f1730;
+    }
+
+    .maplibregl-popup-anchor-left .maplibregl-popup-tip {
+      border-right-color: #0f1730;
+    }
+
+    .maplibregl-popup-anchor-right .maplibregl-popup-tip {
+      border-left-color: #0f1730;
+    }
+
+    .popup-title {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .popup-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 6px 10px;
+      align-items: start;
+    }
+
+    .popup-key {
+      color: #9eb6df;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .popup-value {
+      color: #eef4ff;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="hud-left">
+    <div class="chip" id="datasetChip">Dataset: none</div>
+    <div class="panel" id="statusPanel">Map runtime starting…</div>
+  </div>
+
+  <div class="hud-right">
+    <div class="panel legend" id="legendPanel">
+      <div class="legend-title" id="legendTitle">Legend</div>
+      <div class="legend-subtitle" id="legendSubtitle"></div>
+      <div id="legendBody"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script>
+    const runtimeState = {
+      dataset: "",
+      sourceLayer: "layer0",
+      style: null,
+      sourceId: "starlet-source",
+      layerId: "starlet-layer",
+      managedLayerIds: [],
+      managedSourceIds: [],
+      lastScript: "",
+      defaultCenter: [-98.5795, 39.8283],
+      defaultZoom: 3.2,
+      fittedDataset: "",
+      lastTileUrl: "",
+      currentPopup: null,
+      datasetStats: null,
+      popupInstalled: false
+    };
+
+    const datasetChip = document.getElementById("datasetChip");
+    const statusPanel = document.getElementById("statusPanel");
+    const legendPanel = document.getElementById("legendPanel");
+    const legendTitleEl = document.getElementById("legendTitle");
+    const legendSubtitleEl = document.getElementById("legendSubtitle");
+    const legendBodyEl = document.getElementById("legendBody");
+
+    const map = new maplibregl.Map({
+      container: "map",
+      style: {
+        version: 8,
+        glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
+        sources: {
+          "osm-base": {
+            type: "raster",
+            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            tileSize: 256,
+            attribution: "© OpenStreetMap contributors"
+          }
+        },
+        layers: [
+          {
+            id: "osm-base",
+            type: "raster",
+            source: "osm-base"
+          }
+        ]
+      },
+      center: runtimeState.defaultCenter,
+      zoom: runtimeState.defaultZoom,
+      minZoom: 0,
+      maxZoom: 20,
+      hash: false
+    });
+
+    map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+    function postToParent(type, payload) {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type, payload }, window.location.origin);
+      }
+    }
+
+    function setStatus(message) {
+      statusPanel.textContent = message;
+      console.log("[map runtime]", message);
+      postToParent("starlet:runtime-log", { message });
+    }
+
+    function setRuntimeError(message) {
+      console.error("[map runtime error]", message);
+      statusPanel.textContent = `ERROR: ${message}`;
+      postToParent("starlet:runtime-error", { message });
+    }
+
+    function setDatasetChip(dataset) {
+      datasetChip.textContent = `Dataset: ${dataset || "none"}`;
+    }
+
+    function qs(name) {
+      return new URLSearchParams(window.location.search).get(name);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function clonePlain(value) {
+      if (value == null) return value;
+      if (typeof structuredClone === "function") return structuredClone(value);
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function safeGetState() {
+      return {
+        dataset: runtimeState.dataset,
+        sourceLayer: runtimeState.sourceLayer,
+        sourceId: runtimeState.sourceId,
+        layerId: runtimeState.layerId,
+        managedLayerIds: [...runtimeState.managedLayerIds],
+        managedSourceIds: [...runtimeState.managedSourceIds],
+        lastScript: runtimeState.lastScript,
+        defaultCenter: [...runtimeState.defaultCenter],
+        defaultZoom: runtimeState.defaultZoom,
+        fittedDataset: runtimeState.fittedDataset,
+        lastTileUrl: runtimeState.lastTileUrl,
+        style: clonePlain(runtimeState.style),
+        datasetStats: clonePlain(runtimeState.datasetStats)
+      };
+    }
+
+    function inferGeometryKind(style) {
+      const kind = String(style?.geometry_kind || "").trim().toLowerCase();
+      if (kind === "polygon" || kind === "line" || kind === "point") return kind;
+
+      const styleType = String(style?.style_type || "").toLowerCase();
+      if (styleType.includes("fill")) return "polygon";
+      if (styleType.includes("line")) return "line";
+      if (styleType.includes("circle")) return "point";
+
+      return inferGeometryKindFromStats(runtimeState.datasetStats);
+    }
+
+    function inferGeometryKindFromStats(stats) {
+      const attrs = Array.isArray(stats?.attributes) ? stats.attributes : [];
+      for (const attr of attrs) {
+        const geomTypes = attr?.stats?.geom_types;
+        if (!geomTypes) continue;
+        const joined = Object.keys(geomTypes).join(" ").toLowerCase();
+        if (joined.includes("line")) return "line";
+        if (joined.includes("polygon")) return "polygon";
+        if (joined.includes("point")) return "point";
+      }
+      return "polygon";
+    }
+
+    function getLayerType(style) {
+      const kind = inferGeometryKind(style);
+      if (kind === "line") return "line";
+      if (kind === "point") return "circle";
+      return "fill";
+    }
+
+    function getTileUrl(dataset) {
+      return `${window.location.origin}/${encodeURIComponent(dataset)}/{z}/{x}/{y}.mvt`;
+    }
+
+    function getProbeTileUrl(dataset, z = 0, x = 0, y = 0) {
+      return `${window.location.origin}/${encodeURIComponent(dataset)}/${z}/${x}/${y}.mvt`;
+    }
+
+    async function getDatasetStats(dataset) {
+      const url = `${window.location.origin}/api/datasets/${encodeURIComponent(dataset)}/stats`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        throw new Error(`Stats request failed for ${dataset}: HTTP ${resp.status}`);
+      }
+      return await resp.json();
+    }
+
+    function inferBoundsFromStats(stats) {
+      const attrs = Array.isArray(stats?.attributes) ? stats.attributes : [];
+      for (const attr of attrs) {
+        const mbr = attr?.stats?.mbr;
+        if (!Array.isArray(mbr) || mbr.length !== 4) continue;
+
+        const [minx, miny, maxx, maxy] = mbr.map(Number);
+        if (
+          Number.isFinite(minx) &&
+          Number.isFinite(miny) &&
+          Number.isFinite(maxx) &&
+          Number.isFinite(maxy) &&
+          minx < maxx &&
+          miny < maxy
+        ) {
+          return [[minx, miny], [maxx, maxy]];
+        }
+      }
+      return null;
+    }
+
+    async function probeTileUrl(dataset) {
+      const candidates = [
+        [0, 0, 0],
+        [1, 0, 0],
+        [2, 1, 1],
+        [3, 2, 3]
+      ];
+
+      for (const [z, x, y] of candidates) {
+        const probeUrl = getProbeTileUrl(dataset, z, x, y);
+        try {
+          const resp = await fetch(probeUrl, { method: "GET" });
+          if (resp.ok) {
+            const buf = await resp.arrayBuffer();
+            setStatus(
+              `Tile probe OK\n` +
+              `dataset=${dataset}\n` +
+              `url=${probeUrl}\n` +
+              `bytes=${buf.byteLength}\n` +
+              `source-layer=${runtimeState.sourceLayer}`
+            );
+            return { url: probeUrl, z, x, y, byteLength: buf.byteLength };
+          }
+        } catch (err) {
+          // keep probing
+        }
+      }
+
+      throw new Error(`Could not fetch any sample tile for dataset "${dataset}"`);
+    }
+
+    function removeLayerIfExists(id) {
+      if (id && map.getLayer(id)) {
+        map.removeLayer(id);
+      }
+    }
+
+    function removeSourceIfExists(id) {
+      if (id && map.getSource(id)) {
+        map.removeSource(id);
+      }
+    }
+
+    function clearManagedLayers() {
+      const ids = [...runtimeState.managedLayerIds];
+      for (let i = ids.length - 1; i >= 0; i--) {
+        removeLayerIfExists(ids[i]);
+      }
+      runtimeState.managedLayerIds = [];
+    }
+
+    function clearManagedSources() {
+      const ids = [...runtimeState.managedSourceIds];
+      for (let i = ids.length - 1; i >= 0; i--) {
+        removeSourceIfExists(ids[i]);
+      }
+      runtimeState.managedSourceIds = [];
+    }
+
+    function clearDatasetSources() {
+      removeSourceIfExists(runtimeState.sourceId);
+      if (runtimeState.dataset) {
+        removeSourceIfExists(runtimeState.dataset);
+      }
+    }
+
+    function resetManagedMapObjects() {
+      clearManagedLayers();
+      clearManagedSources();
+      clearDatasetSources();
+    }
+
+    function addManagedSource(id, spec) {
+      if (!id || map.getSource(id)) return;
+      map.addSource(id, spec);
+      runtimeState.managedSourceIds.push(id);
+    }
+
+    function addVectorSourceIfMissing(sourceId, tileUrl) {
+      if (map.getSource(sourceId)) return;
+
+      map.addSource(sourceId, {
+        type: "vector",
+        tiles: [tileUrl],
+        minzoom: 0,
+        maxzoom: 20
+      });
+    }
+
+    function ensureDatasetSources(dataset) {
+      const tileUrl = getTileUrl(dataset);
+      runtimeState.lastTileUrl = tileUrl;
+
+      addVectorSourceIfMissing(runtimeState.sourceId, tileUrl);
+
+      if (dataset && dataset !== runtimeState.sourceId) {
+        addVectorSourceIfMissing(dataset, tileUrl);
+      }
+
+      return runtimeState.sourceId;
+    }
+
+    function normalizeColorArray(colors, fallback) {
+      if (Array.isArray(colors) && colors.length) return colors;
+      return fallback;
+    }
+
+    function formatLegendValue(value) {
+      if (value == null || value === "") return "N/A";
+      if (typeof value === "number") {
+        if (Number.isInteger(value)) return String(value);
+        return Number(value).toLocaleString(undefined, { maximumFractionDigits: 3 });
+      }
+      const n = Number(value);
+      if (Number.isFinite(n) && String(value).trim() !== "") {
+        if (Number.isInteger(n)) return n.toLocaleString();
+        return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+      }
+      return String(value);
+    }
+
+    function buildGradientCss(colors) {
+      const used = normalizeColorArray(colors, ["#4f83ff"]);
+      if (used.length === 1) return used[0];
+      const parts = used.map((c, i) => {
+        const pct = (i / Math.max(used.length - 1, 1)) * 100;
+        return `${c} ${pct}%`;
+      });
+      return `linear-gradient(90deg, ${parts.join(", ")})`;
+    }
+
+    function getLegendMarkerClass(geometryKind) {
+      if (geometryKind === "line") return "legend-line";
+      if (geometryKind === "point") return "legend-point";
+      return "legend-swatch";
+    }
+
+    function getLegendMarkerStyle(geometryKind, color) {
+      if (geometryKind === "line") return `border-top-color:${color};`;
+      if (geometryKind === "point") return `background:${color};`;
+      return `background:${color};`;
+    }
+
+    function clearLegend() {
+      legendTitleEl.textContent = "Legend";
+      legendSubtitleEl.textContent = "";
+      legendBodyEl.innerHTML = "";
+      legendPanel.classList.remove("visible");
+    }
+
+    function renderLegend(style) {
+      const renderer = style?.renderer || {};
+      const mode = String(renderer.mode || "single").toLowerCase();
+      const geometryKind = inferGeometryKind(style);
+      const title = String(style?.legend_title || style?.target_attribute || "Legend").trim();
+      const attribute = String(renderer.attribute || style?.target_attribute || "").trim();
+
+      if (!style) {
+        clearLegend();
+        return;
+      }
+
+      legendTitleEl.textContent = title || "Legend";
+      legendSubtitleEl.textContent = attribute ? `Attribute: ${attribute}` : "";
+      legendBodyEl.innerHTML = "";
+
+      if (mode === "categorical") {
+        const stops = Array.isArray(renderer.stops) ? renderer.stops : [];
+        if (!stops.length) {
+          clearLegend();
+          return;
+        }
+
+        const rows = stops.map(stop => {
+          const color = String(stop?.color || renderer.fallback_color || "#4f83ff");
+          const label = stop?.label ?? stop?.value ?? "Value";
+          const markerClass = getLegendMarkerClass(geometryKind);
+          const markerStyle = getLegendMarkerStyle(geometryKind, color);
+          return `
+            <div class="legend-row">
+              <div class="${markerClass}" style="${markerStyle}"></div>
+              <div class="legend-label">${escapeHtml(formatLegendValue(label))}</div>
+            </div>
+          `;
+        }).join("");
+
+        const fallbackNote = renderer.fallback_color
+          ? `<div class="legend-note">Other values use fallback color ${escapeHtml(String(renderer.fallback_color))}.</div>`
+          : "";
+
+        legendBodyEl.innerHTML = `<div class="legend-list">${rows}</div>${fallbackNote}`;
+        legendPanel.classList.add("visible");
+        return;
+      }
+
+      if (mode === "gradient") {
+        const colors = normalizeColorArray(
+          renderer.colors,
+          geometryKind === "line"
+            ? ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#a50f15"]
+            : ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"]
+        );
+
+        const minLabel = formatLegendValue(renderer.min ?? "min");
+        const maxLabel = formatLegendValue(renderer.max ?? "max");
+
+        legendBodyEl.innerHTML = `
+          <div class="legend-gradient">
+            <div class="legend-gradient-bar" style="background:${buildGradientCss(colors)};"></div>
+            <div class="legend-gradient-scale">
+              <span>${escapeHtml(minLabel)}</span>
+              <span>${escapeHtml(maxLabel)}</span>
+            </div>
+          </div>
+        `;
+        legendPanel.classList.add("visible");
+        return;
+      }
+
+      const singleColor = String(renderer.color || style?.color_theme?.colors?.[0] || "#4f83ff");
+      const markerClass = getLegendMarkerClass(geometryKind);
+      const markerStyle = getLegendMarkerStyle(geometryKind, singleColor);
+
+      legendBodyEl.innerHTML = `
+        <div class="legend-list">
+          <div class="legend-row">
+            <div class="${markerClass}" style="${markerStyle}"></div>
+            <div class="legend-label">${escapeHtml(attribute || title || "Styled features")}</div>
+          </div>
+        </div>
+      `;
+      legendPanel.classList.add("visible");
+    }
+
+    function buildGradientExpression(attribute, min, max, colors) {
+      const safeMin = Number.isFinite(Number(min)) ? Number(min) : 0;
+      const safeMax = Number.isFinite(Number(max)) ? Number(max) : 1;
+      const usedColors = Array.isArray(colors) && colors.length ? colors : ["#4f83ff"];
+
+      const expr = ["interpolate", ["linear"], ["to-number", ["get", attribute], safeMin]];
+
+      if (usedColors.length === 1 || safeMax === safeMin) {
+        expr.push(safeMin, usedColors[0], safeMax, usedColors[usedColors.length - 1]);
+        return expr;
+      }
+
+      const step = (safeMax - safeMin) / (usedColors.length - 1);
+      usedColors.forEach((color, idx) => {
+        expr.push(safeMin + step * idx, color);
+      });
+      return expr;
+    }
+
+    function buildCategoricalExpression(attribute, stops, fallbackColor) {
+      const expr = ["match", ["to-string", ["get", attribute]]];
+      for (const stop of (Array.isArray(stops) ? stops : [])) {
+        expr.push(String(stop.value), String(stop.color));
+      }
+      expr.push(String(fallbackColor || "#4f83ff"));
+      return expr;
+    }
+
+    function buildPaint(style) {
+      const renderer = style?.renderer || {};
+      const mode = String(renderer.mode || "single");
+      const geometryKind = inferGeometryKind(style);
+      const opacity = Number(style?.opacity ?? 0.85);
+      const strokeWidth = Number(style?.stroke_width ?? 1.5);
+      const radius = Number(style?.radius ?? 4.0);
+      const attribute = String(renderer.attribute || style?.target_attribute || "").trim();
+
+      if (geometryKind === "polygon") {
+        const fillPaint = {
+          "fill-opacity": opacity,
+          "fill-outline-color": "#1e2a44"
+        };
+
+        if (mode === "categorical" && attribute) {
+          fillPaint["fill-color"] = buildCategoricalExpression(
+            attribute,
+            renderer.stops,
+            renderer.fallback_color || "#4f83ff"
+          );
+          return fillPaint;
+        }
+
+        if (mode === "gradient" && attribute) {
+          const colors = normalizeColorArray(
+            renderer.colors,
+            ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"]
+          );
+          fillPaint["fill-color"] = buildGradientExpression(attribute, renderer.min, renderer.max, colors);
+          return fillPaint;
+        }
+
+        fillPaint["fill-color"] = String(renderer.color || "#4f83ff");
+        return fillPaint;
+      }
+
+      if (geometryKind === "line") {
+        const linePaint = {
+          "line-opacity": opacity,
+          "line-width": strokeWidth,
+          "line-color": String(renderer.color || "#ff7f50")
+        };
+
+        if (mode === "categorical" && attribute) {
+          linePaint["line-color"] = buildCategoricalExpression(
+            attribute,
+            renderer.stops,
+            renderer.fallback_color || "#ff7f50"
+          );
+        } else if (mode === "gradient" && attribute) {
+          const colors = normalizeColorArray(
+            renderer.colors,
+            ["#fee5d9", "#fcae91", "#fb6a4a", "#de2d26", "#a50f15"]
+          );
+          linePaint["line-color"] = buildGradientExpression(attribute, renderer.min, renderer.max, colors);
+        }
+
+        return linePaint;
+      }
+
+      const circlePaint = {
+        "circle-opacity": opacity,
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          3, Math.max(2, radius * 0.7),
+          10, radius,
+          20, Math.max(radius + 2, radius * 1.35)
+        ],
+        "circle-stroke-width": 0.8,
+        "circle-stroke-color": "#0b1020",
+        "circle-color": String(renderer.color || "#4f83ff")
+      };
+
+      if (mode === "categorical" && attribute) {
+        circlePaint["circle-color"] = buildCategoricalExpression(
+          attribute,
+          renderer.stops,
+          renderer.fallback_color || "#4f83ff"
+        );
+      } else if (mode === "gradient" && attribute) {
+        const colors = normalizeColorArray(
+          renderer.colors,
+          ["#f7fbff", "#c6dbef", "#6baed6", "#2171b5", "#08306b"]
+        );
+        circlePaint["circle-color"] = buildGradientExpression(attribute, renderer.min, renderer.max, colors);
+      }
+
+      return circlePaint;
+    }
+
+    function buildFallbackPaint(layerType) {
+      if (layerType === "line") {
+        return {
+          "line-color": "#ff7f50",
+          "line-width": 2.2,
+          "line-opacity": 0.95
+        };
+      }
+      if (layerType === "circle") {
+        return {
+          "circle-color": "#4f83ff",
+          "circle-radius": 5,
+          "circle-opacity": 0.95,
+          "circle-stroke-color": "#0b1020",
+          "circle-stroke-width": 0.8
+        };
+      }
+      return {
+        "fill-color": "#4f83ff",
+        "fill-opacity": 0.75,
+        "fill-outline-color": "#e6f0ff"
+      };
+    }
+
+    function getLayerInsertBeforeId() {
+      return null;
+    }
+
+    function rememberManagedLayer(id) {
+      if (!runtimeState.managedLayerIds.includes(id)) {
+        runtimeState.managedLayerIds.push(id);
+      }
+    }
+
+    function applyPaintToLayer(layerId, paint) {
+      for (const [key, value] of Object.entries(paint || {})) {
+        map.setPaintProperty(layerId, key, value);
+      }
+    }
+
+    function getBestLabelAttribute(preferred) {
+      const preferredList = [
+        preferred,
+        "name",
+        "NAME",
+        "Name",
+        "label",
+        "LABEL",
+        "title",
+        "TITLE",
+        "county",
+        "COUNTY",
+        "state",
+        "STATE",
+        "id",
+        "ID"
+      ].filter(Boolean);
+
+      const attrs = Array.isArray(runtimeState.datasetStats?.attributes)
+        ? runtimeState.datasetStats.attributes
+        : [];
+
+      const attrNames = attrs
+        .map(a => String(a?.name || "").trim())
+        .filter(Boolean);
+
+      for (const candidate of preferredList) {
+        if (attrNames.includes(candidate)) return candidate;
+      }
+
+      return attrNames[0] || "name";
+    }
+
+    function buildDefaultSymbolLayout(fieldName) {
+      return {
+        "text-field": ["coalesce", ["to-string", ["get", fieldName]], ""],
+        "text-size": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          3, 10,
+          8, 12,
+          12, 14
+        ],
+        "text-font": ["Open Sans Regular"],
+        "text-offset": [0, 0],
+        "text-anchor": "center",
+        "text-allow-overlap": false,
+        "text-ignore-placement": false,
+        "symbol-placement": "point"
+      };
+    }
+
+    function buildDefaultSymbolPaint() {
+      return {
+        "text-color": "#ffffff",
+        "text-halo-color": "#0b1020",
+        "text-halo-width": 1.4,
+        "text-halo-blur": 0.2
+      };
+    }
+
+    function addLabels(options = {}) {
+      if (!runtimeState.dataset) {
+        throw new Error("No dataset selected");
+      }
+
+      ensureDatasetSources(runtimeState.dataset);
+
+      const sourceLayer = String(
+        options.sourceLayer ||
+        options.source_layer ||
+        runtimeState.sourceLayer ||
+        "layer0"
+      );
+
+      const field = getBestLabelAttribute(options.field || options.attribute || options.textField);
+      const id = String(options.id || `${runtimeState.layerId}-labels`);
+
+      removeLayerIfExists(id);
+
+      const layer = {
+        id,
+        type: "symbol",
+        source: options.source || runtimeState.sourceId,
+        "source-layer": sourceLayer,
+        layout: {
+          ...buildDefaultSymbolLayout(field),
+          ...(options.layout || {})
+        },
+        paint: {
+          ...buildDefaultSymbolPaint(),
+          ...(options.paint || {})
+        },
+        minzoom: options.minzoom ?? 5
+      };
+
+      map.addLayer(layer, getLayerInsertBeforeId());
+      rememberManagedLayer(id);
+      return id;
+    }
+
+    function ensureStandardDatasetLayer(style) {
+      const dataset = runtimeState.dataset;
+      if (!dataset) {
+        throw new Error("No dataset selected");
+      }
+
+      ensureDatasetSources(dataset);
+
+      const layerId = runtimeState.layerId;
+      const layerType = getLayerType(style);
+      const sourceLayer = String(
+        style?.source_layer ||
+        style?.sourceLayer ||
+        runtimeState.sourceLayer ||
+        "layer0"
+      );
+
+      runtimeState.sourceLayer = sourceLayer;
+
+      clearManagedLayers();
+
+      map.addLayer(
+        {
+          id: layerId,
+          type: layerType,
+          source: runtimeState.sourceId,
+          "source-layer": sourceLayer
+        },
+        getLayerInsertBeforeId()
+      );
+      rememberManagedLayer(layerId);
+
+      const paint = buildPaint(style || {});
+      applyPaintToLayer(layerId, paint);
+
+      const fallbackPaint = buildFallbackPaint(layerType);
+      for (const [key, value] of Object.entries(fallbackPaint)) {
+        const current = map.getPaintProperty(layerId, key);
+        if (current == null) {
+          map.setPaintProperty(layerId, key, value);
+        }
+      }
+
+      const labels = style?.labels;
+      if (labels && labels.enabled) {
+        addLabels(labels);
+      }
+
+      renderLegend(style || {});
+
+      setStatus(
+        `Dataset layer ready\n` +
+        `dataset=${dataset}\n` +
+        `tile template=${runtimeState.lastTileUrl}\n` +
+        `source-layer=${sourceLayer}\n` +
+        `layer type=${layerType}`
+      );
+    }
+
+    function normalizeLayerSpec(layer, index) {
+      const dataset = runtimeState.dataset;
+      const canonicalSourceId = runtimeState.sourceId;
+      const datasetAlias = dataset;
+
+      const out = clonePlain(layer) || {};
+      if (!out.id) out.id = `custom-layer-${index}`;
+      if (!out.type) {
+        throw new Error(`Custom layer ${out.id} is missing required field "type"`);
+      }
+
+      if (!out.source) {
+        out.source = canonicalSourceId;
+      } else if (out.source === datasetAlias || out.source === canonicalSourceId) {
+        // keep as-is
+      }
+
+      const sourceNeedsLayer =
+        out.type === "fill" ||
+        out.type === "line" ||
+        out.type === "circle" ||
+        out.type === "symbol";
+
+      if (sourceNeedsLayer && !out["source-layer"]) {
+        out["source-layer"] = String(runtimeState.sourceLayer || "layer0");
+      }
+
+      return out;
+    }
+
+    function applyCustomLayers(styleObject) {
+      const dataset = runtimeState.dataset;
+      if (!dataset) throw new Error("No dataset selected");
+
+      ensureDatasetSources(dataset);
+
+      const requestedSourceLayer = String(
+        styleObject?.source_layer ||
+        styleObject?.sourceLayer ||
+        runtimeState.sourceLayer ||
+        "layer0"
+      );
+      runtimeState.sourceLayer = requestedSourceLayer;
+
+      clearManagedLayers();
+
+      const layers = Array.isArray(styleObject?.layers) ? styleObject.layers : [];
+      if (!layers.length) {
+        throw new Error("Custom style object has no layers");
+      }
+
+      layers.forEach((layer, idx) => {
+        const normalized = normalizeLayerSpec(layer, idx);
+        map.addLayer(normalized, getLayerInsertBeforeId());
+        rememberManagedLayer(normalized.id);
+      });
+
+      if (styleObject?.labels?.enabled) {
+        addLabels(styleObject.labels);
+      }
+
+      renderLegend(styleObject || {});
+
+      setStatus(
+        `Custom layers applied\n` +
+        `dataset=${dataset}\n` +
+        `tile template=${runtimeState.lastTileUrl}\n` +
+        `source-layer=${runtimeState.sourceLayer}\n` +
+        `layer count=${layers.length}`
+      );
+    }
+
+    async function applyStyle(styleObject) {
+      runtimeState.style = styleObject || runtimeState.style || {};
+
+      if (!runtimeState.dataset) {
+        throw new Error("No dataset selected");
+      }
+
+      const hasCustomLayers =
+        Array.isArray(runtimeState.style?.layers) &&
+        runtimeState.style.layers.length > 0;
+
+      if (hasCustomLayers) {
+        applyCustomLayers(runtimeState.style);
+      } else {
+        ensureStandardDatasetLayer(runtimeState.style || {});
+      }
+
+      await fitToDataset(runtimeState.dataset);
+    }
+
+    async function fitToDataset(dataset) {
+      if (!dataset) return;
+      if (runtimeState.fittedDataset === dataset) return;
+
+      const bounds = inferBoundsFromStats(runtimeState.datasetStats);
+      if (bounds) {
+        map.fitBounds(bounds, {
+          padding: 40,
+          duration: 800,
+          maxZoom: 14
+        });
+        runtimeState.fittedDataset = dataset;
+        return;
+      }
+
+      const d = dataset.toLowerCase();
+      if (d.includes("boston")) {
+        map.flyTo({ center: [-71.0589, 42.3601], zoom: 10.5 });
+      } else if (d.includes("county") || d.includes("tract")) {
+        map.flyTo({ center: [-98.5795, 39.8283], zoom: 4.2 });
+      } else {
+        map.flyTo({ center: runtimeState.defaultCenter, zoom: runtimeState.defaultZoom });
+      }
+
+      runtimeState.fittedDataset = dataset;
+    }
+
+    function popupHtmlForProperties(properties) {
+      const entries = Object.entries(properties || {}).slice(0, 14);
+      const rows = entries.map(([k, v]) => {
+        return `
+          <div class="popup-key">${escapeHtml(k)}</div>
+          <div class="popup-value">${escapeHtml(v == null ? "" : String(v))}</div>
+        `;
+      }).join("");
+
+      return `
+        <div class="popup-title">Feature attributes</div>
+        <div class="popup-grid">${rows || "<div>No properties</div>"}</div>
+      `;
+    }
+
+    function getInteractiveLayerIds() {
+      return runtimeState.managedLayerIds.filter(id => map.getLayer(id));
+    }
+
+    function installGeneralPopupHandlers() {
+      if (runtimeState.popupInstalled) return;
+      runtimeState.popupInstalled = true;
+
+      map.on("click", (e) => {
+        const layerIds = getInteractiveLayerIds();
+        if (!layerIds.length) return;
+
+        const features = map.queryRenderedFeatures(e.point, { layers: layerIds });
+        if (!features.length) return;
+
+        const f = features[0];
+
+        if (runtimeState.currentPopup) {
+          runtimeState.currentPopup.remove();
+          runtimeState.currentPopup = null;
+        }
+
+        runtimeState.currentPopup = new maplibregl.Popup({ closeButton: true, closeOnClick: true })
+          .setLngLat(e.lngLat)
+          .setHTML(popupHtmlForProperties(f.properties || {}))
+          .addTo(map);
+      });
+
+      map.on("mousemove", (e) => {
+        const layerIds = getInteractiveLayerIds();
+        if (!layerIds.length) {
+          map.getCanvas().style.cursor = "";
+          return;
+        }
+        const features = map.queryRenderedFeatures(e.point, { layers: layerIds });
+        map.getCanvas().style.cursor = features.length ? "pointer" : "";
+      });
+    }
+
+    function resetRuntime() {
+      if (runtimeState.currentPopup) {
+        runtimeState.currentPopup.remove();
+        runtimeState.currentPopup = null;
+      }
+
+      resetManagedMapObjects();
+
+      runtimeState.dataset = "";
+      runtimeState.sourceLayer = "layer0";
+      runtimeState.style = null;
+      runtimeState.managedLayerIds = [];
+      runtimeState.managedSourceIds = [];
+      runtimeState.lastScript = "";
+      runtimeState.fittedDataset = "";
+      runtimeState.lastTileUrl = "";
+      runtimeState.datasetStats = null;
+
+      clearLegend();
+      setDatasetChip("");
+      setStatus("Runtime reset.");
+    }
+
+    function runUserScript(scriptText) {
+      const api = {
+        map,
+        maplibregl,
+        getState: safeGetState,
+        setDataset(dataset) {
+          runtimeState.dataset = String(dataset || "").trim();
+          runtimeState.fittedDataset = "";
+          setDatasetChip(runtimeState.dataset);
+        },
+        getDataset() {
+          return runtimeState.dataset;
+        },
+        setSourceLayer(name) {
+          runtimeState.sourceLayer = String(name || "").trim() || "layer0";
+        },
+        getSourceLayer() {
+          return runtimeState.sourceLayer;
+        },
+        ensureDatasetLayer(style = null) {
+          if (style) runtimeState.style = style;
+          if (!runtimeState.dataset) {
+            throw new Error("No dataset selected");
+          }
+          ensureStandardDatasetLayer(runtimeState.style || style || {});
+          return runtimeState.layerId;
+        },
+        ensureDatasetSources(dataset = runtimeState.dataset) {
+          if (!dataset) throw new Error("No dataset selected");
+          return ensureDatasetSources(dataset);
+        },
+        applyStyle(style) {
+          return applyStyle(style);
+        },
+        addLabels(options = {}) {
+          return addLabels(options);
+        },
+        clearLegend() {
+          clearLegend();
+        },
+        renderLegend(style = runtimeState.style || {}) {
+          renderLegend(style);
+        },
+        fitToDataset(dataset = runtimeState.dataset) {
+          return fitToDataset(dataset);
+        },
+        reset() {
+          resetRuntime();
+        },
+        addManagedLayer(layerSpec) {
+          const normalized = normalizeLayerSpec(layerSpec, runtimeState.managedLayerIds.length);
+          map.addLayer(normalized, getLayerInsertBeforeId());
+          rememberManagedLayer(normalized.id);
+          return normalized.id;
+        },
+        addManagedSource(id, spec) {
+          addManagedSource(id, spec);
+        },
+        removeManagedLayer(id) {
+          removeLayerIfExists(id);
+          runtimeState.managedLayerIds = runtimeState.managedLayerIds.filter(x => x !== id);
+        }
+      };
+
+      const wrapped = new Function("api", "map", "maplibregl", `
+        "use strict";
+        return (async () => {
+          ${scriptText}
+        })();
+      `);
+
+      return wrapped(api, map, maplibregl);
+    }
+
+    async function loadDataset(dataset) {
+      if (!dataset) {
+        resetRuntime();
+        return;
+      }
+
+      runtimeState.dataset = String(dataset).trim();
+      runtimeState.fittedDataset = "";
+      setDatasetChip(runtimeState.dataset);
+
+      await probeTileUrl(runtimeState.dataset);
+      runtimeState.datasetStats = await getDatasetStats(runtimeState.dataset);
+
+      setStatus(
+        `Dataset loaded\n` +
+        `dataset=${runtimeState.dataset}\n` +
+        `source-layer=${runtimeState.sourceLayer}\n` +
+        `ready for style application`
+      );
+    }
+
+    async function handleMessage(event) {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data || {};
+      const type = data.type;
+      const payload = data.payload || {};
+
+      try {
+        if (type === "starlet:set-dataset") {
+          await loadDataset(payload.dataset || "");
+          return;
+        }
+
+        if (type === "starlet:apply-style") {
+          if (payload.dataset && payload.dataset !== runtimeState.dataset) {
+            await loadDataset(payload.dataset);
+          }
+          await applyStyle(payload.style || {});
+          return;
+        }
+
+        if (type === "starlet:run-script") {
+          if (payload.dataset && payload.dataset !== runtimeState.dataset) {
+            await loadDataset(payload.dataset);
+          }
+          runtimeState.lastScript = String(payload.script || "");
+          await runUserScript(runtimeState.lastScript);
+          if (runtimeState.style) {
+            renderLegend(runtimeState.style);
+          }
+          await fitToDataset(runtimeState.dataset);
+          return;
+        }
+
+        if (type === "starlet:reset") {
+          resetRuntime();
+          return;
+        }
+
+        if (type === "starlet:ping") {
+          postToParent("starlet:pong", { ok: true, state: safeGetState() });
+          return;
+        }
+      } catch (err) {
+        setRuntimeError(err?.message || String(err));
+      }
+    }
+
+    window.addEventListener("message", handleMessage);
+
+    map.on("load", async () => {
+      installGeneralPopupHandlers();
+
+      try {
+        const datasetFromQuery = qs("dataset");
+        if (datasetFromQuery) {
+          await loadDataset(datasetFromQuery);
+        } else {
+          setStatus("Map runtime ready. No dataset selected yet.");
+        }
+
+        postToParent("starlet:runtime-ready", { ok: true, state: safeGetState() });
+      } catch (err) {
+        setRuntimeError(err?.message || String(err));
+      }
+    });
+
+    window.addEventListener("error", (event) => {
+      setRuntimeError(event?.error?.message || event.message || "Unknown runtime error");
+    });
+
+    window.addEventListener("unhandledrejection", (event) => {
+      const reason = event.reason;
+      setRuntimeError(reason?.message || String(reason));
+    });
+  </script>
+</body>
+</html>

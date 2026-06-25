@@ -198,6 +198,33 @@ if (isRoadsDataset) {
   );
 }
 
+// Add generic polygon layer for any dataset with polygons
+if (!isPolygonDataset) {
+  layers.push({
+    id: "layer0-fill",
+    type: "fill",
+    source: "local",
+    "source-layer": "layer0",
+    filter: ["==", "$type", "Polygon"],
+    paint: {
+      "fill-color": "#2d6a4f",
+      "fill-opacity": 0.5
+    }
+  });
+  layers.push({
+    id: "layer0-outline",
+    type: "line",
+    source: "local",
+    "source-layer": "layer0",
+    filter: ["==", "$type", "Polygon"],
+    paint: {
+      "line-color": "#1b4332",
+      "line-width": 1,
+      "line-opacity": 0.8
+    }
+  });
+}
+
 // Add generic point layer for any dataset with points
 layers.push({
   id: "layer0-points",

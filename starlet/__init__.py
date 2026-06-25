@@ -1,7 +1,8 @@
 """starlet — spatial tiling, MVT generation, and tile serving for geospatial data."""
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from importlib.metadata import version
+__version__ = version("starlet")
 
 from starlet._types import TileResult, MVTResult, Dataset
 
@@ -10,18 +11,21 @@ __all__ = [
     "generate_mvt",
     "build",
     "create_app",
+    "export_pmtiles",
     "TileResult",
     "MVTResult",
     "Dataset",
 ]
+
+_GEOJSON_DEFAULT_PARTITION_SIZE = 512 * 1024 * 1024
+_GEOPARQUET_DEFAULT_PARTITION_SIZE = 128 * 1024 * 1024
 
 
 def tile(
     input: str,
     outdir: str,
     *,
-    num_tiles: int = 40,
-    partition_size: int = 1 << 30,
+    partition_size: int | None = None,
     sort: str = "zorder",
     compression: str = "zstd",
     sample_cap: int | None = 10_000,
@@ -30,7 +34,14 @@ def tile(
     geom_col: str = "geometry",
     sfc_bits: int = 16,
     max_parallel_files: int = 64,
-    index: str | None = None,
+    covering_bbox: bool = False,
+    geojson_executor: str = "process",
+    orchestrator: str = "two-stage",
+    two_stage_executor: str = "process",
+    two_stage_assignment_workers: int | None = None,
+    two_stage_write_workers: int | None = None,
+    two_stage_reducers: int | None = None,
+    temp_dir: str | None = None,
 ) -> TileResult:
     """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
 
@@ -41,10 +52,10 @@ def tile(
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.
-    num_tiles : int
-        Target number of spatial partitions (used when *index* is ``None``).
-    partition_size : int
-        Target partition size in bytes. Overridden by *num_tiles* when set.
+    partition_size : int | None
+        Target partition size in bytes. When omitted, defaults to 512 MiB for
+        GeoJSON and 128 MiB for GeoParquet. The number of partitions is
+        derived from the input file size.
     sort : str
         Row sort order within each tile: ``"zorder"``, ``"hilbert"``,
         ``"columns"``, or ``"none"``.
@@ -62,8 +73,29 @@ def tile(
         Bits per axis for Z-order / Hilbert key.
     max_parallel_files : int
         Maximum concurrent tile files during write.
-    index : str | None
-        Path to a legacy CSV index file. When provided, *num_tiles* is ignored.
+    covering_bbox : bool
+        Opt-in read-time pruning. If True, write four per-row bbox covering
+        columns plus bounded, spatially-coherent row groups so the on-demand
+        tile server can skip row groups/rows at read time. Off by default
+        (faster batch tiling, smaller files); enable when serving tiles
+        on the fly from these partitions.
+    geojson_executor : str
+        Executor used for GeoJSON spatial sampling: ``"process"`` for
+        production CPU parallelism or ``"thread"`` for small inputs / test
+        environments (avoids process-pool spawn overhead).
+    orchestrator : str
+        Tiling orchestrator to use: ``"round"`` or ``"two-stage"``.
+    two_stage_executor : str
+        Executor used by the two-stage orchestrator: ``"process"`` or ``"thread"``.
+    two_stage_assignment_workers : int | None
+        Number of workers for two-stage split assignment.
+    two_stage_write_workers : int | None
+        Number of workers for two-stage tile writes.
+    two_stage_reducers : int | None
+        Number of hash-shuffle reducers for the two-stage orchestrator.
+    temp_dir : str | None
+        Parent directory for two-stage temporary shard files. Defaults to
+        ``./tmp`` under the current working directory.
 
     Returns
     -------
@@ -73,9 +105,14 @@ def tile(
     import math
     from pathlib import Path
 
-    from starlet._internal.tiling.datasource import GeoParquetSource, GeoJSONSource, is_geojson_path
-    from starlet._internal.tiling.assigner import TileAssignerFromCSV, RSGroveAssigner
+    from starlet._internal.tiling.datasource import (
+        is_geojson_path,
+        read_spatial_sample,
+        source_for_path,
+    )
+    from starlet._internal.tiling.assigner import RSGroveAssigner
     from starlet._internal.tiling.orchestrator import RoundOrchestrator
+    from starlet._internal.tiling.two_stage_orchestrator import TwoStageOrchestrator
     from starlet._internal.tiling.writer_pool import SortMode
     from starlet._internal.histogram.hist_pyramid import build_histograms_for_dir
 
@@ -90,44 +127,76 @@ def tile(
     }
     sort_mode = _sort_map.get(sort.strip().lower(), SortMode.ZORDER)
 
-    # Build data source
-    if is_geojson_path(input):
-        source = GeoJSONSource(input)
-    else:
-        source = GeoParquetSource(input)
+    # Build data source and choose a format-appropriate default size.
+    source = source_for_path(input)
+    if partition_size is None:
+        partition_size = (
+            _GEOJSON_DEFAULT_PARTITION_SIZE
+            if is_geojson_path(input)
+            else _GEOPARQUET_DEFAULT_PARTITION_SIZE
+        )
 
     # Determine partition count
-    input_size_bytes = Path(input).stat().st_size
-    computed = max(1, math.ceil(input_size_bytes / partition_size))
-    target_partitions = num_tiles if num_tiles else computed
-    logger.info("Target partitions: %d (input=%d bytes)", target_partitions, input_size_bytes)
+    if partition_size <= 0:
+        raise ValueError("partition_size must be greater than zero")
+    input_size_bytes = source.input_size_bytes()
+    target_partitions = max(1, math.ceil(input_size_bytes / partition_size))
+    logger.info(
+        "Target partitions: %d (input=%d bytes, target_partition_size=%d bytes)",
+        target_partitions,
+        input_size_bytes,
+        partition_size,
+    )
 
     # Build assigner
-    if index:
-        assigner = TileAssignerFromCSV(index, geom_col=geom_col)
-    else:
-        assigner = RSGroveAssigner.from_source(
-            tables=source.iter_tables(),
-            num_partitions=target_partitions,
-            geom_col=geom_col,
-            seed=seed,
-            sample_ratio=sample_ratio,
-            sample_cap=sample_cap,
-        )
+    spatial_sample = read_spatial_sample(
+        input,
+        geom_col=geom_col,
+        seed=seed,
+        sample_ratio=sample_ratio,
+        sample_cap=sample_cap,
+        geojson_executor=geojson_executor,
+    )
+    assigner = RSGroveAssigner.from_sample_and_mbr(
+        sample_points=spatial_sample.sample_points,
+        mbr=spatial_sample.mbr,
+        num_partitions=target_partitions,
+        geom_col=geom_col,
+    )
 
     tiles_dir = str(Path(outdir) / "parquet_tiles")
     hist_dir = str(Path(outdir) / "histograms")
 
-    orchestrator = RoundOrchestrator(
-        source=source,
-        assigner=assigner,
-        outdir=tiles_dir,
-        max_parallel_files=max_parallel_files,
-        compression=compression,
-        sort_mode=sort_mode,
-        sfc_bits=sfc_bits,
-    )
-    orchestrator.run()
+    orchestrator_name = orchestrator.strip().lower().replace("_", "-")
+    if orchestrator_name == "round":
+        tiling_orchestrator = RoundOrchestrator(
+            source=source,
+            assigner=assigner,
+            outdir=tiles_dir,
+            max_parallel_files=max_parallel_files,
+            compression=compression,
+            sort_mode=sort_mode,
+            sfc_bits=sfc_bits,
+            covering_bbox=covering_bbox,
+        )
+    elif orchestrator_name in {"two-stage", "twostage"}:
+        tiling_orchestrator = TwoStageOrchestrator(
+            source=source,
+            assigner=assigner,
+            outdir=tiles_dir,
+            compression=compression,
+            sort_mode=sort_mode,
+            sfc_bits=sfc_bits,
+            executor=two_stage_executor,
+            assignment_workers=two_stage_assignment_workers,
+            write_workers=two_stage_write_workers,
+            num_reducers=two_stage_reducers,
+            temp_dir=temp_dir,
+            covering_bbox=covering_bbox,
+        )
+    else:
+        raise ValueError("orchestrator must be 'round' or 'two-stage'")
+    tiling_orchestrator.run()
 
     logger.info("Tiling complete. Building histograms.")
     build_histograms_for_dir(
@@ -143,7 +212,6 @@ def tile(
     # Gather result metadata
     tile_files = list(Path(tiles_dir).glob("*.parquet"))
     total_rows = 0
-    bbox = (float("inf"), float("inf"), float("-inf"), float("-inf"))
     for tf in tile_files:
         import pyarrow.parquet as pq
         meta = pq.read_metadata(str(tf))
@@ -167,6 +235,8 @@ def generate_mvt(
     zoom: int = 7,
     threshold: float = 0,
     outdir: str | None = None,
+    auto_zoom: bool = True,
+    occupancy_threshold: float = 0.01,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -180,6 +250,13 @@ def generate_mvt(
         Minimum feature count per tile.
     outdir : str | None
         MVT output directory. Defaults to ``<tile_dir>/mvt/``.
+    auto_zoom : bool
+        Automatically detect maximum useful zoom level from histogram density.
+        If True and data becomes sparse before ``zoom``, generation stops early.
+        Default True.
+    occupancy_threshold : float
+        Minimum tile occupancy (nonempty_tiles / total_tiles) for auto-zoom detection.
+        Default 0.01 (1% occupancy).
 
     Returns
     -------
@@ -202,6 +279,8 @@ def generate_mvt(
         outdir=mvt_outdir,
         last_zoom=zoom,
         threshold=threshold,
+        auto_zoom=auto_zoom,
+        occupancy_threshold=occupancy_threshold,
     )
     gen.run()
 
@@ -225,10 +304,12 @@ def build(
     outdir: str,
     *,
     zoom: int = 7,
-    num_tiles: int = 40,
+    partition_size: int | None = None,
     threshold: float = 100_000,
+    pmtiles: bool = False,
+    pmtiles_compression: str = "gzip",
     **tile_kwargs,
-) -> tuple[TileResult, MVTResult]:
+) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
 
     Parameters
@@ -239,20 +320,89 @@ def build(
         Output dataset directory.
     zoom : int
         Maximum zoom level for MVT generation.
-    num_tiles : int
-        Target number of spatial partitions.
+    partition_size : int | None
+        Target partition size in bytes (forwarded to :func:`tile`). When
+        omitted, a format-appropriate default is used.
     threshold : float
         Minimum feature count per MVT tile.
+    pmtiles : bool
+        If True, export MVT tiles to a PMTiles archive after generation.
+        Default False.
+    pmtiles_compression : str
+        Compression for PMTiles export: "gzip", "brotli", "zstd", "none".
+        Default "gzip". Only used if pmtiles=True.
     **tile_kwargs
-        Additional keyword arguments forwarded to :func:`tile`.
+        Additional keyword arguments forwarded to :func:`tile`
+        (e.g. ``covering_bbox=True``, ``orchestrator="round"``,
+        ``geojson_executor="thread"``).
 
     Returns
     -------
-    tuple[TileResult, MVTResult]
+    tuple[TileResult, MVTResult, str | None]
+        Returns (tile_result, mvt_result, pmtiles_path).
+        pmtiles_path is None if pmtiles=False.
     """
-    tile_result = tile(input=input, outdir=outdir, num_tiles=num_tiles, **tile_kwargs)
+    from pathlib import Path
+
+    tile_result = tile(
+        input=input, outdir=outdir, partition_size=partition_size, **tile_kwargs
+    )
     mvt_result = generate_mvt(tile_dir=outdir, zoom=zoom, threshold=threshold)
-    return tile_result, mvt_result
+
+    pmtiles_path = None
+    if pmtiles:
+        from starlet._internal.pmtiles.exporter import export_to_pmtiles
+
+        dataset_name = Path(outdir).name
+        pmtiles_path = str(Path(outdir).parent / f"{dataset_name}.pmtiles")
+
+        export_to_pmtiles(
+            mvt_dir=str(Path(outdir) / "mvt"),
+            output_path=pmtiles_path,
+            tile_type="mvt",
+            compression=pmtiles_compression,
+        )
+
+    return tile_result, mvt_result, pmtiles_path
+
+
+def export_pmtiles(
+    mvt_dir: str,
+    output_path: str,
+    tile_type: str = "mvt",
+    compression: str = "gzip",
+) -> str:
+    """Export MVT tiles to PMTiles archive format.
+
+    Parameters
+    ----------
+    mvt_dir : str
+        Directory containing MVT tiles in z/x/y.mvt structure.
+        Typically ``<dataset>/mvt/``.
+    output_path : str
+        Path to output .pmtiles file.
+    tile_type : str
+        Tile type: "mvt" (vector), "png", "jpg", "webp" (raster).
+        Default "mvt".
+    compression : str
+        Compression: "gzip", "none", "brotli", "zstd".
+        Default "gzip".
+
+    Returns
+    -------
+    str
+        Path to created PMTiles file.
+
+    Examples
+    --------
+    >>> # After running build/generate_mvt
+    >>> export_pmtiles(
+    ...     mvt_dir="datasets/mydata/mvt",
+    ...     output_path="datasets/mydata.pmtiles"
+    ... )
+    """
+    from starlet._internal.pmtiles.exporter import export_to_pmtiles
+    return export_to_pmtiles(mvt_dir, output_path, tile_type, compression)
 
 
 def create_app(data_dir: str, cache_size: int = 256):

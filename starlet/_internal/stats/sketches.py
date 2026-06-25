@@ -23,8 +23,17 @@ class SpaceSavingTopK:
         if len(self.counter) > self.k * 2:
             self.counter = Counter(dict(self.counter.most_common(self.k)))
 
+    def merge(self, other: "SpaceSavingTopK"):
+        self.counter.update(other.counter)
+        if len(self.counter) > self.k * 2:
+            self.counter = Counter(dict(self.counter.most_common(self.k)))
+        return self
+
     def result(self):
         total_count = sum(self.counter.values())
+        if total_count == 0:
+            return []
+
         top_k = self.counter.most_common(self.k)
         top_k_count = sum(count for _, count in top_k)
 
@@ -70,6 +79,24 @@ class NumericSketch:
             self.hll.update(str(v).encode("utf-8"))
             self.topk.update([v])
 
+    def merge(self, other: "NumericSketch"):
+        self.count += other.count
+        if other.non_null:
+            if self.min is None or (other.min is not None and other.min < self.min):
+                self.min = other.min
+            if self.max is None or (other.max is not None and other.max > self.max):
+                self.max = other.max
+            # Parallel variance merge (Chan et al.) over the non-null counts.
+            nA, nB = self.non_null, other.non_null
+            n = nA + nB
+            delta = other.mean - self.mean
+            self.mean = (self.mean * nA + other.mean * nB) / n if n else 0.0
+            self.M2 = self.M2 + other.M2 + delta * delta * nA * nB / n if n else 0.0
+            self.non_null = n
+        self.hll.merge(other.hll)
+        self.topk.merge(other.topk)
+        return self
+
     def finalize(self):
         stddev = math.sqrt(self.M2 / self.non_null) if self.non_null > 1 else 0.0
         return {
@@ -97,6 +124,12 @@ class CategoricalSketch:
             s = str(v)
             self.hll.update(s.encode("utf-8"))
             self.topk.update([s])
+
+    def merge(self, other: "CategoricalSketch"):
+        self.non_null += other.non_null
+        self.hll.merge(other.hll)
+        self.topk.merge(other.topk)
+        return self
 
     def finalize(self):
         return {
@@ -131,6 +164,21 @@ class TextSketch(CategoricalSketch):
             self.hll.update(s.encode("utf-8"))
             self.topk.update([s])
 
+    def merge(self, other: "TextSketch"):
+        super().merge(other)
+        self.total_length += other.total_length
+        if other.min_length is not None:
+            self.min_length = (
+                other.min_length if self.min_length is None
+                else min(self.min_length, other.min_length)
+            )
+        if other.max_length is not None:
+            self.max_length = (
+                other.max_length if self.max_length is None
+                else max(self.max_length, other.max_length)
+            )
+        return self
+
     def finalize(self):
         avg_len = (
             self.total_length / self.non_null
@@ -147,9 +195,21 @@ class TextSketch(CategoricalSketch):
 
 
 class GeometrySketch:
-    def __init__(self):
-        self.minx = self.miny = None
-        self.maxx = self.maxy = None
+    def __init__(self, global_mbr=None):
+        """
+        Initialize GeometrySketch with optional pre-computed global MBR.
+
+        Args:
+            global_mbr: Optional tuple of (minx, miny, maxx, maxy) to skip redundant MBR computation
+        """
+        if global_mbr is not None:
+            self.minx, self.miny, self.maxx, self.maxy = global_mbr
+            self._skip_mbr_computation = True
+        else:
+            self.minx = self.miny = None
+            self.maxx = self.maxy = None
+            self._skip_mbr_computation = False
+
         self.geom_types = Counter()
         self.total_points = 0
 
@@ -169,19 +229,49 @@ class GeometrySketch:
 
             self.geom_types[geom.geom_type] += 1
 
-            minx, miny, maxx, maxy = geom.bounds
-            if self.minx is None:
-                self.minx, self.miny, self.maxx, self.maxy = minx, miny, maxx, maxy
-            else:
-                self.minx = min(self.minx, minx)
-                self.miny = min(self.miny, miny)
-                self.maxx = max(self.maxx, maxx)
-                self.maxy = max(self.maxy, maxy)
+            # Only compute MBR if not pre-provided
+            if not self._skip_mbr_computation:
+                minx, miny, maxx, maxy = geom.bounds
+                if self.minx is None:
+                    self.minx, self.miny, self.maxx, self.maxy = minx, miny, maxx, maxy
+                else:
+                    self.minx = min(self.minx, minx)
+                    self.miny = min(self.miny, miny)
+                    self.maxx = max(self.maxx, maxx)
+                    self.maxy = max(self.maxy, maxy)
 
-            try:
-                self.total_points += len(geom.coords)
-            except Exception:
-                pass
+            self.total_points += self._count_coords(geom)
+
+    def merge(self, other: "GeometrySketch"):
+        if other.minx is not None:
+            if self.minx is None:
+                self.minx, self.miny = other.minx, other.miny
+                self.maxx, self.maxy = other.maxx, other.maxy
+            else:
+                self.minx = min(self.minx, other.minx)
+                self.miny = min(self.miny, other.miny)
+                self.maxx = max(self.maxx, other.maxx)
+                self.maxy = max(self.maxy, other.maxy)
+        self.geom_types.update(other.geom_types)
+        self.total_points += other.total_points
+        return self
+
+    @staticmethod
+    def _count_coords(geom) -> int:
+        """Recursively count vertices in any geometry type."""
+        geom_type = geom.geom_type
+        if geom_type == 'Point':
+            return 1
+        elif geom_type in ('LineString', 'LinearRing'):
+            return len(geom.coords)
+        elif geom_type == 'Polygon':
+            count = len(geom.exterior.coords)
+            for ring in geom.interiors:
+                count += len(ring.coords)
+            return count
+        elif geom_type.startswith('Multi') or geom_type == 'GeometryCollection':
+            return sum(GeometrySketch._count_coords(part) for part in geom.geoms)
+        return 0
 
 
     def finalize(self):

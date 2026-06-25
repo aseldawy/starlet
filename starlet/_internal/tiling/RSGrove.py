@@ -28,6 +28,9 @@ class EnvelopeNDLite:
     def getCoordinateDimension(self) -> int:
         return int(self.mins.size)
 
+    def len(self) -> int:
+        return self.mins.size()
+    
     def isEmpty(self) -> bool:
         return bool(np.any(self.maxs <= self.mins))
 
@@ -84,46 +87,193 @@ class EnvelopeNDLite:
         return EnvelopeNDLite(mins, maxs)
 
 
-# ----------------------------- Aux Search ------------------------------------
-
-class IntArray(list):
-    """Simple stand-in for the Java IntArray."""
-    pass
-
-
-class AuxiliarySearchStructure:
+class KDPartitionTree:
     """
-    Linear-scan overlap search over partitions.
-    Implemented with NumPy arrays for speed; replaceable by an interval tree/R-tree.
-    Covers entire space if expand_to_inf=True was used.
+    kd-tree-like split structure for point partition lookup.
+
+    While building, every row is either an internal split or an explicit leaf.
+    Leaves are marked with split axis ``-1`` and have stable row IDs, which lets
+    callers split a specific leaf later. The tree starts with one leaf at row 0
+    that represents the entire space.
+
+    After ``assign_partition_ids()``, the table is compacted to contain only
+    internal split nodes. Child references to leaves are replaced with negative
+    partition references encoded as ``-partition_id - 1``.
     """
+
+    LEAF_AXIS = -1
+
     def __init__(self):
-        self.mins: Optional[np.ndarray] = None  # shape (P, D)
-        self.maxs: Optional[np.ndarray] = None  # shape (P, D)
+        self._rows = self._leaf_row()
+        self._finalized = False
+        self._num_partitions = 1
 
-    def build(self, boxes: List[EnvelopeNDLite]):
-        if not boxes:
-            self.mins = self.maxs = None
-            return
-        D = boxes[0].getCoordinateDimension()
-        P = len(boxes)
-        self.mins = np.vstack([b.mins for b in boxes])  # (P, D)
-        self.maxs = np.vstack([b.maxs for b in boxes])  # (P, D)
+    @property
+    def rows(self) -> np.ndarray:
+        """Return the raw split table."""
+        return self._rows
 
-    def search(self, mbr: EnvelopeNDLite, out: Optional[IntArray] = None) -> IntArray:
-        if out is None:
-            out = IntArray()
-        out.clear()
-        if self.mins is None:
-            return out
-        # Overlap: not (max <= qmin or qmax <= min) along any dimension
-        qmin = mbr.mins[None, :]  # (1, D)
-        qmax = mbr.maxs[None, :]  # (1, D)
-        sep = (self.maxs <= qmin) | (qmax <= self.mins)   # (P, D)
-        disjoint = np.any(sep, axis=1)                    # (P,)
-        hits = np.nonzero(~disjoint)[0]
-        out.extend(map(int, hits.tolist()))
-        return out
+    def __len__(self) -> int:
+        return int(self._rows.shape[0])
+
+    def is_empty(self) -> bool:
+        return len(self) == 0
+
+    def numPartitions(self) -> int:
+        return self._num_partitions
+
+    def add_split(self, node_id: int, split_axis: int, split_value: float) -> Tuple[int, int]:
+        """
+        Split a leaf node and return the lower and higher leaf node IDs.
+
+        ``node_id`` must point to an existing leaf row, identified by split
+        axis ``-1``. The row is updated in place with the split information,
+        and two new leaf rows are appended as its lower and higher children.
+        """
+        if self._finalized:
+            raise RuntimeError("Cannot add splits after partition IDs have been assigned")
+        if split_axis < 0:
+            raise ValueError("split_axis cannot be negative")
+        self._validate_node_id(node_id)
+        if int(self._rows[node_id, 1]) != self.LEAF_AXIS:
+            raise ValueError(f"Node {node_id} is already an internal split")
+
+        lower_node_id = self._append_leaf()
+        higher_node_id = self._append_leaf()
+        self._rows[node_id] = [
+            float(split_value),
+            float(split_axis),
+            float(lower_node_id),
+            float(higher_node_id),
+        ]
+        return lower_node_id, higher_node_id
+
+    def assign_partition_ids(self) -> int:
+        """
+        Compact the tree and replace leaves with ``-partition_id - 1``.
+
+        Leaves are numbered by pre-order traversal from 0 to
+        ``num_partitions - 1``. After this method returns, the intermediate
+        explicit leaf rows have been removed and the tree is ready for search.
+        """
+        if self._finalized:
+            return self._num_partitions
+
+        next_partition_id = 0
+        compact_rows: List[List[float]] = []
+
+        def compile_node(node_id: int) -> int:
+            nonlocal next_partition_id
+            self._validate_node_id(node_id)
+            split_axis = int(self._rows[node_id, 1])
+            if split_axis == self.LEAF_AXIS:
+                partition_ref = -next_partition_id - 1
+                next_partition_id += 1
+                return partition_ref
+            if split_axis < 0:
+                raise RuntimeError(f"Invalid split axis {split_axis} at node {node_id}")
+
+            compact_node_id = len(compact_rows)
+            compact_rows.append([float(self._rows[node_id, 0]), float(split_axis), 0.0, 0.0])
+
+            lower_ref = compile_node(int(self._rows[node_id, 2]))
+            higher_ref = compile_node(int(self._rows[node_id, 3]))
+            compact_rows[compact_node_id][2] = float(lower_ref)
+            compact_rows[compact_node_id][3] = float(higher_ref)
+            return compact_node_id
+
+        root_ref = compile_node(0)
+        self._rows = (
+            np.asarray(compact_rows, dtype=np.float64)
+            if compact_rows
+            else np.empty((0, 4), dtype=np.float64)
+        )
+        self._finalized = True
+        self._num_partitions = next_partition_id
+        if root_ref != 0 and compact_rows:
+            raise RuntimeError("Compacted tree root was not written at row 0")
+        return self._num_partitions
+
+    def search(self, x: float, y: float) -> int:
+        """Return the partition ID containing point ``(x, y)``."""
+        return self.search_point((x, y))
+
+    def search_point(self, coords) -> int:
+        """Return the partition ID containing a point coordinate sequence."""
+        if not self._finalized:
+            raise RuntimeError("Partition IDs must be assigned before searching")
+        if len(self) == 0 or len(coords) == 0:
+            return 0
+
+        node_id = 0
+        while True:
+            split_value = float(self._rows[node_id, 0])
+            split_axis = int(self._rows[node_id, 1])
+            if split_axis >= len(coords):
+                raise ValueError(
+                    f"Point has {len(coords)} dimensions, but split uses axis {split_axis}"
+                )
+
+            side_col = 2 if float(coords[split_axis]) <= split_value else 3
+            child_ref = int(self._rows[node_id, side_col])
+            if child_ref < 0:
+                return -child_ref - 1
+            if child_ref == 0:
+                raise RuntimeError("Encountered an unfinished terminal leaf during search")
+            self._validate_node_id(child_ref)
+            node_id = child_ref
+
+    def getPartitionMBR(self, partitionID: int, global_mbr: EnvelopeNDLite) -> EnvelopeNDLite:
+        """Return the partition MBR implied by split paths through the tree."""
+        if not self._finalized:
+            raise RuntimeError("Partition IDs must be assigned before computing partition MBRs")
+        if partitionID < 0 or partitionID >= self._num_partitions:
+            raise IndexError(f"Partition ID {partitionID} is outside the tree")
+        if len(self) == 0:
+            return global_mbr.copy()
+
+        def visit(node_id: int, mins: np.ndarray, maxs: np.ndarray) -> Optional[EnvelopeNDLite]:
+            split_value = float(self._rows[node_id, 0])
+            split_axis = int(self._rows[node_id, 1])
+
+            lower_ref = int(self._rows[node_id, 2])
+            lower_mins = mins.copy()
+            lower_maxs = maxs.copy()
+            lower_maxs[split_axis] = min(lower_maxs[split_axis], split_value)
+            found = visit_ref(lower_ref, lower_mins, lower_maxs)
+            if found is not None:
+                return found
+
+            higher_ref = int(self._rows[node_id, 3])
+            higher_mins = mins.copy()
+            higher_maxs = maxs.copy()
+            higher_mins[split_axis] = max(higher_mins[split_axis], split_value)
+            return visit_ref(higher_ref, higher_mins, higher_maxs)
+
+        def visit_ref(ref: int, mins: np.ndarray, maxs: np.ndarray) -> Optional[EnvelopeNDLite]:
+            if ref < 0:
+                pid = -ref - 1
+                if pid == partitionID:
+                    return EnvelopeNDLite(mins, maxs)
+                return None
+            return visit(ref, mins, maxs)
+
+        result = visit(0, global_mbr.mins.copy(), global_mbr.maxs.copy())
+        if result is None:
+            raise IndexError(f"Partition ID {partitionID} was not found in the tree")
+        return result
+
+    def _append_leaf(self) -> int:
+        self._rows = np.vstack([self._rows, self._leaf_row()])
+        return len(self) - 1
+
+    @classmethod
+    def _leaf_row(cls) -> np.ndarray:
+        return np.array([[np.nan, float(cls.LEAF_AXIS), 0.0, 0.0]], dtype=np.float64)
+
+    def _validate_node_id(self, node_id: int) -> None:
+        if node_id < 0 or node_id >= len(self):
+            raise IndexError(f"Node ID {node_id} is outside the tree")
 
 
 # ----------------------------- Histogram API ---------------------------------
@@ -137,12 +287,6 @@ class AbstractHistogram(Protocol):
 
 
 # ----------------------------- R*-like splitter -------------------------------
-def _bbox_from_slice(coords: np.ndarray, start: int, end: int) -> EnvelopeNDLite:
-    # coords (D, N); slice over columns [start:end)
-    mins = np.min(coords[:, start:end], axis=1)
-    maxs = np.max(coords[:, start:end], axis=1)
-    return EnvelopeNDLite(mins, maxs)
-
 
 def _overlap_volume(a: EnvelopeNDLite, b: EnvelopeNDLite) -> float:
     lo = np.maximum(a.mins, b.mins)
@@ -157,7 +301,7 @@ def _choose_split(coords: np.ndarray,
                   w: Optional[np.ndarray],
                   m: float,
                   M: float,
-                  fraction_min_split: float) -> int:
+                  fraction_min_split: float) -> Tuple[int, int, float]:
     """
     R*-style split selection on the given subset (columns in coords).
     Sorts the target slice of coords (and weights) in-place by the chosen axis and returns the
@@ -351,27 +495,28 @@ def _choose_split(coords: np.ndarray,
     # Ensure the slice is sorted by the chosen axis before returning split position.
     _quicksort_inplace(best_axis_id)
     split_at = start + best_k
-    return split_at
+    split_value = float(coords[best_axis_id, split_at - 1])
+    return split_at, best_axis_id, split_value
 
 
 def _rstar_partition_iterative(coords: np.ndarray,
                                w: Optional[np.ndarray],
                                min_cap: float,
                                max_cap: float,
-                               fraction_min_split: float,
-                               out_boxes: List[EnvelopeNDLite]):
+                               fraction_min_split: float) -> KDPartitionTree:
     """
     Iteratively partition indices into boxes with capacity in [min_cap, max_cap]
     (capacity = count if w is None, else sum(weights) when w provided).
     """
     import logging
     logger = logging.getLogger("RSGrovePartitioner._rstar_partition_iterative")
-    stack: List[Tuple[int, int]] = [(0, coords.shape[1])]
+    tree = KDPartitionTree()
+    stack: List[Tuple[int, int, int]] = [(0, coords.shape[1], 0)]
 
     while stack:
-        start, end = stack.pop()
+        start, end, node_id = stack.pop()
         subset_size = end - start
-        logger.debug(f"Stack pop start={start}, end={end}, subset_size={subset_size}")
+        logger.debug(f"Stack pop start={start}, end={end}, node_id={node_id}, subset_size={subset_size}")
         if subset_size <= 0:
             continue
 
@@ -383,87 +528,64 @@ def _rstar_partition_iterative(coords: np.ndarray,
         logger.debug(f"Subset start={start}, end={end}: cap_here={cap_here}, max_cap={max_cap}")
         if cap_here <= max_cap:
             logger.debug(f"Subset start={start}, end={end}: within capacity, creating box.")
-            out_boxes.append(_bbox_from_slice(coords, start, end))
             continue
 
-        split_at = _choose_split(coords, start, end, w, min_cap, max_cap, fraction_min_split)
-        logger.debug(f"Subset start={start}, end={end}: split_at={split_at}")
+        split_at, split_axis, split_value = _choose_split(
+            coords, start, end, w, min_cap, max_cap, fraction_min_split
+        )
+        logger.debug(
+            "Subset start=%d, end=%d: split_at=%d axis=%d value=%s",
+            start, end, split_at, split_axis, split_value,
+        )
 
         if split_at <= start or split_at >= end:
             logger.warning(f"Subset start={start}, end={end}: Pathological split detected, splitting by median.")
             split_at = start + subset_size // 2
+            split_axis = 0
+            order = np.argsort(coords[split_axis, start:end], kind="mergesort")
+            coords[:, start:end] = coords[:, start:end][:, order]
+            if w is not None:
+                w[start:end] = w[start:end][order]
+            split_value = float(coords[split_axis, split_at - 1])
 
-        stack.append((split_at, end))
-        stack.append((start, split_at))
+        lower_node_id, higher_node_id = tree.add_split(node_id, split_axis, split_value)
+        stack.append((split_at, end, higher_node_id))
+        stack.append((start, split_at, lower_node_id))
+
+    tree.assign_partition_ids()
+    return tree
 
 
 def partition_points(coords: np.ndarray,
                      min_cap: int,
                      max_cap: int,
-                     expand_to_inf: bool,
-                     fraction_min_split: float) -> list:
+                     fraction_min_split: float) -> KDPartitionTree:
     import logging
     logger = logging.getLogger("RSGrovePartitioner.partition_points")
     weights = np.ones(coords.shape[1], dtype=float)
     logger.info(f"Starting partition_weighted_points with {coords.shape[1]} points (uniform weights).")
-    return partition_weighted_points(coords, weights, float(min_cap), float(max_cap), expand_to_inf, fraction_min_split)
+    return partition_weighted_points(coords, weights, float(min_cap), float(max_cap), fraction_min_split)
 
 
 def partition_weighted_points(coords: np.ndarray,
                               weights: np.ndarray,
                               min_cap_w: float,
                               max_cap_w: float,
-                              expand_to_inf: bool,
-                              fraction_min_split: float) -> List[EnvelopeNDLite]:
+                              fraction_min_split: float) -> KDPartitionTree:
     """Weighted partitioning (capacities based on data sizes)."""
     _, N = coords.shape
-    boxes: List[EnvelopeNDLite] = []
-    _rstar_partition_iterative(coords, weights.astype(float), float(min_cap_w), float(max_cap_w),
-                               fraction_min_split, boxes)
-    if expand_to_inf and boxes:
-        boxes = _expand_to_infinity(boxes)
-    return boxes
-
-
-def _expand_to_infinity(boxes: List[EnvelopeNDLite]) -> List[EnvelopeNDLite]:
-    """Expand outermost boxes to (-inf,+inf) per dimension to guarantee full coverage."""
-    if not boxes:
-        return boxes
-    D = boxes[0].getCoordinateDimension()
-    mins = np.vstack([b.mins for b in boxes])   # (P,D)
-    maxs = np.vstack([b.maxs for b in boxes])   # (P,D)
-    global_min = np.min(mins, axis=0)
-    global_max = np.max(maxs, axis=0)
-
-    out: List[EnvelopeNDLite] = []
-    for i, b in enumerate(boxes):
-        mm = b.mins.copy()
-        xx = b.maxs.copy()
-        # if equals global min on a dim, extend to -inf; if equals global max, extend to +inf
-        on_min = (np.isclose(mm, global_min) | (mm <= global_min))
-        on_max = (np.isclose(xx, global_max) | (xx >= global_max))
-        mm = np.where(on_min, -np.inf, mm)
-        xx = np.where(on_max, +np.inf, xx)
-        out.append(EnvelopeNDLite(mm, xx))
-    return out
+    return _rstar_partition_iterative(coords, weights.astype(float), float(min_cap_w), float(max_cap_w),
+                               fraction_min_split)
 
 
 # --------------------------- Partitioner (public) -----------------------------
-
-class BeastOptions(dict):
-    """Very small substitute to provide .getDouble/.getBoolean like the Java conf."""
-    def getDouble(self, key: str, default: float) -> float:
-        return float(self.get(key, default))
-    def getBoolean(self, key: str, default: bool) -> bool:
-        return bool(self.get(key, default))
-
 
 class RSGrovePartitioner:
     """
     Python implementation inspired by Beast's RSGrovePartitioner with R*-style splitting.
 
     Methods:
-      - setup(conf: BeastOptions, disjoint: bool)
+      - setup(mmRatio)
       - construct(summary, sample, histogram, numPartitions)
       - overlapPartitions(mbr: EnvelopeNDLite, out: Optional[IntArray]) -> IntArray
       - overlapPartition(mbr: EnvelopeNDLite) -> int
@@ -482,38 +604,17 @@ class RSGrovePartitioner:
       * If `histogram` is provided (AbstractHistogram), weighted partitioning is used.
     """
 
-    # Config keys (mirror Java constants)
-    MMRatio = "mmratio"
-    MinSplitRatio = "RSGrove.MinSplitRatio"
-    ExpandToInfinity = "RSGrove.ExpandToInf"
-
-    def __init__(self):
+    def __init__(self, mmRatio: float = 0.95, minSplitSize: float = 0.0):
         import logging
         self.logger = logging.getLogger("RSGrovePartitioner")
         # Config / state
-        self.disjointPartitions: bool = True
-        self.mMRatio: float = 0.95
-        self.fractionMinSplitSize: float = 0.0
-        self.expandToInf: bool = True
+        self.mMRatio: float = mmRatio
+        self.fractionMinSplitSize: float = minSplitSize
+        self.searchTree: KDPartitionTree = KDPartitionTree()
 
-        # Geometry / partitions
-        self.mbrPoints: EnvelopeNDLite = EnvelopeNDLite(np.array([np.inf]), np.array([-np.inf]))
-        self.minCoord: Optional[np.ndarray] = None  # (D, P)
-        self.maxCoord: Optional[np.ndarray] = None  # (D, P)
-
-        self.aux: AuxiliarySearchStructure = AuxiliarySearchStructure()
         self._rng = random.Random()
 
     # ---------- API parity ----------
-
-    def setup(self, conf: BeastOptions, disjoint: bool):
-        self.logger.info(f"Setting up partitioner: disjoint={disjoint}")
-        self.disjointPartitions = bool(disjoint)
-        self.mMRatio = conf.getDouble(self.MMRatio, 0.95)
-        self.fractionMinSplitSize = conf.getDouble(self.MinSplitRatio, 0.0)
-        self.expandToInf = conf.getBoolean(self.ExpandToInfinity, True)
-        self.logger.info(f"Config: mMRatio={self.mMRatio}, MinSplitRatio={self.fractionMinSplitSize}, ExpandToInf={self.expandToInf}")
-
     def construct(self,
                   summary,
                   sample: np.ndarray,
@@ -558,9 +659,15 @@ class RSGrovePartitioner:
             M = int(math.ceil(N / float(numPartitions)))
             m = int(math.ceil(self.mMRatio * M))
             self.logger.info(f"Unweighted partitioning: M={M}, m={m}")
-            self.logger.info(f"Calling partition_points with sample shape {sample.shape}, min_cap={m}, max_cap={M}, expand_to_inf={self.expandToInf}, fraction_min_split={self.fractionMinSplitSize}")
-            boxes = partition_points(sample, m, M, self.expandToInf, self.fractionMinSplitSize)
-            self.logger.info(f"partition_points returned {len(boxes)} boxes.")
+            self.logger.info(f"Calling KD-tree partitioning with sample shape {sample.shape}, min_cap={m}, max_cap={M}, fraction_min_split={self.fractionMinSplitSize}")
+            weights = np.ones(sample.shape[1], dtype=float)
+            self.searchTree = _rstar_partition_iterative(
+                sample,
+                weights,
+                float(m),
+                float(M),
+                self.fractionMinSplitSize,
+            )
         else:
             # Weighted mode: compute point weights from histogram, then split by total size
             weights = self.computePointWeights(sample, histogram)  # long[] in Java
@@ -568,17 +675,17 @@ class RSGrovePartitioner:
             M = float(math.ceil(total_size / float(numPartitions)))
             m = float(total_size * self.mMRatio / float(numPartitions))
             self.logger.info(f"Weighted partitioning: total_size={total_size}, M={M}, m={m}")
-            boxes = partition_weighted_points(sample, weights, m, M, self.expandToInf, self.fractionMinSplitSize)
+            self.searchTree = _rstar_partition_iterative(
+                sample,
+                weights.astype(float),
+                m,
+                M,
+                self.fractionMinSplitSize,
+            )
 
         # Store min/max arrays
-        P = len(boxes)
-        self.logger.info(f"Constructed {P} partition boxes.")
-        self.minCoord = np.vstack([b.mins for b in boxes]).T  # (D, P)
-        self.maxCoord = np.vstack([b.maxs for b in boxes]).T  # (D, P)
-
-        # Build auxiliary search structure
-        self.logger.info("Building auxiliary search structure.")
-        self.aux.build(boxes)
+        P = self.searchTree.numPartitions()
+        self.logger.info(f"Constructed {P} KD-tree partitions.")
 
     # ---------- Helpers (API-compatible) ----------
 
@@ -606,76 +713,22 @@ class RSGrovePartitioner:
         return weights
 
     def numPartitions(self) -> int:
-        return 0 if self.minCoord is None else int(self.minCoord.shape[1])
+        return self.searchTree.numPartitions()
 
-    def isDisjoint(self) -> bool:
-        return bool(self.disjointPartitions)
+    def getPartitionMBR(self, partition_id: int, global_mbr: EnvelopeNDLite) -> EnvelopeNDLite:
+        return self.searchTree.getPartitionMBR(partition_id, global_mbr)
 
-    def getCoordinateDimension(self) -> int:
-        if self.minCoord is None:
-            return 0
-        return int(self.minCoord.shape[0])
-
-    def overlapPartitions(self, mbr: EnvelopeNDLite, out: Optional[IntArray] = None) -> IntArray:
-        if out is None:
-            out = IntArray()
-        out.clear()
-        if mbr.isEmpty():
-            # Match Java behavior: assign empty to a random partition for load-balance
-            if self.numPartitions() > 0:
-                out.append(self._rng.randrange(self.numPartitions()))
-            return out
-        return self.aux.search(mbr, out)
-
-    def _partition_expansion(self, pid: int, env: EnvelopeNDLite) -> float:
-        # Compute expansion within the global mbr bounds (like Java's Partition_expansion)
-        D = self.getCoordinateDimension()
-        vol_before = 1.0
-        vol_after = 1.0
-        for d in range(D):
-            mb = max(self.mbrPoints.getMinCoord(d), self.minCoord[d, pid])
-            xb = min(self.mbrPoints.getMaxCoord(d), self.maxCoord[d, pid])
-            ma = max(self.mbrPoints.getMinCoord(d), min(self.minCoord[d, pid], env.getMinCoord(d)))
-            xa = min(self.mbrPoints.getMaxCoord(d), max(self.maxCoord[d, pid], env.getMaxCoord(d)))
-            vol_before *= max(0.0, xb - mb)
-            vol_after *= max(0.0, xa - ma)
-        return vol_after - vol_before
-
-    def _partition_volume(self, pid: int) -> float:
-        side = np.maximum(0.0, self.maxCoord[:, pid] - self.minCoord[:, pid])
-        return float(np.prod(side))
-
-    def overlapPartition(self, mbr: EnvelopeNDLite) -> int:
+    def overlapPartition(self, mbr_or_coords) -> int:
         if self.numPartitions() == 0:
             return -1
-        if mbr.isEmpty():
-            return self._rng.randrange(self.numPartitions())
-        tmp = self.overlapPartitions(mbr, None)
-        if len(tmp) == 1:
-            return tmp[0]
-        # Choose by minimal expansion; break ties by smaller area
-        chosen = -1
-        best_exp = float("inf")
-        best_area = float("inf")
-        for pid in tmp:
-            exp = self._partition_expansion(pid, mbr)
-            if exp < best_exp:
-                best_exp = exp
-                best_area = self._partition_volume(pid)
-                chosen = pid
-            elif exp == best_exp:
-                vol = self._partition_volume(pid)
-                if vol < best_area:
-                    best_area = vol
-                    chosen = pid
-        return chosen if chosen >= 0 else tmp[0] if tmp else self._rng.randrange(self.numPartitions())
-
-    def getPartitionMBR(self, partitionID: int, mbr_out: EnvelopeNDLite):
-        D = self.getCoordinateDimension()
-        mbr_out.setCoordinateDimension(D)
-        mbr_out.setEmpty()
-        mbr_out.mins = self.minCoord[:, partitionID].copy()
-        mbr_out.maxs = self.maxCoord[:, partitionID].copy()
-
-    def getEnvelope(self) -> EnvelopeNDLite:
-        return self.mbrPoints
+        if isinstance(mbr_or_coords, EnvelopeNDLite):
+            if (
+                not np.all(np.isfinite(mbr_or_coords.mins))
+                or not np.all(np.isfinite(mbr_or_coords.maxs))
+            ):
+                coords = self.mbrPoints.mins.copy()
+            else:
+                coords = (mbr_or_coords.mins + mbr_or_coords.maxs) * 0.5
+        else:
+            coords = mbr_or_coords
+        return self.searchTree.search_point(coords)

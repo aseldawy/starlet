@@ -5,16 +5,17 @@ import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import pyarrow.parquet as pq
 from shapely import from_wkb
 from shapely.geometry import (
     Point, LineString, LinearRing, Polygon,
     MultiPoint, MultiLineString, MultiPolygon, GeometryCollection
 )
 from pyproj import Transformer
+
+from starlet._internal.tiling.datasource import GeoParquetSource
 
 logger = logging.getLogger(__name__)
 
@@ -75,88 +76,80 @@ def _geometry_vertices_iter(g):
 
 def _accumulate_vertices_hist(
     table,
+    histogram: np.ndarray,
     geom_col: str,
     bbox_out,
     transformer,
-    n: int,
-    dtype
 ):
-    hist = np.zeros((n, n), dtype=dtype)
+    """Transform each vertex and increment its histogram cell in place."""
     geoms = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
 
     minx, miny, maxx, maxy = bbox_out
     inv_w = 1.0 / (maxx - minx)
     inv_h = 1.0 / (maxy - miny)
-
-    all_xs: list[float] = []
-    all_ys: list[float] = []
+    grid_size = histogram.shape[0]
 
     for g in geoms:
         if g is None or g.is_empty:
             continue
 
-        coords = list(_geometry_vertices_iter(g))
-        if not coords:
-            continue
-        
-        xs, ys = zip(*coords)
-        all_xs.extend(xs)
-        all_ys.extend(ys)
-
-    if not all_xs:
-        return hist
-    
-    X, Y = transformer.transform(all_xs, all_ys)
-
-    X = np.asarray(X)
-    Y = np.asarray(Y)
-
-    tx = (X - minx) * inv_w
-    ty = (Y - miny) * inv_h
-    
-    ix = np.floor(tx * n).astype(np.int64, copy=False)
-    iy = np.floor(ty * n).astype(np.int64, copy=False)
-    
-    np.clip(ix, 0, n - 1, out=ix)
-    np.clip(iy, 0, n - 1, out=iy)
-
-    iy = n - 1 - iy
-
-    np.add.at(hist, (iy, ix), 1)
-
-    return hist
+        for x, y in _geometry_vertices_iter(g):
+            transformed_x, transformed_y = transformer.transform(x, y)
+            ix = int((transformed_x - minx) * inv_w * grid_size)
+            iy = int((transformed_y - miny) * inv_h * grid_size)
+            ix = min(max(ix, 0), grid_size - 1)
+            iy = min(max(iy, 0), grid_size - 1)
+            histogram[grid_size - 1 - iy, ix] += 1
 
 
 # ---------------------------------------------------------------------------
-# PROCESS ONE TILE
+# PROCESS SPLIT GROUPS
 # ---------------------------------------------------------------------------
 
-def _process_one_tile(parquet_path: Path, cfg, geom_col: str) -> np.ndarray:
+def _split_groups(splits: Sequence, max_workers: int) -> List[List]:
+    """Divide splits into balanced, non-empty groups for worker processes."""
+    if max_workers <= 0:
+        raise ValueError("hist_max_parallel must be positive")
 
-    tile_id = parquet_path.stem
-    logger.info(f"Processing tile: {tile_id}")
+    worker_count = min(max_workers, len(splits))
+    base_size, remainder = divmod(len(splits), worker_count)
+    groups: List[List] = []
+    offset = 0
+    for index in range(worker_count):
+        group_size = base_size + (1 if index < remainder else 0)
+        groups.append(list(splits[offset:offset + group_size]))
+        offset += group_size
+    return groups
 
-    pf = pq.ParquetFile(str(parquet_path))
 
+def _process_split_group(
+    source_path: str,
+    splits: Sequence,
+    cfg,
+    geom_col: str,
+) -> np.ndarray:
+    """Sequentially accumulate one balanced group of source splits."""
+    logger.info("Processing histogram group with %d splits", len(splits))
+
+    source = GeoParquetSource(
+        source_path,
+        geometry_only=True,
+        geom_col=geom_col,
+    )
     dtype = np.dtype(cfg.dtype)
     transformer = Transformer.from_crs("EPSG:4326", cfg.out_crs, always_xy=True)
     bbox = GLOBAL_BBOX
-
     base = np.zeros((cfg.grid_size, cfg.grid_size), dtype=dtype)
 
-    # Avoid per-tile thread pools: we already parallelize across tiles, and
-    # row-group level fan-out adds overhead and thread contention. Process each
-    # row group directly and accumulate into a single histogram buffer.
-    for rg in range(pf.metadata.num_row_groups):
-        hist = _accumulate_vertices_hist(
-            pf.read_row_group(rg, columns=[geom_col]).combine_chunks(),
-            geom_col,
-            bbox,
-            transformer,
-            cfg.grid_size,
-            dtype,
-        )
-        base += hist
+    for split in splits:
+        for table in source.iter_tables(split):
+            _accumulate_vertices_hist(
+                table.combine_chunks(),
+                base,
+                geom_col,
+                bbox,
+                transformer,
+            )
 
     return base
 
@@ -216,7 +209,7 @@ def _sum_all_tiles(tile_hists: List[np.ndarray], outdir: Path, dtype="float64") 
     logger.info(f"Wrote global histogram: {global_path}")
     logger.info(f"Wrote global prefix sum histogram: {prefix_path}")
 
-    return global_path
+    return prefix_path
 
 
 # ---------------------------------------------------------------------------
@@ -239,8 +232,13 @@ def build_histograms_for_dir(
         rg_parallel=hist_rg_parallel,
     )
 
-    tiles = sorted(Path(tiles_dir).rglob("*.parquet"))
-    if not tiles:
+    source = GeoParquetSource(
+        tiles_dir,
+        geometry_only=True,
+        geom_col=geom_col,
+    )
+    splits = source.create_splits()
+    if not splits:
         logger.error("No parquet tiles found")
         return
 
@@ -248,11 +246,17 @@ def build_histograms_for_dir(
     outdir_p.mkdir(parents=True, exist_ok=True)
 
     tile_outputs = []
+    split_groups = _split_groups(splits, cfg.max_parallel_tiles)
+    logger.info(
+        "Histogram computation: %d splits grouped into %d worker tasks",
+        len(splits),
+        len(split_groups),
+    )
 
     with ProcessPoolExecutor(max_workers=cfg.max_parallel_tiles) as ex:
         futures = {
-            ex.submit(_process_one_tile, p, cfg, geom_col): p
-            for p in tiles
+            ex.submit(_process_split_group, source.path, split_group, cfg, geom_col): split_group
+            for split_group in split_groups
         }
 
         for f in as_completed(futures):

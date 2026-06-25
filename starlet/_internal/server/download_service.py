@@ -9,14 +9,6 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Dict, Any
 import json
 import pyarrow.parquet as pq
-import pyarrow.compute as pc
-from shapely import from_wkb
-from shapely.geometry import box as _shp_box, mapping as _shp_mapping, shape as _shp_shape
-
-from .tiler.parquet_index import parse_parquet_bbox as _parse_filename_bbox
-
-# Per-row bbox covering columns written by the tiling stage (see writer_pool).
-_BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 
 
 @dataclass
@@ -51,42 +43,26 @@ class BoundingBox:
 
 class TileManager:
     """Manages parquet tile discovery and filtering by MBR."""
-    
+
     def __init__(self, dataset_path: Path):
         """Initialize with path to parquet_tiles directory."""
+        from .tiler.parquet_index import parse_parquet_bbox
         self.dataset_path = dataset_path
         self.tiles_dir = dataset_path / "parquet_tiles"
-        
-    def parse_tile_mbr(self, filename: str) -> Optional[BoundingBox]:
-        """
-        Parse MBR from a tile filename.
-        Format: tile_XXXXXX__minx_miny_maxx_maxy.parquet, where each coordinate
-        is an ``int_decimal`` pair (e.g. ``-78_099403`` -> ``-78.099403``).
-        """
-        bb = _parse_filename_bbox(filename)
-        if bb is None:
-            return None
-        return BoundingBox(minx=bb[0], miny=bb[1], maxx=bb[2], maxy=bb[3])
-    
+        # Cache file list and parsed bboxes at init
+        self._entries: List[tuple] = []
+        if self.tiles_dir.exists():
+            for pf in sorted(self.tiles_dir.glob("*.parquet")):
+                bbox = parse_parquet_bbox(pf.name)
+                if bbox is not None:
+                    self._entries.append((pf, BoundingBox(*bbox)))
+
     def find_intersecting_tiles(self, query_mbr: Optional[BoundingBox]) -> List[Path]:
         """Find all parquet tiles that intersect with the query MBR.
         If query_mbr is None, return all tiles."""
-        intersecting_tiles = []
-        
-        if not self.tiles_dir.exists():
-            return intersecting_tiles
-        
-        # If no MBR specified, return all tiles
         if query_mbr is None:
-            return sorted(self.tiles_dir.glob("*.parquet"))
-        
-        # Filter tiles by MBR intersection
-        for tile_file in self.tiles_dir.glob("*.parquet"):
-            tile_mbr = self.parse_tile_mbr(tile_file.name)
-            if tile_mbr and query_mbr.intersects(tile_mbr):
-                intersecting_tiles.append(tile_file)
-        
-        return sorted(intersecting_tiles)
+            return [pf for pf, _ in self._entries]
+        return [pf for pf, tile_mbr in self._entries if query_mbr.intersects(tile_mbr)]
 
 
 class FormatHandler(ABC):
@@ -169,11 +145,11 @@ class CSVHandler(FormatHandler):
             if field == 'geometry_type' and geometry:
                 row.append(geometry.get('type', ''))
             elif field == 'x' and geometry:
-                c = _first_coord(geometry.get('coordinates'))
-                row.append(str(c[0]) if c else '')
+                coords = geometry.get('coordinates', [])
+                row.append(str(coords[0]) if coords else '')
             elif field == 'y' and geometry:
-                c = _first_coord(geometry.get('coordinates'))
-                row.append(str(c[1]) if c and len(c) > 1 else '')
+                coords = geometry.get('coordinates', [])
+                row.append(str(coords[1]) if len(coords) > 1 else '')
             else:
                 value = properties.get(field, '')
                 # Escape quotes and wrap if needed
@@ -212,26 +188,8 @@ class GeoJSONHandler(FormatHandler):
         return "]}"
 
 
-def _first_coord(coords):
-    """Return the first ``[x, y]`` pair from (possibly nested) GeoJSON coords."""
-    if not coords:
-        return None
-    if isinstance(coords[0], (int, float)):
-        return coords
-    return _first_coord(coords[0])
-
-
 class FeatureStreamer:
-    """Streams features from parquet tiles with spatial filtering.
-
-    Spatial filtering happens in two stages, mirroring the tile server:
-      1. partition pruning by filename bbox (``find_intersecting_tiles``);
-      2. row-group + row pruning via pyarrow predicate pushdown on the
-         ``_bbox_*`` covering columns (when present), then an exact
-         geometry-intersection test against the query shape.
-    WKB geometries are decoded so features carry real geometry (the previous
-    implementation left geometry ``None``, dropping every filtered feature).
-    """
+    """Streams features from parquet tiles with spatial filtering."""
 
     def __init__(self, dataset_path: Path):
         self.dataset_path = dataset_path
@@ -241,50 +199,39 @@ class FeatureStreamer:
         self,
         query_mbr: Optional[BoundingBox],
         format_handler: FormatHandler,
-        filter_geom=None,
+        filter_geometry=None,
     ) -> Iterator[str]:
-        """Stream features intersecting ``filter_geom`` (or ``query_mbr``) as
-        the requested format. With no filter, streams all features."""
+        """
+        Stream features that intersect with query MBR in specified format.
+        If query_mbr is None, streams all features.
+        If filter_geometry (a Shapely geometry) is provided, features are
+        tested for intersection against it (fine-grained spatial filter).
+        Yields strings that can be written to response.
+        """
+        # Initialize output
         yield format_handler.initialize()
 
+        # Find intersecting tiles
         tiles = self.tile_manager.find_intersecting_tiles(query_mbr)
+
         if not tiles:
             yield format_handler.finalize()
             return
 
-        if filter_geom is None and query_mbr is not None:
-            filter_geom = _shp_box(query_mbr.minx, query_mbr.miny, query_mbr.maxx, query_mbr.maxy)
-
+        # Stream features from each tile
         for tile_path in tiles:
             try:
-                pf = pq.ParquetFile(str(tile_path))
-                names = pf.schema_arrow.names
-                if query_mbr is not None and all(c in names for c in _BBOX_COLS):
-                    flt = ((pc.field("_bbox_xmax") >= query_mbr.minx)
-                           & (pc.field("_bbox_xmin") <= query_mbr.maxx)
-                           & (pc.field("_bbox_ymax") >= query_mbr.miny)
-                           & (pc.field("_bbox_ymin") <= query_mbr.maxy))
-                    table = pq.read_table(str(tile_path), filters=flt)
-                else:
-                    table = pq.read_table(str(tile_path))
+                # Read parquet file
+                table = pq.read_table(str(tile_path))
+                gdf = table.to_pandas()
 
-                df = table.to_pandas()
-                if "geometry" not in df.columns or len(df) == 0:
-                    continue
-                geoms = from_wkb(df["geometry"].to_numpy())
-                prop_cols = [c for c in df.columns if c != "geometry" and not c.startswith("_bbox_")]
-                records = df[prop_cols].to_dict("records")
-
-                for geom, props in zip(geoms, records):
-                    if geom is None or geom.is_empty:
-                        continue
-                    if filter_geom is not None and not filter_geom.intersects(geom):
-                        continue
-                    feature = {
-                        "type": "Feature",
-                        "properties": {k: v for k, v in props.items() if v is not None},
-                        "geometry": _shp_mapping(geom),
-                    }
+                # Convert to GeoJSON-like format
+                for _, row in gdf.iterrows():
+                    # Fine-grained spatial filter against actual geometry
+                    if filter_geometry is not None and hasattr(row.get('geometry', None), 'intersects'):
+                        if not filter_geometry.intersects(row['geometry']):
+                            continue
+                    feature = self._row_to_feature(row)
                     output = format_handler.write_feature(feature)
                     if output:
                         yield output
@@ -292,7 +239,31 @@ class FeatureStreamer:
                 print(f"Error reading tile {tile_path}: {e}")
                 continue
 
+        # Finalize output
         yield format_handler.finalize()
+    
+    @staticmethod
+    def _row_to_feature(row) -> Dict[str, Any]:
+        """Convert a GeoDataFrame row to GeoJSON feature."""
+        properties = {}
+        geometry = None
+        
+        for col, value in row.items():
+            if col == 'geometry':
+                # Handle geometry column
+                if hasattr(value, '__geo_interface__'):
+                    geometry = value.__geo_interface__
+            else:
+                # Regular properties
+                if value is not None:
+                    properties[col] = value
+        
+        feature = {
+            'type': 'Feature',
+            'properties': properties,
+            'geometry': geometry
+        }
+        return feature
 
 
 class DatasetFeatureService:
@@ -315,44 +286,44 @@ class DatasetFeatureService:
             dataset_name: Name of dataset (e.g., 'TIGER2018_COUNTY')
             format: Output format ('csv' or 'geojson')
             mbr_string: Optional bounding box string 'minx,miny,maxx,maxy'.
-            geometry: Optional GeoJSON geometry to filter by (exact intersection).
-                      Takes precedence over mbr_string. If both are None, returns
-                      all features.
+                       If None, returns all features.
+            geometry: Optional GeoJSON geometry dict for spatial filtering.
+                     If provided, features are clipped to this geometry.
 
         Yields:
             String chunks for streaming response
         """
+        # Parse spatial filter
         query_mbr = None
         filter_geom = None
-        if geometry is not None:
-            try:
-                filter_geom = _shp_shape(geometry)
-            except Exception as e:
-                raise ValueError(f"Invalid geometry filter: {e}")
-            gx0, gy0, gx1, gy1 = filter_geom.bounds
-            query_mbr = BoundingBox(minx=gx0, miny=gy0, maxx=gx1, maxy=gy1)
+        if geometry:
+            from shapely.geometry import shape
+            filter_geom = shape(geometry)
+            bounds = filter_geom.bounds  # minx, miny, maxx, maxy
+            query_mbr = BoundingBox(minx=bounds[0], miny=bounds[1], maxx=bounds[2], maxy=bounds[3])
         elif mbr_string:
             try:
                 query_mbr = BoundingBox.from_string(mbr_string)
             except ValueError as e:
                 raise ValueError(f"Invalid MBR format: {e}")
 
+        # Get dataset path
         dataset_path = self.data_root / dataset_name
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_name}")
 
-        # The streamer performs the spatial filtering, so the handler does not
-        # re-filter (output_mbr=None).
+        # Create appropriate handler
         format_lower = format.lower()
         if format_lower == 'csv':
-            handler = CSVHandler(output_mbr=None)
+            handler = CSVHandler(output_mbr=query_mbr)
         elif format_lower == 'geojson':
-            handler = GeoJSONHandler(output_mbr=None)
+            handler = GeoJSONHandler(output_mbr=query_mbr)
         else:
             raise ValueError(f"Unsupported format: {format}")
 
+        # Stream features
         streamer = FeatureStreamer(dataset_path)
-        return streamer.stream_features(query_mbr, handler, filter_geom=filter_geom)
+        return streamer.stream_features(query_mbr, handler, filter_geometry=filter_geom)
     
     def get_mime_type(self, format: str) -> str:
         """Get MIME type for format."""

@@ -1,22 +1,27 @@
-import numpy as np
 import logging
+from pathlib import Path
+
+import numpy as np
 
 logger = logging.getLogger("bucket_mvt")
 
 
 class HistogramLoader:
     def __init__(self, hist_path):
-        self.hist_path = hist_path
+        self.hist_path = Path(hist_path)
         self.prefix = None
 
     def load(self):
-        logger.info(f"Loading histogram from {self.hist_path}")
-        arr = np.load(self.hist_path)
-        # ``global_prefix.npy`` already holds the 2D prefix-sum (integral image)
-        # written by the tiling stage; ``global.npy`` is the raw histogram and
-        # still needs the cumulative sums computed here.
-        if str(self.hist_path).endswith("_prefix.npy"):
+        logger.info("Loading histogram from %s", self.hist_path)
+        arr = np.load(self.hist_path, allow_pickle=False)
+
+        # If the provided file is already a prefix histogram (the integral image
+        # ``global_prefix.npy`` written by the tiling stage), use it directly;
+        # ``global.npy`` is the raw histogram and still needs the cumulative
+        # sums computed here.
+        if self.hist_path.stem.endswith("_prefix"):
             self.prefix = arr
         else:
             self.prefix = arr.cumsum(axis=0).cumsum(axis=1)
+
         return self.prefix

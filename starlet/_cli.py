@@ -42,8 +42,7 @@ def main():
 @main.command()
 @click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
-@click.option("--num-tiles", type=int, default=40, show_default=True, help="Target number of spatial partitions.")
-@click.option("--partition-size", default="1gb", show_default=True, help="Target partition size (e.g. 512mb, 1gb).")
+@click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
 @click.option("--sort", default="zorder", show_default=True, type=click.Choice(["zorder", "hilbert", "columns", "none"]), help="Row sort order within each tile.")
 @click.option("--compression", default="zstd", show_default=True, help="Parquet compression codec.")
 @click.option("--sample-cap", type=int, default=10000, show_default=True, help="Reservoir sampling cap for centroids.")
@@ -52,11 +51,22 @@ def main():
 @click.option("--geom-col", default="geometry", show_default=True, help="Geometry column name.")
 @click.option("--sfc-bits", type=int, default=16, show_default=True, help="Bits per axis for Z-order key.")
 @click.option("--max-parallel-files", type=int, default=64, show_default=True, help="Max concurrent tile writes.")
-@click.option("--index", default=None, help="Legacy CSV index file (overrides --num-tiles).")
+@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
+              help="Opt-in: write per-row bbox covering columns + bounded row groups for "
+                   "fast on-demand serving. Off by default (faster batch tiling, smaller files).")
+@click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
+@click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
+@click.option("--two-stage-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for the two-stage orchestrator.")
+@click.option("--two-stage-assignment-workers", type=int, default=None, help="Assignment workers for the two-stage orchestrator.")
+@click.option("--two-stage-write-workers", type=int, default=None, help="Write workers for the two-stage orchestrator.")
+@click.option("--two-stage-reducers", type=int, default=None, help="Hash-shuffle reducers for the two-stage orchestrator.")
+@click.option("--temp-dir", default=None, help="Parent directory for two-stage temporary shard files (default: ./tmp).")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def tile(input_path, outdir, num_tiles, partition_size, sort, compression,
+def tile(input_path, outdir, partition_size, sort, compression,
          sample_cap, sample_ratio, seed, geom_col, sfc_bits, max_parallel_files,
-         index, log_level):
+         covering_bbox, geojson_executor, orchestrator, two_stage_executor,
+         two_stage_assignment_workers, two_stage_write_workers, two_stage_reducers,
+         temp_dir, log_level):
     """Partition a geospatial dataset into spatially-tiled Parquet files."""
     _setup_logging(log_level)
     import starlet
@@ -64,8 +74,7 @@ def tile(input_path, outdir, num_tiles, partition_size, sort, compression,
     result = starlet.tile(
         input=input_path,
         outdir=outdir,
-        num_tiles=num_tiles,
-        partition_size=_parse_size(partition_size),
+        partition_size=_parse_size(partition_size) if partition_size else None,
         sort=sort,
         compression=compression,
         sample_cap=sample_cap,
@@ -74,7 +83,14 @@ def tile(input_path, outdir, num_tiles, partition_size, sort, compression,
         geom_col=geom_col,
         sfc_bits=sfc_bits,
         max_parallel_files=max_parallel_files,
-        index=index,
+        covering_bbox=covering_bbox,
+        geojson_executor=geojson_executor,
+        orchestrator=orchestrator,
+        two_stage_executor=two_stage_executor,
+        two_stage_assignment_workers=two_stage_assignment_workers,
+        two_stage_write_workers=two_stage_write_workers,
+        two_stage_reducers=two_stage_reducers,
+        temp_dir=temp_dir,
     )
     click.echo(f"Tiling complete: {result.num_files} tiles, {result.total_rows} rows")
     click.echo(f"  Output: {result.outdir}")
@@ -107,24 +123,38 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 @click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
-@click.option("--num-tiles", type=int, default=40, show_default=True, help="Target number of spatial partitions.")
+@click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
 @click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per MVT tile.")
+@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
+              help="Opt-in: write per-row bbox covering columns for fast on-demand serving.")
+@click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
+@click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
+@click.option("--pmtiles", is_flag=True, help="Export MVT tiles to PMTiles archive after generation.")
+@click.option("--pmtiles-compression", default="gzip", show_default=True, type=click.Choice(["gzip", "brotli", "zstd", "none"]), help="PMTiles compression format.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def build(input_path, outdir, zoom, num_tiles, threshold, log_level):
+def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
+          geojson_executor, orchestrator, pmtiles, pmtiles_compression, log_level):
     """Run the full pipeline: tile then generate MVTs."""
     _setup_logging(log_level)
     import starlet
 
-    tile_result, mvt_result = starlet.build(
+    tile_result, mvt_result, pmtiles_path = starlet.build(
         input=input_path,
         outdir=outdir,
         zoom=zoom,
-        num_tiles=num_tiles,
+        partition_size=_parse_size(partition_size) if partition_size else None,
         threshold=threshold,
+        covering_bbox=covering_bbox,
+        geojson_executor=geojson_executor,
+        orchestrator=orchestrator,
+        pmtiles=pmtiles,
+        pmtiles_compression=pmtiles_compression,
     )
     click.echo(f"Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
     click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {mvt_result.zoom_levels}")
+    if pmtiles_path:
+        click.echo(f"  PMTiles: {pmtiles_path}")
 
 
 @main.command()

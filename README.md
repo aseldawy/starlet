@@ -101,52 +101,6 @@ Once the server is running:
 | `GET` | `/datasets/<dataset>/features/sample.json` | Sample attributes |
 | `GET` | `/datasets/<dataset>/features/sample.geojson` | Sample record with geometry |
 | `GET` | `/api/datasets/<dataset>/stats` | Attribute statistics |
-| `POST` | `/datasets/<dataset>/styles.json` | LLM-generated styling suggestions |
-
-## LLM Styling Suggestions
-
-The `POST /datasets/<dataset>/styles.json` endpoint uses an LLM to generate
-map styling rules from dataset attribute statistics.
-
-### Provider Selection
-
-Set the `LLM_PROVIDER` environment variable to choose a provider:
-
-```bash
-export LLM_PROVIDER=gemini   # default
-export LLM_PROVIDER=ollama   # local Ollama
-```
-
-Falls back to Gemini if the variable is unset or invalid.
-
-### Gemini (default)
-
-Requires a Google AI Studio API key:
-
-```bash
-export GEMINI_API_KEY=your-key-here
-starlet serve --dir datasets
-```
-
-### Ollama (local)
-
-Requires a running Ollama instance on the default port (11434):
-
-```bash
-ollama serve                  # start Ollama
-ollama pull llama3            # pull a model (once)
-
-export LLM_PROVIDER=ollama
-starlet serve --dir datasets
-```
-
-To use a different model:
-
-```bash
-export OLLAMA_MODEL=mistral
-```
-
-See [`starlet/_internal/server/llm/README.md`](starlet/_internal/server/llm/README.md) for full LLM provider documentation.
 
 ## Example
 

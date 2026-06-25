@@ -24,12 +24,11 @@ class GeometryStreamer:
     def _decode_table(self, table):
         geom_col = table["geometry"].to_pylist()
 
-        # Extract all columns except geometry and the internal bbox covering
-        # columns written by the tiling stage (used for read-time pruning).
+        # Extract all columns except geometry
         attrs = {
             col: table[col].to_pylist()
             for col in table.column_names
-            if col != "geometry" and not col.startswith("_bbox_")
+            if col != "geometry"
         }
 
         for i, wkb in enumerate(geom_col):

@@ -9,7 +9,15 @@ from .sketches import (
 
 
 class AttributeStatsCollector:
-    def __init__(self, schema: pa.Schema, geometry_column="geometry"):
+    def __init__(self, schema: pa.Schema, geometry_column="geometry", global_mbr=None):
+        """
+        Initialize AttributeStatsCollector with optional pre-computed global MBR.
+
+        Args:
+            schema: PyArrow schema
+            geometry_column: Name of geometry column
+            global_mbr: Optional tuple of (minx, miny, maxx, maxy) to avoid redundant MBR computation
+        """
         self.schema = schema
         self.geometry_column = geometry_column
         self.sketches = OrderedDict()
@@ -17,7 +25,7 @@ class AttributeStatsCollector:
         for field in schema:
             name = field.name
             if name == geometry_column:
-                self.sketches[name] = GeometrySketch()
+                self.sketches[name] = GeometrySketch(global_mbr=global_mbr)
                 continue
 
             t = field.type
@@ -49,6 +57,18 @@ class AttributeStatsCollector:
             arr = col.combine_chunks()
             values = arr.to_pylist()
             sketch.update(values)
+
+    def merge(self, other: "AttributeStatsCollector"):
+        """Merge another collector's sketches into this one (for parallel
+        stats collection across workers). Sketches present in ``other`` but not
+        here are adopted as-is."""
+        for name, other_sketch in other.sketches.items():
+            mine = self.sketches.get(name)
+            if mine is None:
+                self.sketches[name] = other_sketch
+            else:
+                mine.merge(other_sketch)
+        return self
 
     def finalize(self):
         out = []

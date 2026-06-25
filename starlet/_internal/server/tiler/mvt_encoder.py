@@ -20,10 +20,7 @@ class MVTEncoder:
         gdf = gdf.copy()
         gdf["geometry"] = gdf.geometry.apply(make_valid)
         gdf = gdf[~gdf.geometry.is_empty]
-        # sort_index keeps feature order stable and independent of clip()'s
-        # internal spatial-index ordering, so the encoded tile is deterministic
-        # regardless of how many geometries were pre-filtered out beforehand.
-        return gdf.clip(self.tile_poly_3857).sort_index()
+        return gdf.clip(self.tile_poly_3857)
 
 
     def transform_geom(self, geom: Any, scale_func: Callable) -> Any:

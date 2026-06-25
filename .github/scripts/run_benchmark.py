@@ -34,10 +34,13 @@ def run_benchmark(input_path, format_name, output_dir):
 
     start = time.time()
 
-    tile_result, mvt_result = starlet.build(
+    # ~100 MiB partitions ≈ 10 partitions on the 1 GB asia_postal_codes dataset
+    # (0.3.0 replaced --num-tiles with size-based partitioning). build() now
+    # returns a 3-tuple (tile, mvt, pmtiles_path).
+    tile_result, mvt_result, _ = starlet.build(
         input=input_path,
         outdir=output_dir,
-        num_tiles=10,
+        partition_size=100 * 1024 * 1024,
         zoom=5,
         threshold=50000,
         max_parallel_files=max_parallel
@@ -54,7 +57,7 @@ def run_benchmark(input_path, format_name, output_dir):
         'input_size_mb': 1024,
         'features': 184338,
         'config': {
-            'num_tiles': 10,
+            'partition_size_mb': 100,
             'zoom': 5,
             'threshold': 50000
         },

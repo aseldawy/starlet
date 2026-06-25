@@ -1,40 +1,74 @@
 # Starlet
 
-Spatial tiling, MVT generation, and tile serving for geospatial data.
+Spatial tiling, Mapbox Vector Tile (MVT) generation, and on-demand tile serving
+for large geospatial datasets (GeoParquet / GeoJSON).
 
-## Setup
+The pipeline is: **partition a dataset into spatial tiles → build density
+histograms → (optionally) pre-generate MVTs → serve them over HTTP.**
+
+## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+pip install starlet
 ```
 
-## CLI
+Requires Python 3.10+. This installs the `starlet` command-line tool.
 
-All commands are available through the `starlet` CLI.
+> Want to work on Starlet itself (run from a clone, run the tests)? See
+> [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Quick start
+
+Turn a GeoParquet or GeoJSON file into a running tile server in two commands:
 
 ```bash
-starlet --help
+# 1. Build a dataset: partition into tiles + pre-generate vector tiles
+starlet build --input data.parquet --outdir datasets/mydata
+
+# 2. Serve it
+starlet serve --dir datasets --port 8765
 ```
 
-### `starlet tile` — Partition a dataset
+Then open <http://localhost:8765> and pick your dataset to explore it on a map.
+
+## Commands
+
+Everything is available through the `starlet` CLI (`starlet --help`).
+
+### `starlet build` — full pipeline (tile + MVT)
 
 ```bash
-starlet tile --input data.parquet --outdir datasets/mydata --num-tiles 40
+starlet build --input data.parquet --outdir datasets/mydata --zoom 8
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input` | (required) | Path to GeoParquet or GeoJSON file |
+| `--input` | (required) | Path to a GeoParquet or GeoJSON file |
 | `--outdir` | (required) | Output dataset directory |
-| `--num-tiles` | 40 | Target number of spatial partitions |
-| `--partition-size` | 1gb | Target partition size (e.g. 512mb, 1gb) |
-| `--sort` | zorder | Sort order: zorder, hilbert, columns, none |
-| `--sample-cap` | 10000 | Reservoir sampling cap for centroids |
+| `--zoom` | 7 | Maximum MVT zoom level |
+| `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size, e.g. `256mb`, `1gb` |
+| `--threshold` | 100000 | Minimum feature count per MVT tile |
+| `--pmtiles` | off | Also export a single `.pmtiles` archive |
+
+### `starlet tile` — partition a dataset only
+
+```bash
+starlet tile --input data.parquet --outdir datasets/mydata
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | (required) | Path to a GeoParquet or GeoJSON file |
+| `--outdir` | (required) | Output dataset directory |
+| `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size; the number of tiles is derived from the input size |
+| `--sort` | zorder | Within-tile row order: `zorder`, `hilbert`, `columns`, `none` |
+| `--orchestrator` | two-stage | Tiling engine: `two-stage` (fast, map-reduce) or `round` |
+| `--geojson-executor` | process | `process` for large files, `thread` for small GeoJSON |
+| `--covering-bbox` | off | Write per-row bbox columns for faster on-demand serving |
+| `--geom-col` | geometry | Geometry column name (e.g. `wkb_geometry` for OGR exports) |
 | `--compression` | zstd | Parquet compression codec |
 
-### `starlet mvt` — Generate vector tiles
+### `starlet mvt` — generate vector tiles from a tiled dataset
 
 ```bash
 starlet mvt --dir datasets/mydata --zoom 7 --threshold 100000
@@ -42,18 +76,12 @@ starlet mvt --dir datasets/mydata --zoom 7 --threshold 100000
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dir` | (required) | Dataset directory with parquet_tiles/ and histograms/ |
+| `--dir` | (required) | Dataset directory (contains `parquet_tiles/` and `histograms/`) |
 | `--zoom` | 7 | Maximum zoom level |
 | `--threshold` | 0 | Minimum feature count per tile |
 | `--outdir` | `<dir>/mvt/` | MVT output directory |
 
-### `starlet build` — Full pipeline (tile + MVT)
-
-```bash
-starlet build --input data.parquet --outdir datasets/mydata
-```
-
-### `starlet serve` — Launch the tile server
+### `starlet serve` — launch the tile server
 
 ```bash
 starlet serve --dir datasets --port 8765
@@ -66,75 +94,43 @@ starlet serve --dir datasets --port 8765
 | `--port` | 8765 | Port to bind |
 | `--cache-size` | 256 | In-memory tile cache size |
 
-### `starlet info` — Inspect a dataset
+### `starlet info` — inspect a dataset
 
 ```bash
 starlet info --dir datasets/mydata
 ```
 
-## Make Targets
+## Server API
 
-Convenience wrappers around the CLI:
-
-```bash
-make tiles INPUT=path/to/data.parquet
-make mvt   INPUT=path/to/data.parquet
-make build INPUT=path/to/data.parquet   # tiles + mvt
-make server                              # starts on port 8765
-make clean                               # removes datasets/*
-```
-
-## API Endpoints
-
-Once the server is running:
+Once `starlet serve` is running:
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Interactive dataset selector |
 | `GET` | `/api/datasets` | List all datasets |
-| `GET` | `/datasets.json` | Search datasets by name |
 | `GET` | `/datasets/<dataset>.json` | Dataset metadata |
-| `GET` | `/datasets/<dataset>.html` | Dataset detail page |
 | `GET` | `/<dataset>/<z>/<x>/<y>.mvt` | Mapbox Vector Tile |
-| `GET` | `/datasets/<dataset>/features.<fmt>` | Download features (csv/geojson) |
-| `POST` | `/datasets/<dataset>/features.<fmt>` | Download with geometry filter |
-| `GET` | `/datasets/<dataset>/features/sample.json` | Sample attributes |
-| `GET` | `/datasets/<dataset>/features/sample.geojson` | Sample record with geometry |
+| `GET`/`POST` | `/datasets/<dataset>/features.<csv\|geojson>` | Download features (optional geometry filter) |
 | `GET` | `/api/datasets/<dataset>/stats` | Attribute statistics |
 
-## Example
+## Notes & tips
 
-```bash
-# Full pipeline
-starlet build --input ../data/TIGER2018_COUNTY.parquet --outdir datasets/TIGER2018_COUNTY
+- **Big GeoJSON?** The default `process` executor parallelizes reading. For
+  small files (<10 MB) add `--geojson-executor thread` to skip process-pool
+  startup overhead.
+- **Geometry column** not named `geometry` (common with OGR/`pyogrio`
+  exports)? Pass `--geom-col wkb_geometry`.
+- **Serving tiles on the fly** (zooming past the pre-generated levels)? Build
+  with `--covering-bbox` so the server can prune row groups at read time.
+- **One-file distribution:** `starlet build --pmtiles` writes a single
+  `datasets/mydata.pmtiles` archive alongside the dataset.
 
-# Or via Make
-make build INPUT=../data/TIGER2018_COUNTY.parquet
+## Deploying a server
 
-# Start the server
-make server
-```
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for a step-by-step guide to standing
+up a production tile server, including a no-root recipe behind an existing
+Apache install.
 
-Then open http://localhost:8765 and select a dataset to visualize.
+## License
 
-## Prerequisites
-
-- Python 3.10+
-- `make` (optional, for convenience targets)
-
-## Development
-
-### Running Tests
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
-```
-
-### Creating a Release
-
-See [RELEASE.md](RELEASE.md) for the complete release process, including:
-- Where to update version numbers
-- How to create and push release tags
-- Automated CI/CD workflow details
-- Troubleshooting guide
+See the repository for license details.

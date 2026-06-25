@@ -1,4 +1,4 @@
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import os
 from queue import Queue
@@ -20,6 +20,7 @@ from shapely import from_wkb
 from starlet._internal.tiling.RSGrove import EnvelopeNDLite
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 from starlet._internal.tiling.utils_large import ensure_large_types
+from starlet._internal.progress import iter_with_progress
 
 logger = logging.getLogger(__name__)
 _QUEUE_SENTINEL = object()
@@ -354,7 +355,15 @@ def _read_geoparquet_spatial_sample(
             )
             for index, split in enumerate(splits)
         ]
-        return _combine_spatial_samples([future.result() for future in futures])
+        parts: List[SpatialSample] = []
+        for future in iter_with_progress(
+            as_completed(futures),
+            total=len(futures),
+            logger=logger,
+            label="MBR + sample",
+        ):
+            parts.append(future.result())
+        return _combine_spatial_samples(parts)
 
 
 def _read_geoparquet_split_spatial_sample(
@@ -454,7 +463,15 @@ def _read_geojson_spatial_sample(
             )
             for idx, split in enumerate(splits)
         ]
-        return _combine_spatial_samples([future.result() for future in futures])
+        parts: List[SpatialSample] = []
+        for future in iter_with_progress(
+            as_completed(futures),
+            total=len(futures),
+            logger=logger,
+            label="MBR + sample",
+        ):
+            parts.append(future.result())
+        return _combine_spatial_samples(parts)
 
 
 def _geojson_executor_class(kind: str):

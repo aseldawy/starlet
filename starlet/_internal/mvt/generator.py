@@ -1,5 +1,7 @@
 """Streaming MVT generation pipeline: histogram → assign → stream → render."""
 import logging
+import multiprocessing
+
 from starlet._internal.histogram.loader import HistogramLoader
 from .streamer import GeometryStreamer
 from .assigner import TileAssigner
@@ -17,9 +19,10 @@ class BucketMVTGenerator:
          assigns each geometry to overlapping tiles (with reservoir sampling
          to cap features per tile)
       3. **GeometryStreamer** — decodes WKB geometries from GeoParquet row
-         groups and reprojects EPSG:4326 → EPSG:3857
+         groups and reprojects EPSG:4326 → EPSG:3857 (vectorised, array-at-a-time)
       4. **TileRenderer** — clips, simplifies, transforms to tile coords,
-         and encodes each tile as a ``.mvt`` Protobuf file
+         and encodes each tile as a ``.mvt`` Protobuf file, in parallel across
+         ``max_workers`` cores
     """
 
     def __init__(
@@ -30,7 +33,8 @@ class BucketMVTGenerator:
         last_zoom: int,
         threshold: float,
         auto_zoom: bool = True,
-        occupancy_threshold: float = 0.01
+        occupancy_threshold: float = 0.01,
+        max_workers: int | None = None,
     ) -> None:
         """
         Initialize BucketMVTGenerator with optional auto-zoom detection.
@@ -43,6 +47,8 @@ class BucketMVTGenerator:
             threshold: Minimum feature count threshold
             auto_zoom: Enable automatic max zoom detection (default True)
             occupancy_threshold: Minimum tile occupancy for auto-detection (default 0.01 = 1%)
+            max_workers: Number of processes for the (parallel) render stage.
+                Defaults to CPU count - 1.
         """
         logger.info(f"Initializing BucketMVTGenerator: parquet_dir={parquet_dir}, outdir={outdir}, last_zoom={last_zoom}, threshold={threshold}")
         self.parquet_dir = parquet_dir
@@ -52,6 +58,8 @@ class BucketMVTGenerator:
         self.threshold = threshold
         self.auto_zoom = auto_zoom
         self.occupancy_threshold = occupancy_threshold
+        cpu_default = max(1, multiprocessing.cpu_count() - 1)
+        self.max_workers = max(1, int(max_workers or cpu_default))
 
     def run(self) -> None:
         logger.info("Starting MVT generation pipeline")
@@ -99,5 +107,5 @@ class BucketMVTGenerator:
         logger.info(f"Assigned {geom_count} geometries to tiles")
 
         logger.info(f"Rendering tiles to {self.outdir}")
-        TileRenderer(self.outdir).render(assigner.buckets)
+        TileRenderer(self.outdir, max_workers=self.max_workers).render(assigner.buckets)
         logger.info("Pipeline execution complete")

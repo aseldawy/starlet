@@ -237,6 +237,7 @@ def generate_mvt(
     outdir: str | None = None,
     auto_zoom: bool = True,
     occupancy_threshold: float = 0.01,
+    max_workers: int | None = None,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -281,6 +282,7 @@ def generate_mvt(
         threshold=threshold,
         auto_zoom=auto_zoom,
         occupancy_threshold=occupancy_threshold,
+        max_workers=max_workers,
     )
     gen.run()
 

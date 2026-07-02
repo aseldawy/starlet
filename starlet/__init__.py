@@ -12,6 +12,19 @@ __all__ = [
     "build",
     "create_app",
     "export_pmtiles",
+    "list_datasets",
+    "get_tile",
+    "get_dataset_metadata",
+    "get_dataset_summary",
+    "estimate_range_count",
+    "query_dataset",
+    "query_dataset_count",
+    "query_dataset_size",
+    "get_sample_record",
+    "add_dataset",
+    "delete_dataset",
+    "add_dataset_async",
+    "AsyncDatasetHandle",
     "TileResult",
     "MVTResult",
     "Dataset",
@@ -451,3 +464,20 @@ def create_app(data_dir: str, cache_size: int = 256):
     """
     from starlet._internal.server.app import create_app as _create_app
     return _create_app(data_dir=data_dir, cache_size=cache_size)
+
+
+from starlet.api import (  # noqa: E402
+    AsyncDatasetHandle,
+    add_dataset,
+    add_dataset_async,
+    delete_dataset,
+    estimate_range_count,
+    get_dataset_metadata,
+    get_dataset_summary,
+    get_tile,
+    get_sample_record,
+    list_datasets,
+    query_dataset,
+    query_dataset_count,
+    query_dataset_size,
+)

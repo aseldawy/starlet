@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 from time import perf_counter
+from typing import Any, MutableMapping
 
 from .tiler_bounds import TileBounds
 from .parquet_index import ParquetIndex
@@ -35,6 +36,15 @@ def explode_collections(geom):
 
     return []
 
+
+TileInfo = MutableMapping[str, Any]
+
+
+def _update_output(output: TileInfo | None, **values: Any) -> None:
+    if output is not None:
+        output.update(values)
+
+
 class VectorTiler:
     """On-demand MVT tile server with a three-tier lookup.
 
@@ -44,8 +54,8 @@ class VectorTiler:
       3. **Generate** — reads intersecting GeoParquet tiles, clips/transforms
          geometries, and encodes a fresh MVT on the fly
 
-    Generated tiles are persisted to disk and promoted into the memory cache
-    so that subsequent requests are served from cache.
+    Generated tiles are promoted into the memory cache but are not persisted
+    to disk.
     """
 
     def __init__(self, dataset_root: str, memory_cache_size: int = 256) -> None:
@@ -59,7 +69,7 @@ class VectorTiler:
     def tile_path(self, z: int, x: int, y: int) -> Path:
         return self.mvt_dir / str(z) / str(x) / f"{y}.mvt"
 
-    def generate(self, z: int, x: int, y: int) -> bytes:
+    def generate(self, z: int, x: int, y: int, output: TileInfo | None = None) -> bytes:
         t0 = perf_counter()
         bounds = TileBounds(z, x, y)
         encoder = MVTEncoder(bounds.bbox_3857, bounds.tile_poly_3857)
@@ -68,15 +78,35 @@ class VectorTiler:
             intersecting = self.index.find_intersecting_files(bounds.bbox_4326)
         except Exception as e:
             logger.error("[TileGen] z=%d x=%d y=%d index error: %s", z, x, y, e)
+            _update_output(
+                output,
+                source="generated",
+                generation="error_empty_tile",
+                feature_count=0,
+                intersecting_partition_count=0,
+                elapsed_ms=(perf_counter() - t0) * 1000,
+                error=str(e),
+            )
             return encoder.empty_tile()
 
         if not intersecting:
             logger.debug("[TileGen] z=%d x=%d y=%d no intersecting files", z, x, y)
+            _update_output(
+                output,
+                source="generated",
+                generation="generated_on_the_fly",
+                feature_count=0,
+                intersecting_partition_count=0,
+                elapsed_ms=(perf_counter() - t0) * 1000,
+            )
             return encoder.empty_tile()
 
         features = []
+        feature_count = 0
+        intersecting_partition_count = 0
 
         for pf in intersecting:
+            intersecting_partition_count += 1
             try:
                 gdf = self.index.load_and_reproject(pf, bounds.bbox_4326)
             except Exception as e:
@@ -125,25 +155,58 @@ class VectorTiler:
                         "geometry": mapping(scaled),
                         "properties": attrs
                     })
+                    feature_count += 1
 
-        if not features:
+        if feature_count == 0:
+            _update_output(
+                output,
+                source="generated",
+                generation="generated_on_the_fly",
+                feature_count=0,
+                intersecting_partition_count=intersecting_partition_count,
+                elapsed_ms=(perf_counter() - t0) * 1000,
+            )
             return encoder.empty_tile()
 
         try:
             elapsed_ms = (perf_counter() - t0) * 1000
             logger.info("[TileGen] z=%d x=%d y=%d features=%d elapsed=%.1fms",
-                        z, x, y, len(features), elapsed_ms)
+                        z, x, y, feature_count, elapsed_ms)
+            _update_output(
+                output,
+                source="generated",
+                generation="generated_on_the_fly",
+                feature_count=feature_count,
+                intersecting_partition_count=intersecting_partition_count,
+                elapsed_ms=elapsed_ms,
+            )
             return encoder.encode(features)
         except Exception as e:
             logger.error("[TileGen] z=%d x=%d y=%d encode failed: %s", z, x, y, e)
+            _update_output(
+                output,
+                source="generated",
+                generation="error_empty_tile",
+                feature_count=feature_count,
+                intersecting_partition_count=intersecting_partition_count,
+                elapsed_ms=(perf_counter() - t0) * 1000,
+                error=str(e),
+            )
             return encoder.empty_tile()
 
-    def get_tile(self, z: int, x: int, y: int) -> bytes:
+    def get_tile(self, z: int, x: int, y: int, output: TileInfo | None = None) -> bytes:
+        t0 = perf_counter()
         key = (z, x, y)
 
         cached = self.cache.get(key)
         if cached is not None:
             logger.debug("[Cache] HIT memory z=%d x=%d y=%d", z, x, y)
+            _update_output(
+                output,
+                source="memory",
+                generation="read_from_memory_cache",
+                elapsed_ms=(perf_counter() - t0) * 1000,
+            )
             return cached
 
         path = self.tile_path(z, x, y)
@@ -154,11 +217,18 @@ class VectorTiler:
             elapsed_ms = (perf_counter() - t0) * 1000
             logger.debug("[Cache] HIT disk z=%d x=%d y=%d elapsed=%.1fms", z, x, y, elapsed_ms)
             self.cache.put(key, data)
+            _update_output(
+                output,
+                source="disk",
+                generation="read_from_disk",
+                path=str(path),
+                elapsed_ms=elapsed_ms,
+            )
             return data
 
         logger.info("[Cache] MISS z=%d x=%d y=%d — generating (memory cache only)", z, x, y)
 
-        tile_bytes = self.generate(z, x, y)
+        tile_bytes = self.generate(z, x, y, output=output)
 
         # On-demand tiles are cached in memory only; we deliberately do NOT
         # persist them to disk. Writing every generated tile would incrementally

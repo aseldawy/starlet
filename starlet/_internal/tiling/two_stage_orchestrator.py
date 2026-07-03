@@ -15,7 +15,7 @@ from time import perf_counter
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+import pyarrow.ipc as ipc
 
 from starlet._internal.tiling.datasource import DataSource
 from starlet._internal.tiling.writer_pool import (
@@ -30,6 +30,8 @@ from starlet._internal.progress import iter_with_progress
 logger = logging.getLogger(__name__)
 
 _TILE_COL = "_tile_id"
+_INTERMEDIATE_SUFFIX = ".arrow"
+_INTERMEDIATE_BATCH_SIZE = 64_000
 _MIN_MERGE_FAN_IN = 16
 _OPEN_FILE_RESERVE = 32
 
@@ -48,8 +50,9 @@ class _ShardManifest:
     rows_read: int
     rows_assigned: int
     batches_read: int
-    # Reducer id -> sorted parquet file for this split. Each file contains only
-    # rows owned by that reducer and is already sorted by tile id for k-way merge.
+    # Reducer id -> sorted Arrow IPC file for this split. Each file contains
+    # only rows owned by that reducer and is already sorted by tile id for
+    # k-way merge.
     intermediate_by_reducer: Dict[int, str]
     # Optional per-split attribute stats; the parent merges these after all
     # mapper workers finish so stats are collected without re-reading input.
@@ -116,8 +119,22 @@ def _cast_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     return table.cast(schema, safe=False)
 
 
-def _iter_partition_groups(path: str, batch_size: int = 64_000) -> Iterator[Tuple[int, pa.Table]]:
-    parquet_file = pq.ParquetFile(path)
+def _write_intermediate_table(path: str, table: pa.Table, schema: Optional[pa.Schema] = None) -> None:
+    writer_schema = schema or table.schema
+    with pa.OSFile(path, "wb") as sink:
+        with ipc.new_file(sink, writer_schema) as writer:
+            writer.write_table(
+                _cast_table_to_schema(table, writer_schema),
+                max_chunksize=_INTERMEDIATE_BATCH_SIZE,
+            )
+
+
+def _iter_partition_groups(
+    path: str,
+    batch_size: int = _INTERMEDIATE_BATCH_SIZE,
+) -> Iterator[Tuple[int, pa.Table]]:
+    source = pa.memory_map(path, "r")
+    reader = ipc.open_file(source)
     current_partition: Optional[int] = None
     current_tables: List[pa.Table] = []
 
@@ -132,37 +149,38 @@ def _iter_partition_groups(path: str, batch_size: int = 64_000) -> Iterator[Tupl
         return result
 
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size):
+        for batch_index in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_index)
             table = pa.Table.from_batches([batch])
-            partition_ids = table[_TILE_COL].to_pylist()
-            if not partition_ids:
-                continue
+            for offset in range(0, table.num_rows, batch_size):
+                table_batch = table.slice(offset, batch_size)
+                partition_ids = table_batch[_TILE_COL].to_pylist()
+                if not partition_ids:
+                    continue
 
-            run_start = 0
-            while run_start < len(partition_ids):
-                partition_id = int(partition_ids[run_start])
-                run_end = run_start + 1
-                while run_end < len(partition_ids) and int(partition_ids[run_end]) == partition_id:
-                    run_end += 1
+                run_start = 0
+                while run_start < len(partition_ids):
+                    partition_id = int(partition_ids[run_start])
+                    run_end = run_start + 1
+                    while run_end < len(partition_ids) and int(partition_ids[run_end]) == partition_id:
+                        run_end += 1
 
-                if current_partition is not None and partition_id != current_partition:
-                    flushed = flush_current()
-                    if flushed is not None:
-                        yield flushed
+                    if current_partition is not None and partition_id != current_partition:
+                        flushed = flush_current()
+                        if flushed is not None:
+                            yield flushed
 
-                current_partition = partition_id
-                current_tables.append(
-                    table.slice(run_start, run_end - run_start)
-                )
-                run_start = run_end
+                    current_partition = partition_id
+                    current_tables.append(
+                        table_batch.slice(run_start, run_end - run_start)
+                    )
+                    run_start = run_end
 
         flushed = flush_current()
         if flushed is not None:
             yield flushed
     finally:
-        close = getattr(parquet_file, "close", None)
-        if close is not None:
-            close()
+        source.close()
 
 
 def _is_too_many_open_files_error(error: BaseException) -> bool:
@@ -218,9 +236,13 @@ def _merge_sorted_partition_files(
     output_path: str,
     compression: Optional[str],
 ) -> Optional[str]:
+    # Arrow IPC intermediates are intentionally uncompressed: they are internal
+    # full-table shuffle files, so avoiding codec work is the fast path.
+    _ = compression
     iterators = [iter(_iter_partition_groups(path)) for path in input_paths]
     heap: List[Tuple[int, int, pa.Table]] = []
-    writer: Optional[pq.ParquetWriter] = None
+    writer: Optional[ipc.RecordBatchFileWriter] = None
+    sink: Optional[pa.OSFile] = None
     writer_schema: Optional[pa.Schema] = None
 
     for iterator_id, iterator in enumerate(iterators):
@@ -238,13 +260,13 @@ def _merge_sorted_partition_files(
             partition_id, iterator_id, table = heapq.heappop(heap)
             if writer is None:
                 writer_schema = _nullable_schema(table.schema)
-                writer = pq.ParquetWriter(
-                    where=output_path,
-                    schema=writer_schema,
-                    compression=compression,
-                )
+                sink = pa.OSFile(output_path, "wb")
+                writer = ipc.new_file(sink, writer_schema)
             assert writer_schema is not None
-            writer.write_table(_cast_table_to_schema(table, writer_schema))
+            writer.write_table(
+                _cast_table_to_schema(table, writer_schema),
+                max_chunksize=_INTERMEDIATE_BATCH_SIZE,
+            )
 
             try:
                 next_partition_id, next_table = next(iterators[iterator_id])
@@ -254,6 +276,8 @@ def _merge_sorted_partition_files(
     finally:
         if writer is not None:
             writer.close()
+        if sink is not None:
+            sink.close()
 
     return output_path
 
@@ -327,7 +351,7 @@ def _merge_sorted_partition_files_to_fan_in(
 
                 for chunk_start in range(0, len(level_paths), fan_in):
                     chunk = level_paths[chunk_start:chunk_start + fan_in]
-                    chunk_path = level_dir / f"run_{len(next_paths):06d}.parquet"
+                    chunk_path = level_dir / f"run_{len(next_paths):06d}{_INTERMEDIATE_SUFFIX}"
                     merged = _merge_sorted_partition_files(chunk, str(chunk_path), compression)
                     if merged is not None:
                         next_paths.append(merged)
@@ -403,14 +427,18 @@ def _assignment_stage_worker(
             if reducer_table.num_rows == 0:
                 continue
             sorted_table = _sort_by_partition_id(reducer_table)
-            run_path = split_dir / f"reducer_{reducer_id:06d}_run_{batch_index:06d}.parquet"
-            pq.write_table(sorted_table, str(run_path), compression=compression)
+            run_path = split_dir / (
+                f"reducer_{reducer_id:06d}_run_{batch_index:06d}{_INTERMEDIATE_SUFFIX}"
+            )
+            _write_intermediate_table(str(run_path), sorted_table)
             reducer_run_paths[reducer_id].append(str(run_path))
             rows_assigned += sorted_table.num_rows
 
     intermediate_by_reducer: Dict[int, str] = {}
     for reducer_id, run_paths in reducer_run_paths.items():
-        merged_path = split_dir / f"mapper_{split_index:06d}_reducer_{reducer_id:06d}.parquet"
+        merged_path = split_dir / (
+            f"mapper_{split_index:06d}_reducer_{reducer_id:06d}{_INTERMEDIATE_SUFFIX}"
+        )
         merged = _merge_sorted_partition_files(run_paths, str(merged_path), compression)
         if merged is not None:
             intermediate_by_reducer[reducer_id] = merged

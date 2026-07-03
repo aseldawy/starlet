@@ -15,6 +15,7 @@ import pytest
 from pathlib import Path
 import numpy as np
 import pyarrow as pa
+import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
 
 import starlet._internal.tiling.two_stage_orchestrator as two_stage_module
@@ -147,11 +148,11 @@ class TestTwoStageOrchestrator:
             [pa.array([1], type=pa.int64()), pa.array([None], type=pa.int64())],
             schema=schema_nullable,
         )
-        first_path = temp_dir / "first.parquet"
-        second_path = temp_dir / "second.parquet"
-        output_path = temp_dir / "merged.parquet"
-        pq.write_table(first, str(first_path))
-        pq.write_table(second, str(second_path))
+        first_path = temp_dir / "first.arrow"
+        second_path = temp_dir / "second.arrow"
+        output_path = temp_dir / "merged.arrow"
+        two_stage_module._write_intermediate_table(str(first_path), first)
+        two_stage_module._write_intermediate_table(str(second_path), second)
 
         merged = two_stage_module._merge_sorted_partition_files(
             [str(first_path), str(second_path)],
@@ -160,7 +161,8 @@ class TestTwoStageOrchestrator:
         )
 
         assert merged == str(output_path)
-        result = pq.read_table(str(output_path))
+        with pa.memory_map(str(output_path), "r") as source:
+            result = ipc.open_file(source).read_all()
         assert result["MADRank"].to_pylist() == [10, None]
         assert result.schema.field("MADRank").nullable
 
@@ -232,10 +234,11 @@ class TestTwoStageOrchestrator:
 
         run_dirs = list(temp_parent.glob("starlet_two_stage_*"))
         assert len(run_dirs) == 1
-        intermediate_files = list(run_dirs[0].glob("split_*/mapper_*_reducer_*.parquet"))
+        intermediate_files = list(run_dirs[0].glob("split_*/mapper_*_reducer_*.arrow"))
         assert intermediate_files
         for path in intermediate_files:
-            tile_ids = pq.read_table(str(path), columns=["_tile_id"])["_tile_id"].to_pylist()
+            with pa.memory_map(str(path), "r") as source:
+                tile_ids = ipc.open_file(source).read_all()["_tile_id"].to_pylist()
             assert tile_ids == sorted(tile_ids)
 
 

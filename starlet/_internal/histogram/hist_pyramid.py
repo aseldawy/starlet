@@ -8,11 +8,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from shapely import from_wkb
-from shapely.geometry import (
-    Point, LineString, LinearRing, Polygon,
-    MultiPoint, MultiLineString, MultiPolygon, GeometryCollection
-)
+from shapely import from_wkb, get_coordinates
 from pyproj import Transformer
 
 from starlet._internal.progress import iter_with_progress
@@ -43,33 +39,18 @@ class HistConfig:
 # GEOMETRY HELPERS
 # ---------------------------------------------------------------------------
 
-def _geometry_vertices_iter(g):
+def _geometry_vertices_array(g) -> np.ndarray:
     if g is None or g.is_empty:
-        return
+        return np.empty((0, 2), dtype=np.float64)
+    coords = get_coordinates(g)
+    if coords.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray(coords[:, :2], dtype=np.float64)
 
-    if isinstance(g, Point):
-        yield (g.x, g.y)
 
-    elif isinstance(g, (LineString, LinearRing)):
-        for x, y in g.coords:
-            yield (x, y)
-
-    elif isinstance(g, Polygon):
-        for x, y in g.exterior.coords:
-            yield (x, y)
-        for ring in g.interiors:
-            for x, y in ring.coords:
-                yield (x, y)
-
-    elif isinstance(g, (MultiPoint, MultiLineString, MultiPolygon, GeometryCollection)):
-        for sub in g.geoms:
-            yield from _geometry_vertices_iter(sub)
-
-    else:
-        coords = getattr(g, "coords", None)
-        if coords is not None:
-            for x, y in coords:
-                yield (x, y)
+def _geometry_vertices_iter(g):
+    for x, y in _geometry_vertices_array(g):
+        yield (float(x), float(y))
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +64,7 @@ def _accumulate_vertices_hist(
     bbox_out,
     transformer,
 ):
-    """Transform each vertex and increment its histogram cell in place."""
+    """Transform vertices in batches and increment histogram cells in place."""
     geoms = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
 
     minx, miny, maxx, maxy = bbox_out
@@ -91,27 +72,39 @@ def _accumulate_vertices_hist(
     inv_h = 1.0 / (maxy - miny)
     grid_size = histogram.shape[0]
 
-    for g in geoms:
-        if g is None or g.is_empty:
-            continue
+    coords = get_coordinates(geoms)
+    if coords.size == 0:
+        return
 
-        for x, y in _geometry_vertices_iter(g):
-            transformed_x, transformed_y = transformer.transform(x, y)
-            if not (np.isfinite(transformed_x) and np.isfinite(transformed_y)):
-                logger.debug(
-                    "Skipping histogram vertex with non-finite transformed coordinates: "
-                    "input=(%s, %s) transformed=(%s, %s)",
-                    x,
-                    y,
-                    transformed_x,
-                    transformed_y,
-                )
-                continue
-            ix = int((transformed_x - minx) * inv_w * grid_size)
-            iy = int((transformed_y - miny) * inv_h * grid_size)
-            ix = min(max(ix, 0), grid_size - 1)
-            iy = min(max(iy, 0), grid_size - 1)
-            histogram[grid_size - 1 - iy, ix] += 1
+    coords = np.asarray(coords[:, :2], dtype=np.float64)
+    xs = coords[:, 0]
+    ys = coords[:, 1]
+    transformed_x, transformed_y = transformer.transform(xs, ys)
+    transformed_x = np.asarray(transformed_x, dtype=np.float64)
+    transformed_y = np.asarray(transformed_y, dtype=np.float64)
+    if transformed_x.ndim == 0:
+        transformed_x = np.full_like(xs, float(transformed_x))
+    if transformed_y.ndim == 0:
+        transformed_y = np.full_like(ys, float(transformed_y))
+
+    finite = np.isfinite(transformed_x) & np.isfinite(transformed_y)
+    skipped = int(finite.size - np.count_nonzero(finite))
+    if skipped:
+        logger.debug(
+            "Skipping %d histogram vertices with non-finite transformed coordinates",
+            skipped,
+        )
+
+    if not np.any(finite):
+        return
+
+    transformed_x = transformed_x[finite]
+    transformed_y = transformed_y[finite]
+    ix = ((transformed_x - minx) * inv_w * grid_size).astype(np.int64)
+    iy = ((transformed_y - miny) * inv_h * grid_size).astype(np.int64)
+    ix = np.clip(ix, 0, grid_size - 1)
+    iy = np.clip(iy, 0, grid_size - 1)
+    np.add.at(histogram, (grid_size - 1 - iy, ix), 1)
 
 
 # ---------------------------------------------------------------------------

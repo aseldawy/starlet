@@ -4,6 +4,7 @@ from .sketches import (
     NumericSketch,
     CategoricalSketch,
     TextSketch,
+    TemporalSketch,
     GeometrySketch,
 )
 
@@ -33,8 +34,8 @@ class AttributeStatsCollector:
                 self.sketches[name] = NumericSketch()
             elif pa.types.is_boolean(t):
                 self.sketches[name] = CategoricalSketch()
-            elif pa.types.is_timestamp(t) or pa.types.is_date(t):
-                self.sketches[name] = NumericSketch()
+            elif pa.types.is_timestamp(t) or pa.types.is_date(t) or pa.types.is_time(t):
+                self.sketches[name] = TemporalSketch()
             elif pa.types.is_string(t) or pa.types.is_large_string(t):
                 self.sketches[name] = TextSketch()
             else:

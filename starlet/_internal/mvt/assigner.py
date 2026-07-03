@@ -162,7 +162,16 @@ class TileAssigner:
         the geometry touches, so the keep/drop decision is consistent
         across tile boundaries.
         """
+        if geom is None or geom.is_empty:
+            logger.debug("Skipping empty geometry during MVT assignment")
+            return
         minx, miny, maxx, maxy = geom.bounds
+        if not all(math.isfinite(value) for value in (minx, miny, maxx, maxy)):
+            logger.debug(
+                "Skipping geometry with non-finite bounds during MVT assignment: %s",
+                (minx, miny, maxx, maxy),
+            )
+            return
         priority = random.random()
 
         for z in self.zooms:

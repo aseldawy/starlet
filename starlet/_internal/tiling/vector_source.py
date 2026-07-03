@@ -18,6 +18,7 @@ from starlet._internal.tiling.datasource import (
     _normalize_decimal_columns,
     _wkb_geometry_type,
 )
+from starlet._internal.tiling.nonlinear_wkb import linearize_wkb
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +107,7 @@ class _OGRVectorSource(DataSource):
         splits = [split] if split is not None else self.create_splits()
         for source_split in splits:
             try:
-                gdf = self._read_split(source_split)
+                table = self._read_split(source_split)
             except Exception:
                 logger.exception(
                     "Failed reading vector source split (%s, %s)",
@@ -114,22 +115,97 @@ class _OGRVectorSource(DataSource):
                     _probe_vector_split_geometry_types(source_split),
                 )
                 raise
-            if gdf.empty:
+            if table.num_rows == 0:
                 continue
-            yield self._geodataframe_to_table(gdf, source_split)
+            yield table
 
-    def _read_split(self, split: VectorLayerSplit):
+    def _read_split(self, split: VectorLayerSplit) -> pa.Table:
         import pyogrio
 
         columns = [] if self.geometry_only else None
-        return pyogrio.read_dataframe(
+        meta, table = self._read_arrow_split(split, columns=columns)
+        geometry_name = _geometry_column_name(meta, table)
+        if not geometry_name:
+            if columns == []:
+                meta, table = self._read_arrow_split(split, columns=None)
+                geometry_name = _geometry_column_name(meta, table)
+            if not geometry_name:
+                raise ValueError(
+                    "Vector split did not contain a geometry column: "
+                    f"{_vector_split_context(split)}"
+                )
+
+        fid_column = meta.get("fid_column")
+        converted_geometries: List[bytes] = []
+        keep_indices: List[int] = []
+        skipped = 0
+        linearized = 0
+        geometry_values = table[geometry_name].to_pylist()
+        for index, value in enumerate(geometry_values):
+            try:
+                converted = linearize_wkb(value)
+            except Exception:
+                skipped += 1
+                continue
+            if converted is None:
+                skipped += 1
+                continue
+            if converted != value:
+                linearized += 1
+            converted_geometries.append(converted)
+            keep_indices.append(index)
+
+        if not keep_indices:
+            logger.warning(
+                "Skipped all records with unsupported geometries in vector source split (%s)",
+                _vector_split_context(split),
+            )
+            return pa.table([pa.array([], type=pa.binary())], names=[self.geom_col])
+
+        if len(keep_indices) != table.num_rows:
+            table = table.take(pa.array(keep_indices, type=pa.int64()))
+
+        drop_columns = {geometry_name}
+        if fid_column:
+            drop_columns.add(fid_column)
+        props_table = table.drop([name for name in drop_columns if name in table.column_names])
+        if self.geometry_only:
+            props_table = pa.table({})
+
+        source_crs = meta.get("crs")
+        geometry_col = pa.array(converted_geometries, type=pa.binary())
+        out = (
+            pa.table([geometry_col], names=[self.geom_col])
+            if props_table.num_columns == 0
+            else props_table.append_column(self.geom_col, geometry_col)
+        )
+        schema_with_geo = _attach_geoparquet_metadata(
+            out.schema,
+            str(source_crs) if source_crs else None,
+        )
+        out = out.replace_schema_metadata(schema_with_geo.metadata).combine_chunks()
+        if linearized or skipped:
+            logger.warning(
+                "Linearized nonlinear WKB in vector source split (%s, linearized_records=%d, "
+                "skipped_records=%d)",
+                _vector_split_context(split),
+                linearized,
+                skipped,
+            )
+        return out
+
+    @staticmethod
+    def _read_arrow_split(split: VectorLayerSplit, *, columns: List[str] | None):
+        import pyogrio
+
+        return pyogrio.read_arrow(
             split.path,
             layer=split.layer,
             columns=columns,
             read_geometry=True,
             skip_features=split.skip_features,
             max_features=split.max_features,
-            use_arrow=True,
+            return_fids=True,
         )
 
     def _geodataframe_to_table(self, gdf, split: VectorLayerSplit) -> pa.Table:
@@ -258,6 +334,20 @@ def _geodataframe_geometry_types(gdf) -> str:
     return ", ".join(f"{geom_type}={count}" for geom_type, count in counts.items()) or "<none>"
 
 
+def _geometry_column_name(meta: dict, table: pa.Table) -> str | None:
+    geometry_name = meta.get("geometry_name")
+    if geometry_name and geometry_name in table.column_names:
+        return geometry_name
+    if "wkb_geometry" in table.column_names:
+        return "wkb_geometry"
+    geometry_columns = [
+        field.name
+        for field in table.schema
+        if (field.metadata or {}).get(b"ARROW:extension:name") == b"geoarrow.wkb"
+    ]
+    return geometry_columns[0] if geometry_columns else None
+
+
 def _probe_vector_split_geometry_types(split: VectorLayerSplit) -> str:
     try:
         import pyogrio
@@ -271,8 +361,8 @@ def _probe_vector_split_geometry_types(split: VectorLayerSplit) -> str:
             max_features=split.max_features,
             return_fids=True,
         )
-        geometry_name = meta.get("geometry_name")
-        if not geometry_name or geometry_name not in table.column_names:
+        geometry_name = _geometry_column_name(meta, table)
+        if not geometry_name:
             return "actual_wkb_geometry_types=<unavailable: no geometry column>"
 
         values = table[geometry_name].to_pylist()
@@ -293,7 +383,11 @@ def _probe_vector_split_geometry_types(split: VectorLayerSplit) -> str:
 
         summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
         if unavailable:
-            summary = f"{summary}, unavailable={unavailable}" if summary else f"unavailable={unavailable}"
+            summary = (
+                f"{summary}, unavailable={unavailable}"
+                if summary
+                else f"unavailable={unavailable}"
+            )
         examples_summary = ", ".join(
             f"{name}=[{', '.join(ids)}]" for name, ids in sorted(examples.items())
         )

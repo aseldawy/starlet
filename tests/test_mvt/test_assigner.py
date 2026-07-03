@@ -194,6 +194,26 @@ class TestGeometryAssignment:
             # Should be assigned to multiple tiles
             assert len(buckets[6]) > 1
 
+    def test_empty_geometry_is_skipped(self, sample_prefix_sum):
+        assigner = TileAssigner(zooms=[6], prefix=sample_prefix_sum, threshold=0)
+        assigner.compute_nonempty()
+
+        assigner.assign_geometry(Point(), {"id": 1})
+
+        assert assigner.buckets == {}
+
+    def test_geometry_with_non_finite_bounds_is_skipped(self, sample_prefix_sum):
+        class NaNBoundsGeometry:
+            is_empty = False
+            bounds = (float("nan"), 0.0, 1.0, 1.0)
+
+        assigner = TileAssigner(zooms=[6], prefix=sample_prefix_sum, threshold=0)
+        assigner.compute_nonempty()
+
+        assigner.assign_geometry(NaNBoundsGeometry(), {"id": 1})
+
+        assert assigner.buckets == {}
+
     def test_priority_consistency(self, sample_prefix_sum):
         """Test that same geometry gets same priority across tiles.
 

@@ -9,6 +9,7 @@ Tests cover:
 """
 import json
 import logging
+import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 import geopandas as gpd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyproj import Transformer
 from shapely.geometry import Point
 from shapely import wkb
 
@@ -31,6 +33,22 @@ from starlet._internal.tiling.datasource import (
     _iter_geojson_xy,
 )
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
+
+
+def _linestring_wkb(coords):
+    data = bytearray(struct.pack("<BI", 1, 2))
+    data.extend(struct.pack("<I", len(coords)))
+    for x, y in coords:
+        data.extend(struct.pack("<dd", x, y))
+    return bytes(data)
+
+
+def _multicurve_wkb(lines):
+    data = bytearray(struct.pack("<BI", 1, 11))
+    data.extend(struct.pack("<I", len(lines)))
+    for coords in lines:
+        data.extend(_linestring_wkb(coords))
+    return bytes(data)
 
 
 class TestGeoParquetSource:
@@ -86,6 +104,34 @@ class TestGeoParquetSource:
         for table in source.iter_tables():
             assert table.column_names == ["geometry"]
             break
+
+    def test_geoparquet_source_preserves_native_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        table = pa.table({
+            "geometry": [wkb.dumps(Point(x, y))],
+            "id": [1],
+        })
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:3857"}},
+        }
+        table = table.replace_schema_metadata({
+            b"geo": json.dumps(geo).encode("utf-8"),
+        })
+        parquet_path = temp_dir / "mercator.parquet"
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path))
+        result = next(source.iter_tables())
+        point = wkb.loads(result["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(result.schema.metadata[b"geo"].decode("utf-8"))
+        assert geo["columns"]["geometry"]["crs"] == "EPSG:3857"
 
     def test_multiple_row_groups(self, temp_dir, sample_polygons):
         """Test reading Parquet file with multiple row groups."""
@@ -618,6 +664,27 @@ class TestCSVSource:
         assert sample.total_sampled == 2
         assert sample.sample_points.shape == (2, 2)
 
+    def test_csv_source_preserves_native_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        csv_path = temp_dir / "mercator_points.csv"
+        csv_path.write_text(f"id,x,y\n1,{x},{y}\n")
+
+        source = CSVSource(
+            str(csv_path),
+            x_col="x",
+            y_col="y",
+            src_crs="EPSG:3857",
+        )
+        table = next(source.iter_tables())
+        point = wkb.loads(table["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(table.schema.metadata[b"geo"].decode("utf-8"))
+        assert geo["columns"]["geometry"]["crs"] == "EPSG:3857"
+
 
 class TestShapefileSource:
     def test_reads_shapefile_and_geometry_only_projection(self, temp_dir):
@@ -644,14 +711,32 @@ class TestShapefileSource:
 
         assert isinstance(source, ShapefileSource)
 
-    def test_logs_file_layer_and_geometry_type_on_read_error(self, temp_dir, monkeypatch, caplog):
+    def test_preserves_shapefile_source_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        shp_path = temp_dir / "mercator_points.shp"
+        gdf = gpd.GeoDataFrame(
+            {"id": [1]},
+            geometry=[Point(x, y)],
+            crs="EPSG:3857",
+        )
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = ShapefileSource(str(shp_path), geometry_only=True)
+        table = next(source.iter_tables())
+        point = wkb.loads(table["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(table.schema.metadata[b"geo"].decode("utf-8"))
+        assert "3857" in str(geo["columns"]["geometry"]["crs"])
+
+    def test_linearizes_nonlinear_geometry_on_read_error(self, temp_dir, monkeypatch, caplog):
         import pyogrio
 
         shp_path = temp_dir / "curves.shp"
         shp_path.touch()
-
-        def raise_unsupported_geometry(*args, **kwargs):
-            raise NotImplementedError("Nonlinear geometry types are not currently supported")
 
         def read_arrow_with_actual_multicurve(*args, **kwargs):
             return (
@@ -659,7 +744,7 @@ class TestShapefileSource:
                 pa.table(
                     {
                         "OBJECTID": [123],
-                        "SHAPE": [b"\x01\x0b\x00\x00\x00"],
+                        "SHAPE": [_multicurve_wkb([[(0.0, 0.0), (1.0, 1.0)]])],
                     }
                 ),
             )
@@ -673,20 +758,21 @@ class TestShapefileSource:
                 "geometry_type": "CurvePolygon",
             },
         )
-        monkeypatch.setattr(pyogrio, "read_dataframe", raise_unsupported_geometry)
         monkeypatch.setattr(pyogrio, "read_arrow", read_arrow_with_actual_multicurve)
 
         source = ShapefileSource(str(shp_path))
 
-        with caplog.at_level(logging.ERROR, logger="starlet._internal.tiling.vector_source"):
-            with pytest.raises(NotImplementedError):
-                list(source.iter_tables())
+        with caplog.at_level(logging.WARNING, logger="starlet._internal.tiling.vector_source"):
+            tables = list(source.iter_tables())
 
+        assert len(tables) == 1
+        geom = wkb.loads(tables[0]["geometry"][0].as_py())
+        assert geom.geom_type == "MultiLineString"
+        assert list(geom.geoms[0].coords) == [(0.0, 0.0), (1.0, 1.0)]
         assert "curves.shp" in caplog.text
         assert "layer='curves'" in caplog.text
         assert "geometry_type=CurvePolygon" in caplog.text
-        assert "actual_wkb_geometry_types=MultiCurve=1" in caplog.text
-        assert "sample_feature_ids_by_type=MultiCurve=[123]" in caplog.text
+        assert "linearized_records=1" in caplog.text
         assert "skip_features=0" in caplog.text
 
 

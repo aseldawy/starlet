@@ -14,6 +14,7 @@ import errno
 import pytest
 from pathlib import Path
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 import starlet._internal.tiling.two_stage_orchestrator as two_stage_module
@@ -128,6 +129,40 @@ class TestTwoStageOrchestrator:
         assert observed_chunk_sizes[:3] == [8, 4, 2]
         assert len(result) == 2
         assert all(Path(path).exists() for path in result)
+
+    def test_merge_relaxes_non_nullable_fields_when_later_files_have_nulls(self, temp_dir):
+        schema_non_nullable = pa.schema([
+            pa.field("_tile_id", pa.int64(), nullable=False),
+            pa.field("MADRank", pa.int64(), nullable=False),
+        ])
+        schema_nullable = pa.schema([
+            pa.field("_tile_id", pa.int64(), nullable=False),
+            pa.field("MADRank", pa.int64(), nullable=True),
+        ])
+        first = pa.table(
+            [pa.array([1], type=pa.int64()), pa.array([10], type=pa.int64())],
+            schema=schema_non_nullable,
+        )
+        second = pa.table(
+            [pa.array([1], type=pa.int64()), pa.array([None], type=pa.int64())],
+            schema=schema_nullable,
+        )
+        first_path = temp_dir / "first.parquet"
+        second_path = temp_dir / "second.parquet"
+        output_path = temp_dir / "merged.parquet"
+        pq.write_table(first, str(first_path))
+        pq.write_table(second, str(second_path))
+
+        merged = two_stage_module._merge_sorted_partition_files(
+            [str(first_path), str(second_path)],
+            str(output_path),
+            compression=None,
+        )
+
+        assert merged == str(output_path)
+        result = pq.read_table(str(output_path))
+        assert result["MADRank"].to_pylist() == [10, None]
+        assert result.schema.field("MADRank").nullable
 
     def test_two_stage_orchestrator_writes_all_rows(self, sample_parquet_file, sample_polygons, temp_dir):
         source = GeoParquetSource(str(sample_parquet_file))

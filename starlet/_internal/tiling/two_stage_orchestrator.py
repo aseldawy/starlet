@@ -100,6 +100,22 @@ def _sort_by_partition_id(table: pa.Table) -> pa.Table:
     return table.sort_by([(_TILE_COL, "ascending")])
 
 
+def _nullable_schema(schema: pa.Schema) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field(field.name, field.type, nullable=True, metadata=field.metadata)
+            for field in schema
+        ],
+        metadata=schema.metadata,
+    )
+
+
+def _cast_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
+    if table.schema.equals(schema):
+        return table
+    return table.cast(schema, safe=False)
+
+
 def _iter_partition_groups(path: str, batch_size: int = 64_000) -> Iterator[Tuple[int, pa.Table]]:
     parquet_file = pq.ParquetFile(path)
     current_partition: Optional[int] = None
@@ -205,6 +221,7 @@ def _merge_sorted_partition_files(
     iterators = [iter(_iter_partition_groups(path)) for path in input_paths]
     heap: List[Tuple[int, int, pa.Table]] = []
     writer: Optional[pq.ParquetWriter] = None
+    writer_schema: Optional[pa.Schema] = None
 
     for iterator_id, iterator in enumerate(iterators):
         try:
@@ -220,12 +237,14 @@ def _merge_sorted_partition_files(
         while heap:
             partition_id, iterator_id, table = heapq.heappop(heap)
             if writer is None:
+                writer_schema = _nullable_schema(table.schema)
                 writer = pq.ParquetWriter(
                     where=output_path,
-                    schema=table.schema,
+                    schema=writer_schema,
                     compression=compression,
                 )
-            writer.write_table(table)
+            assert writer_schema is not None
+            writer.write_table(_cast_table_to_schema(table, writer_schema))
 
             try:
                 next_partition_id, next_table = next(iterators[iterator_id])

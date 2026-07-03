@@ -5,6 +5,7 @@ assignment workers and merges them in the parent process. These tests verify
 that merging partial collectors yields the same result as a single pass.
 """
 import random
+from datetime import datetime, timedelta
 
 import pyarrow as pa
 from shapely import wkb
@@ -23,6 +24,10 @@ def _make_table(n, seed):
         "num": [random.randint(0, 500) for _ in range(n)],
         "cat": [random.choice(["a", "b", "c", "d"]) for _ in range(n)],
         "name": [random.choice(["alpha", "beta", "gamma"]) for _ in range(n)],
+        "observed_at": [
+            datetime(2024, 1, 1) + timedelta(hours=random.randint(0, 100))
+            for _ in range(n)
+        ],
     })
 
 
@@ -55,6 +60,9 @@ def test_merge_matches_single_pass():
     assert merged["num"]["approx_distinct"] == expected["num"]["approx_distinct"]
     assert merged["cat"]["non_null_count"] == expected["cat"]["non_null_count"]
     assert merged["cat"]["approx_distinct"] == expected["cat"]["approx_distinct"]
+    assert merged["observed_at"]["non_null_count"] == expected["observed_at"]["non_null_count"]
+    assert merged["observed_at"]["min"] == expected["observed_at"]["min"]
+    assert merged["observed_at"]["max"] == expected["observed_at"]["max"]
     assert merged["geometry"]["mbr"] == expected["geometry"]["mbr"]
     assert merged["geometry"]["total_points"] == expected["geometry"]["total_points"]
 

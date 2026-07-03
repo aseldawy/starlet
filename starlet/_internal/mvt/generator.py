@@ -19,7 +19,7 @@ class BucketMVTGenerator:
          assigns each geometry to overlapping tiles (with reservoir sampling
          to cap features per tile)
       3. **GeometryStreamer** — decodes WKB geometries from GeoParquet row
-         groups and reprojects EPSG:4326 → EPSG:3857 (vectorised, array-at-a-time)
+         groups and reprojects their stored CRS to EPSG:3857 (vectorised, array-at-a-time)
       4. **TileRenderer** — clips, simplifies, transforms to tile coords,
          and encodes each tile as a ``.mvt`` Protobuf file, in parallel across
          ``max_workers`` cores

@@ -194,6 +194,57 @@ class TextSketch(CategoricalSketch):
         }
 
 
+class TemporalSketch:
+    def __init__(self):
+        self.non_null = 0
+        self.min = None
+        self.max = None
+        self.hll = HyperLogLog(p=12)
+        self.topk = SpaceSavingTopK()
+
+    def update(self, values):
+        for v in values:
+            if v is None:
+                continue
+
+            self.non_null += 1
+            if self.min is None or v < self.min:
+                self.min = v
+            if self.max is None or v > self.max:
+                self.max = v
+
+            s = _json_scalar(v)
+            self.hll.update(s.encode("utf-8"))
+            self.topk.update([s])
+
+    def merge(self, other: "TemporalSketch"):
+        self.non_null += other.non_null
+        if other.min is not None:
+            self.min = other.min if self.min is None else min(self.min, other.min)
+        if other.max is not None:
+            self.max = other.max if self.max is None else max(self.max, other.max)
+        self.hll.merge(other.hll)
+        self.topk.merge(other.topk)
+        return self
+
+    def finalize(self):
+        return {
+            "non_null_count": self.non_null,
+            "min": _json_scalar(self.min),
+            "max": _json_scalar(self.max),
+            "approx_distinct": int(self.hll.count()),
+            "top_k": self.topk.result(),
+        }
+
+
+def _json_scalar(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 class GeometrySketch:
     def __init__(self, global_mbr=None):
         """

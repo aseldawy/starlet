@@ -16,6 +16,7 @@ from shapely.geometry import (
 from pyproj import Transformer
 
 from starlet._internal.progress import iter_with_progress
+from starlet._internal.tiling.crs import WGS84_CRS, geoparquet_crs
 from starlet._internal.tiling.datasource import GeoParquetSource
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,16 @@ def _accumulate_vertices_hist(
 
         for x, y in _geometry_vertices_iter(g):
             transformed_x, transformed_y = transformer.transform(x, y)
+            if not (np.isfinite(transformed_x) and np.isfinite(transformed_y)):
+                logger.debug(
+                    "Skipping histogram vertex with non-finite transformed coordinates: "
+                    "input=(%s, %s) transformed=(%s, %s)",
+                    x,
+                    y,
+                    transformed_x,
+                    transformed_y,
+                )
+                continue
             ix = int((transformed_x - minx) * inv_w * grid_size)
             iy = int((transformed_y - miny) * inv_h * grid_size)
             ix = min(max(ix, 0), grid_size - 1)
@@ -138,12 +149,17 @@ def _process_split_group(
         geom_col=geom_col,
     )
     dtype = np.dtype(cfg.dtype)
-    transformer = Transformer.from_crs("EPSG:4326", cfg.out_crs, always_xy=True)
     bbox = GLOBAL_BBOX
     base = np.zeros((cfg.grid_size, cfg.grid_size), dtype=dtype)
+    transformers = {}
 
     for split in splits:
         for table in source.iter_tables(split):
+            source_crs = geoparquet_crs(table.schema, geom_col) or WGS84_CRS
+            transformer = transformers.get(str(source_crs))
+            if transformer is None:
+                transformer = Transformer.from_crs(source_crs, cfg.out_crs, always_xy=True)
+                transformers[str(source_crs)] = transformer
             _accumulate_vertices_hist(
                 table.combine_chunks(),
                 base,

@@ -808,16 +808,21 @@ def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> p
     """
     md = dict(schema.metadata or {})
     if b"geo" in md:
-        return pa.schema(schema, metadata=md)
+        try:
+            geo = json.loads(md[b"geo"].decode("utf-8"))
+        except Exception:
+            geo = {}
+    else:
+        geo = {}
 
-    geo = {
-        "version": "1.1.0",
-        "primary_column": "geometry",
-        "columns": {"geometry": {"encoding": "WKB"}},
-    }
+    geo.setdefault("version", "1.1.0")
+    geo.setdefault("primary_column", "geometry")
+    columns = geo.setdefault("columns", {})
+    geometry_meta = columns.setdefault("geometry", {})
+    geometry_meta.setdefault("encoding", "WKB")
     if crs_hint:
         try:
-            geo["columns"]["geometry"]["crs"] = crs_hint
+            geometry_meta["crs"] = crs_hint
         except Exception:
             pass
 

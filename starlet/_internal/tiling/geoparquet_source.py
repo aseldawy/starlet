@@ -8,7 +8,11 @@ from typing import Iterable, List, Optional, Tuple
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from starlet._internal.tiling.datasource import DataSource, _GEOPARQUET_SUFFIXES, _source_files
+from starlet._internal.tiling.datasource import (
+    DataSource,
+    _GEOPARQUET_SUFFIXES,
+    _source_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,5 +110,3 @@ class GeoParquetSource(DataSource):
                     source_split.path,
                 )
                 yield pf.read_row_group(row_group, columns=selected_columns)
-
-

@@ -7,6 +7,8 @@ from pathlib import Path
 from pyproj import Transformer
 import logging
 
+from starlet._internal.tiling.crs import WGS84_CRS, WEB_MERCATOR_CRS, geoparquet_crs
+
 logger = logging.getLogger("bucket_mvt")
 
 
@@ -18,22 +20,39 @@ class GeometryStreamer:
 
     def __init__(self, parquet_dir=None):
         self.parquet_dir = Path(parquet_dir) if parquet_dir is not None else None
-        self.to_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        self._transformers = {}
 
-    def _reproject_coords(self, coords):
-        """Reproject an (N, 2) coordinate array EPSG:4326 → EPSG:3857 in bulk."""
-        x, y = self.to_3857.transform(coords[:, 0], coords[:, 1])
+    def _reproject_coords(self, coords, transformer):
+        """Reproject an (N, 2) coordinate array to EPSG:3857 in bulk."""
+        x, y = transformer.transform(coords[:, 0], coords[:, 1])
         return np.column_stack([x, y])
+
+    def _transformer_for(self, source_crs):
+        key = str(source_crs or WGS84_CRS)
+        transformer = self._transformers.get(key)
+        if transformer is None:
+            transformer = Transformer.from_crs(
+                source_crs or WGS84_CRS,
+                WEB_MERCATOR_CRS,
+                always_xy=True,
+            )
+            self._transformers[key] = transformer
+        return transformer
 
     def _decode_table(self, table):
         # Vectorised decode/repair/reproject over the whole row group. The old
         # per-geometry path spent ~75% of its time in the coordinate-by-coordinate
         # pyproj callback; doing it array-at-a-time (shapely 2 + pyproj bulk
         # transform) is ~8x faster for the WKB→make_valid→reproject stage.
+        source_crs = geoparquet_crs(table.schema) or WGS84_CRS
+        transformer = self._transformer_for(source_crs)
         wkb_arr = table["geometry"].to_numpy(zero_copy_only=False)
         geoms = shapely.from_wkb(wkb_arr)
         geoms = shapely.make_valid(geoms)
-        geoms = shapely.transform(geoms, self._reproject_coords)
+        geoms = shapely.transform(
+            geoms,
+            lambda coords: self._reproject_coords(coords, transformer),
+        )
 
         # Extract all columns except geometry
         attrs = {

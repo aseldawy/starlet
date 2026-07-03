@@ -56,12 +56,13 @@ class GeoJSONSource(DataSource):
             raise ValueError(f"No GeoJSON files found in {self.path}")
         self.batch_rows = int(batch_rows)
         self.src_crs = src_crs
-        self.target_crs = target_crs  # informational only here
+        self.target_crs = target_crs
         self.keep_null_geoms = keep_null_geoms
 
         if target_crs:
             logger.warning(
-                "target_crs requested (%s) but GeoJSON reader does not reproject on the fly; data will be read as-is.",
+                "target_crs requested (%s) but GeoJSONSource preserves source CRS; "
+                "projection is handled by downstream stages.",
                 target_crs,
             )
 
@@ -81,12 +82,12 @@ class GeoJSONSource(DataSource):
                 # Empty input file. Create a minimal schema with geometry column.
                 base = pa.schema([("geometry", pa.binary())])
                 self._schema = _attach_geoparquet_metadata(
-                    base, self._crs_hint or self.target_crs or self.src_crs
+                    base, self._crs_hint or self.src_crs
                 )
             else:
                 # Lock schema with GeoParquet metadata
                 self._schema = _attach_geoparquet_metadata(
-                    first.schema, self._crs_hint or self.target_crs or self.src_crs
+                    first.schema, self._crs_hint or self.src_crs
                 )
 
         return self._schema
@@ -109,7 +110,7 @@ class GeoJSONSource(DataSource):
 
     def iter_tables(self, split: Optional[GeoJSONSplit] = None) -> Iterable[pa.Table]:
         batch_index = 0
-        crs_value = self._crs_hint or self.target_crs or self.src_crs
+        crs_value = self._crs_hint or self.src_crs
 
         import geopandas as gpd
 
@@ -219,4 +220,3 @@ class GeoJSONSource(DataSource):
                 out_cols.append(pa.nulls(t.num_rows, type=fld.type))
 
         return pa.table(out_cols, names=[f.name for f in schema])
-

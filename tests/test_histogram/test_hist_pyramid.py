@@ -11,14 +11,21 @@ Tests cover:
 import json
 import pytest
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pathlib import Path
+from pyproj import Transformer
 from shapely.geometry import Point, LineString, Polygon, MultiPoint, GeometryCollection
+from shapely import wkb
 
 from starlet._internal.histogram.hist_pyramid import (
+    _accumulate_vertices_hist,
     _geometry_vertices_iter,
+    _process_split_group,
     HistConfig,
     build_histograms_for_dir,
 )
+from starlet._internal.tiling.datasource import GeoParquetSource
 
 
 class TestGeometryVertexIteration:
@@ -231,6 +238,48 @@ class TestHistogramAccumulation:
         # This would require exposing _accumulate_vertices_hist or testing
         # through the full pipeline
         pass
+
+    def test_non_finite_transformed_vertices_are_skipped(self):
+        table = pa.table({"geometry": [wkb.dumps(Point(0, 0))]})
+        histogram = np.zeros((4, 4), dtype=np.float64)
+
+        class InfiniteTransformer:
+            def transform(self, x, y):
+                return float("inf"), float("inf")
+
+        _accumulate_vertices_hist(
+            table,
+            histogram,
+            "geometry",
+            (-1.0, -1.0, 1.0, 1.0),
+            InfiniteTransformer(),
+        )
+
+        assert histogram.sum() == 0
+
+    def test_histogram_uses_geoparquet_source_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:3857"}},
+        }
+        tile_dir = temp_dir / "tiles"
+        tile_dir.mkdir()
+        table = pa.table({"geometry": [wkb.dumps(Point(x, y))]})
+        table = table.replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+        pq.write_table(table, tile_dir / "tile_000000__0_0_0_0.parquet")
+
+        source = GeoParquetSource(str(tile_dir), geometry_only=True)
+        hist = _process_split_group(
+            str(tile_dir),
+            source.create_splits(),
+            HistConfig(grid_size=16),
+            "geometry",
+        )
+        assert hist.sum() == 1
 
     def test_multiple_vertices_same_cell(self):
         """Test that multiple vertices in the same cell accumulate correctly."""

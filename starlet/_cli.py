@@ -7,10 +7,30 @@ import sys
 import click
 
 
+_LOG_RECORD_FACTORY_INSTALLED = False
+
+
+def _install_relative_seconds_factory() -> None:
+    global _LOG_RECORD_FACTORY_INSTALLED
+    if _LOG_RECORD_FACTORY_INSTALLED:
+        return
+
+    old_factory = logging.getLogRecordFactory()
+
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.relativeSeconds = record.relativeCreated / 1000.0
+        return record
+
+    logging.setLogRecordFactory(record_factory)
+    _LOG_RECORD_FACTORY_INSTALLED = True
+
+
 def _setup_logging(log_level: str) -> None:
+    _install_relative_seconds_factory()
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(relativeCreated).0fms] %(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s [%(relativeSeconds).3fs] %(levelname)s %(name)s: %(message)s",
     )
 
 

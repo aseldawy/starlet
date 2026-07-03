@@ -330,6 +330,114 @@ def _spatial_sample_from_state(
     )
 
 
+_WKB_GEOMETRY_TYPES = {
+    1: "Point",
+    2: "LineString",
+    3: "Polygon",
+    4: "MultiPoint",
+    5: "MultiLineString",
+    6: "MultiPolygon",
+    7: "GeometryCollection",
+    8: "CircularString",
+    9: "CompoundCurve",
+    10: "CurvePolygon",
+    11: "MultiCurve",
+    12: "MultiSurface",
+    13: "Curve",
+    14: "Surface",
+    15: "PolyhedralSurface",
+    16: "TIN",
+    17: "Triangle",
+}
+
+
+def _decode_wkb_geometries(values: Any, *, geom_col: str, context: str) -> Any:
+    try:
+        return from_wkb(values)
+    except Exception:
+        logger.exception(
+            "Failed decoding WKB geometries (%s, geom_col=%s, wkb_geometry_types=%s)",
+            context,
+            geom_col,
+            _wkb_geometry_type_summary(values),
+        )
+        raise
+
+
+def _split_context(source_path: Any, split: Any) -> str:
+    parts = [f"path={getattr(split, 'path', source_path)}"]
+    context_attrs = (
+        "layer",
+        "geometry_type",
+        "row_groups",
+        "offset",
+        "length",
+        "skip_features",
+        "max_features",
+    )
+    for attr in context_attrs:
+        if hasattr(split, attr):
+            parts.append(f"{attr}={getattr(split, attr)!r}")
+    return " ".join(parts)
+
+
+def _wkb_geometry_type_summary(values: Any, limit: int = 64) -> str:
+    counts: Dict[str, int] = {}
+    inspected = 0
+    unavailable = 0
+    for value in values:
+        if inspected >= limit:
+            break
+        inspected += 1
+        geometry_type = _wkb_geometry_type(value)
+        if geometry_type is None:
+            unavailable += 1
+            continue
+        counts[geometry_type] = counts.get(geometry_type, 0) + 1
+
+    pieces = [f"{name}={count}" for name, count in sorted(counts.items())]
+    if unavailable:
+        pieces.append(f"unavailable={unavailable}")
+    return ", ".join(pieces) or "<none>"
+
+
+def _wkb_geometry_type(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        data = bytes(value)
+    except Exception:
+        return None
+    if len(data) < 5:
+        return None
+
+    byte_order = data[0]
+    if byte_order == 0:
+        raw_type = int.from_bytes(data[1:5], "big")
+    elif byte_order == 1:
+        raw_type = int.from_bytes(data[1:5], "little")
+    else:
+        return None
+
+    has_z = bool(raw_type & 0x80000000)
+    has_m = bool(raw_type & 0x40000000)
+    base_type = raw_type & 0x0000FFFF
+    if base_type >= 3000:
+        has_z = True
+        has_m = True
+        base_type -= 3000
+    elif base_type >= 2000:
+        has_m = True
+        base_type -= 2000
+    elif base_type >= 1000:
+        has_z = True
+        base_type -= 1000
+
+    name = _WKB_GEOMETRY_TYPES.get(base_type, f"type_code_{base_type}")
+    suffix = ("Z" if has_z else "") + ("M" if has_m else "")
+    return f"{name}{suffix}" if suffix else name
+
+
 def _read_geoparquet_spatial_sample(
     path: str,
     *,
@@ -399,7 +507,11 @@ def _read_geoparquet_split_spatial_sample(
             continue
         n_batches += 1
         table = ensure_large_types(table, geom_col)
-        geometries = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
+        geometries = _decode_wkb_geometries(
+            table[geom_col].to_numpy(zero_copy_only=False),
+            geom_col=geom_col,
+            context=_split_context(path, split),
+        )
 
         for geom in geometries:
             if geom is None or geom.is_empty:
@@ -502,7 +614,11 @@ def _read_datasource_split_spatial_sample(
             continue
         n_batches += 1
         table = ensure_large_types(table, geom_col)
-        geometries = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
+        geometries = _decode_wkb_geometries(
+            table[geom_col].to_numpy(zero_copy_only=False),
+            geom_col=geom_col,
+            context=_split_context(getattr(source, "path", "<source>"), split),
+        )
 
         for geom in geometries:
             if geom is None or geom.is_empty:

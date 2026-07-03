@@ -16,6 +16,7 @@ from starlet._internal.tiling.datasource import (
     _ZIP_SUFFIXES,
     _attach_geoparquet_metadata,
     _normalize_decimal_columns,
+    _wkb_geometry_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class VectorLayerSplit:
     layer: str | None
     skip_features: int
     max_features: int | None
+    geometry_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,7 @@ class _VectorLayer:
     path: str
     layer: str | None
     feature_count: int | None
+    geometry_type: str | None = None
 
 
 class _OGRVectorSource(DataSource):
@@ -83,7 +86,9 @@ class _OGRVectorSource(DataSource):
         splits: List[VectorLayerSplit] = []
         for layer in self._layers:
             if layer.feature_count is None or layer.feature_count < 0:
-                splits.append(VectorLayerSplit(layer.path, layer.layer, 0, None))
+                splits.append(
+                    VectorLayerSplit(layer.path, layer.layer, 0, None, layer.geometry_type)
+                )
                 continue
             for offset in range(0, layer.feature_count, chunk_size):
                 splits.append(
@@ -92,6 +97,7 @@ class _OGRVectorSource(DataSource):
                         layer=layer.layer,
                         skip_features=offset,
                         max_features=min(chunk_size, layer.feature_count - offset),
+                        geometry_type=layer.geometry_type,
                     )
                 )
         return splits
@@ -99,10 +105,18 @@ class _OGRVectorSource(DataSource):
     def iter_tables(self, split: Optional[VectorLayerSplit] = None) -> Iterable[pa.Table]:
         splits = [split] if split is not None else self.create_splits()
         for source_split in splits:
-            gdf = self._read_split(source_split)
+            try:
+                gdf = self._read_split(source_split)
+            except Exception:
+                logger.exception(
+                    "Failed reading vector source split (%s, %s)",
+                    _vector_split_context(source_split),
+                    _probe_vector_split_geometry_types(source_split),
+                )
+                raise
             if gdf.empty:
                 continue
-            yield self._geodataframe_to_table(gdf)
+            yield self._geodataframe_to_table(gdf, source_split)
 
     def _read_split(self, split: VectorLayerSplit):
         import pyogrio
@@ -118,8 +132,19 @@ class _OGRVectorSource(DataSource):
             use_arrow=True,
         )
 
-    def _geodataframe_to_table(self, gdf) -> pa.Table:
-        geometry_col = pa.array(to_wkb(gdf.geometry.array, hex=False).tolist(), type=pa.binary())
+    def _geodataframe_to_table(self, gdf, split: VectorLayerSplit) -> pa.Table:
+        try:
+            geometry_col = pa.array(
+                to_wkb(gdf.geometry.array, hex=False).tolist(),
+                type=pa.binary(),
+            )
+        except Exception:
+            logger.exception(
+                "Failed converting vector geometries to WKB (%s, dataframe_geometry_types=%s)",
+                _vector_split_context(split),
+                _geodataframe_geometry_types(gdf),
+            )
+            raise
         props_df = pd.DataFrame(index=gdf.index) if self.geometry_only else gdf.drop(columns=gdf.geometry.name)
         props_df = _normalize_decimal_columns(props_df)
         props_table = pa.Table.from_pandas(props_df, preserve_index=False)
@@ -148,13 +173,27 @@ class _OGRVectorSource(DataSource):
         except Exception:
             layer_info = []
         layer_names = [str(row[0]) for row in layer_info] if len(layer_info) else [None]
+        layer_types = {
+            str(row[0]): str(row[1])
+            for row in layer_info
+            if len(row) > 1 and row[1] is not None
+        }
         for layer_name in layer_names:
             try:
                 info = pyogrio.read_info(path, layer=layer_name, force_feature_count=True)
                 feature_count = info.get("features")
+                geometry_type = info.get("geometry_type") or layer_types.get(str(layer_name))
             except Exception:
                 feature_count = None
-            layers.append(_VectorLayer(path=path, layer=layer_name, feature_count=feature_count))
+                geometry_type = layer_types.get(str(layer_name))
+            layers.append(
+                _VectorLayer(
+                    path=path,
+                    layer=layer_name,
+                    feature_count=feature_count,
+                    geometry_type=geometry_type,
+                )
+            )
         return layers
 
 
@@ -199,3 +238,68 @@ class GDBSource(_OGRVectorSource):
 
 def _zip_vsi_path(path: Path) -> str:
     return f"/vsizip/{path}"
+
+
+def _vector_split_context(split: VectorLayerSplit) -> str:
+    return (
+        f"path={split.path} "
+        f"layer={split.layer!r} "
+        f"geometry_type={split.geometry_type or '<unknown>'} "
+        f"skip_features={split.skip_features} "
+        f"max_features={split.max_features}"
+    )
+
+
+def _geodataframe_geometry_types(gdf) -> str:
+    try:
+        counts = gdf.geometry.geom_type.value_counts(dropna=False).to_dict()
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+    return ", ".join(f"{geom_type}={count}" for geom_type, count in counts.items()) or "<none>"
+
+
+def _probe_vector_split_geometry_types(split: VectorLayerSplit) -> str:
+    try:
+        import pyogrio
+
+        meta, table = pyogrio.read_arrow(
+            split.path,
+            layer=split.layer,
+            columns=[],
+            read_geometry=True,
+            skip_features=split.skip_features,
+            max_features=split.max_features,
+            return_fids=True,
+        )
+        geometry_name = meta.get("geometry_name")
+        if not geometry_name or geometry_name not in table.column_names:
+            return "actual_wkb_geometry_types=<unavailable: no geometry column>"
+
+        values = table[geometry_name].to_pylist()
+        fid_column = meta.get("fid_column")
+        fids = table[fid_column].to_pylist() if fid_column in table.column_names else None
+        counts: dict[str, int] = {}
+        examples: dict[str, list[str]] = {}
+        unavailable = 0
+        for index, value in enumerate(values):
+            geometry_type = _wkb_geometry_type(value)
+            if geometry_type is None:
+                unavailable += 1
+                continue
+            counts[geometry_type] = counts.get(geometry_type, 0) + 1
+            if len(examples.setdefault(geometry_type, [])) < 5:
+                feature_id = fids[index] if fids is not None else split.skip_features + index
+                examples[geometry_type].append(str(feature_id))
+
+        summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+        if unavailable:
+            summary = f"{summary}, unavailable={unavailable}" if summary else f"unavailable={unavailable}"
+        examples_summary = ", ".join(
+            f"{name}=[{', '.join(ids)}]" for name, ids in sorted(examples.items())
+        )
+        return (
+            f"actual_wkb_geometry_types={summary or '<none>'} "
+            f"sample_feature_ids_by_type={examples_summary or '<none>'}"
+        )
+    except Exception as exc:
+        return f"actual_wkb_geometry_types=<unavailable: {exc}>"

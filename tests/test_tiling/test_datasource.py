@@ -8,6 +8,7 @@ Tests cover:
 - Schema validation
 """
 import json
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -642,6 +643,51 @@ class TestShapefileSource:
         source = source_for_path(str(shp_path))
 
         assert isinstance(source, ShapefileSource)
+
+    def test_logs_file_layer_and_geometry_type_on_read_error(self, temp_dir, monkeypatch, caplog):
+        import pyogrio
+
+        shp_path = temp_dir / "curves.shp"
+        shp_path.touch()
+
+        def raise_unsupported_geometry(*args, **kwargs):
+            raise NotImplementedError("Nonlinear geometry types are not currently supported")
+
+        def read_arrow_with_actual_multicurve(*args, **kwargs):
+            return (
+                {"geometry_name": "SHAPE", "fid_column": "OBJECTID"},
+                pa.table(
+                    {
+                        "OBJECTID": [123],
+                        "SHAPE": [b"\x01\x0b\x00\x00\x00"],
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["curves", "CurvePolygon"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "CurvePolygon",
+            },
+        )
+        monkeypatch.setattr(pyogrio, "read_dataframe", raise_unsupported_geometry)
+        monkeypatch.setattr(pyogrio, "read_arrow", read_arrow_with_actual_multicurve)
+
+        source = ShapefileSource(str(shp_path))
+
+        with caplog.at_level(logging.ERROR, logger="starlet._internal.tiling.vector_source"):
+            with pytest.raises(NotImplementedError):
+                list(source.iter_tables())
+
+        assert "curves.shp" in caplog.text
+        assert "layer='curves'" in caplog.text
+        assert "geometry_type=CurvePolygon" in caplog.text
+        assert "actual_wkb_geometry_types=MultiCurve=1" in caplog.text
+        assert "sample_feature_ids_by_type=MultiCurve=[123]" in caplog.text
+        assert "skip_features=0" in caplog.text
 
 
 class TestDataSourceIntegration:

@@ -24,6 +24,10 @@ from starlet._internal.progress import iter_with_progress
 logger = logging.getLogger(__name__)
 _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
 _GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
+_CSV_SUFFIXES = (".csv",)
+_SHAPEFILE_SUFFIXES = (".shp",)
+_ZIP_SUFFIXES = (".zip",)
+_GDB_SUFFIXES = (".gdb",)
 
 
 class DataSource:
@@ -58,6 +62,11 @@ def is_geojson_path(path: str) -> bool:
     return p.endswith(_GEOJSON_SUFFIXES)
 
 
+def is_csv_path(path: str) -> bool:
+    p = path.lower()
+    return p.endswith(_CSV_SUFFIXES)
+
+
 def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     source_path = Path(path)
     if source_path.is_file():
@@ -72,41 +81,102 @@ def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
 
 
 def _is_geojson_source(path: str) -> bool:
+    return _source_kind(path) == "geojson"
+
+
+def _source_kind(path: str) -> str:
     source_path = Path(path)
     if source_path.is_file():
-        return is_geojson_path(path)
+        suffix = source_path.suffix.lower()
+        if suffix in _GEOJSON_SUFFIXES:
+            return "geojson"
+        if suffix in _GEOPARQUET_SUFFIXES:
+            return "geoparquet"
+        if suffix in _CSV_SUFFIXES:
+            return "csv"
+        if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
+            return "shapefile"
+        raise ValueError(f"Unsupported source file type: {path}")
 
-    geojson_files = _source_files(path, _GEOJSON_SUFFIXES)
-    geoparquet_files = _source_files(path, _GEOPARQUET_SUFFIXES)
-    if geojson_files and not geoparquet_files:
-        return True
-    if geoparquet_files and not geojson_files:
-        return False
-    if geojson_files and geoparquet_files:
-        raise ValueError(f"Source directory contains both GeoJSON and GeoParquet files: {path}")
-    raise ValueError(f"No GeoJSON or GeoParquet files found in {path}")
+    if source_path.is_dir() and source_path.suffix.lower() in _GDB_SUFFIXES:
+        return "gdb"
+
+    source_types = []
+    if _source_files(path, _GEOJSON_SUFFIXES):
+        source_types.append("geojson")
+    if _source_files(path, _GEOPARQUET_SUFFIXES):
+        source_types.append("geoparquet")
+    if _source_files(path, _CSV_SUFFIXES):
+        source_types.append("csv")
+    if _source_files(path, _SHAPEFILE_SUFFIXES) or _source_files(path, _ZIP_SUFFIXES):
+        source_types.append("shapefile")
+    if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
+        source_types.append("gdb")
+
+    if len(source_types) == 1:
+        return source_types[0]
+    if source_types:
+        raise ValueError(f"Source directory contains multiple supported source types: {path}")
+    raise ValueError(f"No supported geospatial files found in {path}")
 
 
-def source_for_path(path: str, **geojson_kwargs) -> DataSource:
-    """Create the appropriate source reader for a GeoParquet/GeoJSON path."""
-    if _is_geojson_source(path):
+def source_for_path(
+    path: str,
+    *,
+    geom_col: str = "geometry",
+    csv_x_col: str | None = None,
+    csv_y_col: str | None = None,
+    csv_wkt_col: str | None = None,
+    csv_split_size: int = 32 * 1024 * 1024,
+    csv_batch_rows: int | None = None,
+    src_crs: str = "EPSG:4326",
+    **geojson_kwargs,
+) -> DataSource:
+    """Create the appropriate source reader for a supported geospatial path."""
+    kind = _source_kind(path)
+    if kind == "geojson":
         return GeoJSONSource(path, **geojson_kwargs)
-    return GeoParquetSource(path)
+    if kind == "geoparquet":
+        return GeoParquetSource(path)
+    if kind == "csv":
+        return CSVSource(
+            path,
+            x_col=csv_x_col,
+            y_col=csv_y_col,
+            wkt_col=csv_wkt_col,
+            split_size=csv_split_size,
+            batch_rows=csv_batch_rows,
+            src_crs=src_crs,
+            geom_col=geom_col,
+        )
+    if kind == "shapefile":
+        return ShapefileSource(path, geom_col=geom_col)
+    if kind == "gdb":
+        return GDBSource(path, geom_col=geom_col)
+    raise ValueError(f"Unsupported source: {path}")
 
 
 def read_spatial_sample(
     path: str,
     *,
     geom_col: str = "geometry",
+    csv_x_col: str | None = None,
+    csv_y_col: str | None = None,
+    csv_wkt_col: str | None = None,
+    csv_split_size: int = 32 * 1024 * 1024,
+    csv_batch_rows: int | None = None,
+    src_crs: str = "EPSG:4326",
     sample_ratio: float = 1.0,
     sample_cap: Optional[int] = None,
     seed: int = 42,
     geojson_workers: Optional[int] = None,
     geojson_executor: str = "process",
     geoparquet_workers: Optional[int] = None,
+    source_workers: Optional[int] = None,
 ) -> SpatialSample:
     """Read a file once and return centroid sample points plus the global MBR."""
-    if _is_geojson_source(path):
+    kind = _source_kind(path)
+    if kind == "geojson":
         return _read_geojson_spatial_sample(
             path,
             sample_ratio=sample_ratio,
@@ -115,13 +185,49 @@ def read_spatial_sample(
             geojson_workers=geojson_workers,
             geojson_executor=geojson_executor,
         )
-    return _read_geoparquet_spatial_sample(
+    if kind == "geoparquet":
+        return _read_geoparquet_spatial_sample(
+            path,
+            geom_col=geom_col,
+            sample_ratio=sample_ratio,
+            sample_cap=sample_cap,
+            seed=seed,
+            geoparquet_workers=geoparquet_workers,
+        )
+
+    source = source_for_path(
         path,
+        geom_col=geom_col,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=csv_split_size,
+        csv_batch_rows=csv_batch_rows,
+        src_crs=src_crs,
+    )
+    if isinstance(source, CSVSource):
+        source = CSVSource(
+            path,
+            x_col=csv_x_col,
+            y_col=csv_y_col,
+            wkt_col=csv_wkt_col,
+            split_size=csv_split_size,
+            batch_rows=csv_batch_rows,
+            src_crs=src_crs,
+            geometry_only=True,
+            geom_col=geom_col,
+        )
+    elif isinstance(source, ShapefileSource):
+        source = ShapefileSource(path, geometry_only=True, geom_col=geom_col)
+    elif isinstance(source, GDBSource):
+        source = GDBSource(path, geometry_only=True, geom_col=geom_col)
+    return _read_datasource_spatial_sample(
+        source,
         geom_col=geom_col,
         sample_ratio=sample_ratio,
         sample_cap=sample_cap,
         seed=seed,
-        geoparquet_workers=geoparquet_workers,
+        source_workers=source_workers,
     )
 
 
@@ -279,6 +385,109 @@ def _read_geoparquet_split_spatial_sample(
 ) -> SpatialSample:
     """Read one GeoParquet row-group split for parallel spatial sampling."""
     source = GeoParquetSource(path, geometry_only=True, geom_col=geom_col)
+    rng = np.random.default_rng(seed)
+    mins = np.array([+np.inf, +np.inf], dtype=np.float64)
+    maxs = np.array([-np.inf, -np.inf], dtype=np.float64)
+    x_sample: List[float] = []
+    y_sample: List[float] = []
+    n_seen = 0
+    n_batches = 0
+
+    for table in source.iter_tables(split):
+        table = table.combine_chunks()
+        if table.num_rows == 0:
+            continue
+        n_batches += 1
+        table = ensure_large_types(table, geom_col)
+        geometries = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
+
+        for geom in geometries:
+            if geom is None or geom.is_empty:
+                continue
+            minx, miny, maxx, maxy = geom.bounds
+            if minx < mins[0]:
+                mins[0] = minx
+            if miny < mins[1]:
+                mins[1] = miny
+            if maxx > maxs[0]:
+                maxs[0] = maxx
+            if maxy > maxs[1]:
+                maxs[1] = maxy
+
+            centroid = geom.centroid
+            n_seen += 1
+            _reservoir_add(
+                rng=rng,
+                sample_cap=sample_cap,
+                sample_ratio=sample_ratio,
+                x_sample=x_sample,
+                y_sample=y_sample,
+                n_seen=n_seen,
+                x=float(centroid.x),
+                y=float(centroid.y),
+            )
+
+    return _spatial_sample_from_state(
+        x_sample=x_sample,
+        y_sample=y_sample,
+        mins=mins,
+        maxs=maxs,
+        n_seen=n_seen,
+        batches_read=n_batches,
+    )
+
+
+def _read_datasource_spatial_sample(
+    source: DataSource,
+    *,
+    geom_col: str,
+    sample_ratio: float,
+    sample_cap: Optional[int],
+    seed: int,
+    source_workers: Optional[int],
+) -> SpatialSample:
+    splits = source.create_splits()
+    sample_caps = _split_sample_cap(sample_cap, len(splits))
+
+    logger.info(
+        "Reading spatial sample from %s in %d source partitions with %s thread workers",
+        getattr(source, "path", "<source>"),
+        len(splits),
+        source_workers or "auto",
+    )
+
+    with ThreadPoolExecutor(max_workers=source_workers) as executor:
+        futures = [
+            executor.submit(
+                _read_datasource_split_spatial_sample,
+                source,
+                split,
+                geom_col,
+                sample_ratio,
+                sample_caps[index],
+                seed + index,
+            )
+            for index, split in enumerate(splits)
+        ]
+        parts: List[SpatialSample] = []
+        for future in iter_with_progress(
+            as_completed(futures),
+            total=len(futures),
+            logger=logger,
+            label="MBR + sample",
+        ):
+            parts.append(future.result())
+        return _combine_spatial_samples(parts)
+
+
+def _read_datasource_split_spatial_sample(
+    source: DataSource,
+    split: Any,
+    geom_col: str,
+    sample_ratio: float,
+    sample_cap: Optional[int],
+    seed: int,
+) -> SpatialSample:
     rng = np.random.default_rng(seed)
     mins = np.array([+np.inf, +np.inf], dtype=np.float64)
     maxs = np.array([-np.inf, -np.inf], dtype=np.float64)
@@ -638,3 +847,5 @@ def _extract_feature_collection_crs_hint(buffer: str) -> Optional[str]:
 # this module.
 from starlet._internal.tiling.geojson_source import GeoJSONSource, GeoJSONSplit
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
+from starlet._internal.tiling.csv_source import CSVSource, CSVSplit
+from starlet._internal.tiling.vector_source import GDBSource, ShapefileSource, VectorLayerSplit

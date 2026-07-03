@@ -35,6 +35,11 @@ def tile(
     sfc_bits: int = 16,
     max_parallel_files: int = 64,
     covering_bbox: bool = False,
+    csv_x_col: str | None = None,
+    csv_y_col: str | None = None,
+    csv_wkt_col: str | None = None,
+    csv_split_size: int = 32 * 1024 * 1024,
+    src_crs: str = "EPSG:4326",
     geojson_executor: str = "process",
     orchestrator: str = "two-stage",
     two_stage_executor: str = "process",
@@ -79,6 +84,15 @@ def tile(
         tile server can skip row groups/rows at read time. Off by default
         (faster batch tiling, smaller files); enable when serving tiles
         on the fly from these partitions.
+    csv_x_col, csv_y_col : str | None
+        Column names containing x/y coordinates for CSV inputs. Provide both,
+        or provide ``csv_wkt_col`` instead.
+    csv_wkt_col : str | None
+        Column name containing WKT geometry for CSV inputs.
+    csv_split_size : int
+        Target byte length for each CSV source split.
+    src_crs : str
+        CRS hint for CSV inputs and other sources without embedded CRS.
     geojson_executor : str
         Executor used for GeoJSON spatial sampling: ``"process"`` for
         production CPU parallelism or ``"thread"`` for small inputs / test
@@ -128,7 +142,15 @@ def tile(
     sort_mode = _sort_map.get(sort.strip().lower(), SortMode.ZORDER)
 
     # Build data source and choose a format-appropriate default size.
-    source = source_for_path(input)
+    source = source_for_path(
+        input,
+        geom_col=geom_col,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=csv_split_size,
+        src_crs=src_crs,
+    )
     if partition_size is None:
         partition_size = (
             _GEOJSON_DEFAULT_PARTITION_SIZE
@@ -155,6 +177,11 @@ def tile(
         seed=seed,
         sample_ratio=sample_ratio,
         sample_cap=sample_cap,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=csv_split_size,
+        src_crs=src_crs,
         geojson_executor=geojson_executor,
     )
     assigner = RSGroveAssigner.from_sample_and_mbr(

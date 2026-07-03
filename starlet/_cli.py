@@ -40,7 +40,7 @@ def main():
 
 
 @main.command()
-@click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
+@click.option("--input", "input_path", required=True, help="Path to a supported geospatial source.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
 @click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
 @click.option("--sort", default="zorder", show_default=True, type=click.Choice(["zorder", "hilbert", "columns", "none"]), help="Row sort order within each tile.")
@@ -49,6 +49,11 @@ def main():
 @click.option("--sample-ratio", type=float, default=1.0, show_default=True, help="Bernoulli sampling ratio (0 < r <= 1).")
 @click.option("--seed", type=int, default=42, show_default=True, help="Random seed for partitioner.")
 @click.option("--geom-col", default="geometry", show_default=True, help="Geometry column name.")
+@click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
+@click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
+@click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--csv-split-size", default="32mb", show_default=True, help="Target byte size for each CSV source split.")
+@click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
 @click.option("--sfc-bits", type=int, default=16, show_default=True, help="Bits per axis for Z-order key.")
 @click.option("--max-parallel-files", type=int, default=64, show_default=True, help="Max concurrent tile writes.")
 @click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
@@ -64,6 +69,7 @@ def main():
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def tile(input_path, outdir, partition_size, sort, compression,
          sample_cap, sample_ratio, seed, geom_col, sfc_bits, max_parallel_files,
+         csv_x_col, csv_y_col, csv_wkt_col, csv_split_size, src_crs,
          covering_bbox, geojson_executor, orchestrator, two_stage_executor,
          two_stage_assignment_workers, two_stage_write_workers, two_stage_reducers,
          temp_dir, log_level):
@@ -81,6 +87,11 @@ def tile(input_path, outdir, partition_size, sort, compression,
         sample_ratio=sample_ratio,
         seed=seed,
         geom_col=geom_col,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=_parse_size(csv_split_size),
+        src_crs=src_crs,
         sfc_bits=sfc_bits,
         max_parallel_files=max_parallel_files,
         covering_bbox=covering_bbox,
@@ -120,19 +131,25 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 
 
 @main.command()
-@click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
+@click.option("--input", "input_path", required=True, help="Path to a supported geospatial source.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
 @click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
 @click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per MVT tile.")
 @click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
               help="Opt-in: write per-row bbox covering columns for fast on-demand serving.")
+@click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
+@click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
+@click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--csv-split-size", default="32mb", show_default=True, help="Target byte size for each CSV source split.")
+@click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
 @click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
 @click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
 @click.option("--pmtiles", is_flag=True, help="Export MVT tiles to PMTiles archive after generation.")
 @click.option("--pmtiles-compression", default="gzip", show_default=True, type=click.Choice(["gzip", "brotli", "zstd", "none"]), help="PMTiles compression format.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
+          csv_x_col, csv_y_col, csv_wkt_col, csv_split_size, src_crs,
           geojson_executor, orchestrator, pmtiles, pmtiles_compression, log_level):
     """Run the full pipeline: tile then generate MVTs."""
     _setup_logging(log_level)
@@ -145,6 +162,11 @@ def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
         partition_size=_parse_size(partition_size) if partition_size else None,
         threshold=threshold,
         covering_bbox=covering_bbox,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=_parse_size(csv_split_size),
+        src_crs=src_crs,
         geojson_executor=geojson_executor,
         orchestrator=orchestrator,
         pmtiles=pmtiles,

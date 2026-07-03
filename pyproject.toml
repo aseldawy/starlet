@@ -17,6 +17,7 @@ dependencies = [
     "flask>=3",
     "flask-cors",
     "geopandas>=0.14",
+    "pyogrio>=0.8",
     "gunicorn",
     "datasketch",
     "pmtiles>=3.7",

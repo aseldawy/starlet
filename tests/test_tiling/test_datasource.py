@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import geopandas as gpd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from shapely.geometry import Point
@@ -22,7 +23,10 @@ from starlet._internal.tiling.datasource import (
     GeoJSONSplit,
     GeoParquetSource,
     GeoParquetSplit,
+    CSVSource,
+    ShapefileSource,
     read_spatial_sample,
+    source_for_path,
     _iter_geojson_xy,
 )
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
@@ -528,6 +532,116 @@ class TestGeoJSONSource:
             (9.0, 10.0),
             (7.0, 8.0),
         ]
+
+
+class TestCSVSource:
+    def test_xy_columns_are_converted_to_geometry(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["id", "x", "y", "geometry"]
+        assert tables[0]["id"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_byte_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text(
+            "id,x,y,name\n"
+            "1,0,1,alpha\n"
+            "2,2,3,beta\n"
+            "3,4,5,gamma\n"
+            "4,6,7,delta\n"
+        )
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        splits = source.create_splits(num_splits=5)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert ids == [1, 2, 3, 4]
+
+    def test_create_splits_does_not_open_csv(self, temp_dir, monkeypatch):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+
+        def fail_open(*args, **kwargs):
+            raise AssertionError("create_splits should not read CSV contents")
+
+        monkeypatch.setattr("builtins.open", fail_open)
+
+        splits = source.create_splits(num_splits=2)
+
+        assert splits
+        assert splits[0].offset == 0
+
+    def test_wkt_column_can_be_geometry_only(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,wkt\n1,POINT (0 1)\n2,POINT (2 3)\n")
+
+        source = CSVSource(str(csv_path), wkt_col="wkt", geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_source_for_path_detects_csv(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_col="x", csv_y_col="y")
+
+        assert isinstance(source, CSVSource)
+        assert next(source.iter_tables()).column_names[-1] == "geom"
+
+    def test_read_spatial_sample_uses_csv_geometry_columns(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_col="x",
+            csv_y_col="y",
+            source_workers=1,
+        )
+
+        assert sample.total_seen == 2
+        assert sample.total_sampled == 2
+        assert sample.sample_points.shape == (2, 2)
+
+
+class TestShapefileSource:
+    def test_reads_shapefile_and_geometry_only_projection(self, temp_dir):
+        shp_path = temp_dir / "points.shp"
+        gdf = gpd.GeoDataFrame(
+            {"id": [1, 2], "name": ["a", "b"]},
+            geometry=[Point(0, 1), Point(2, 3)],
+            crs="EPSG:4326",
+        )
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = ShapefileSource(str(shp_path), geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_source_for_path_detects_shapefile(self, temp_dir):
+        shp_path = temp_dir / "points.shp"
+        gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[Point(0, 1)], crs="EPSG:4326")
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = source_for_path(str(shp_path))
+
+        assert isinstance(source, ShapefileSource)
 
 
 class TestDataSourceIntegration:

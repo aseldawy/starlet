@@ -125,7 +125,6 @@ class ParquetIndex:
         schema = pq.ParquetFile(path).schema_arrow
         names = list(schema.names)
         has_bbox = all(c in names for c in BBOX_COLS)
-        crs = geoparquet_crs(schema) or WGS84_CRS
         geom_col = "geometry"
         if geom_col not in names:
             geom_col = names[-1] if names else "geometry"
@@ -136,6 +135,7 @@ class ParquetIndex:
                     geom_col = json.loads(raw).get("primary_column", geom_col)
                 except Exception:
                     pass
+        crs = geoparquet_crs(schema, geom_col) or WGS84_CRS
         info = (names, geom_col, has_bbox, crs)
         self._schema_cache[key] = info
         return info

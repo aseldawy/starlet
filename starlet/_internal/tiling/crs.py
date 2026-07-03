@@ -91,5 +91,11 @@ def geoparquet_crs(schema: pa.Schema, geom_col: str = "geometry") -> Any:
         logger.debug("Could not parse GeoParquet CRS metadata", exc_info=True)
         return None
     columns = geo.get("columns") or {}
-    geometry_meta = columns.get(geom_col) or columns.get("geometry") or {}
+    primary = geo.get("primary_column")
+    geometry_meta = (
+        columns.get(geom_col)
+        or columns.get(primary)
+        or columns.get("geometry")
+        or {}
+    )
     return geometry_meta.get("crs")

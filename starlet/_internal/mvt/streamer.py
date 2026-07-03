@@ -6,6 +6,7 @@ import shapely
 from pathlib import Path
 from pyproj import Transformer
 import logging
+import json
 
 from starlet._internal.tiling.crs import WGS84_CRS, WEB_MERCATOR_CRS, geoparquet_crs
 
@@ -44,9 +45,10 @@ class GeometryStreamer:
         # per-geometry path spent ~75% of its time in the coordinate-by-coordinate
         # pyproj callback; doing it array-at-a-time (shapely 2 + pyproj bulk
         # transform) is ~8x faster for the WKB→make_valid→reproject stage.
-        source_crs = geoparquet_crs(table.schema) or WGS84_CRS
+        geom_col = _geometry_column_name(table.schema)
+        source_crs = geoparquet_crs(table.schema, geom_col) or WGS84_CRS
         transformer = self._transformer_for(source_crs)
-        wkb_arr = table["geometry"].to_numpy(zero_copy_only=False)
+        wkb_arr = table[geom_col].to_numpy(zero_copy_only=False)
         geoms = shapely.from_wkb(wkb_arr)
         geoms = shapely.make_valid(geoms)
         geoms = shapely.transform(
@@ -58,7 +60,7 @@ class GeometryStreamer:
         attrs = {
             col: table[col].to_pylist()
             for col in table.column_names
-            if col != "geometry"
+            if col != geom_col
         }
 
         for i, geom in enumerate(geoms):
@@ -83,3 +85,24 @@ class GeometryStreamer:
             for rg in range(num_row_groups):
                 table = pf_obj.read_row_group(rg)
                 yield from self._decode_table(table)
+
+
+def _geometry_column_name(schema) -> str:
+    raw_geo = (schema.metadata or {}).get(b"geo")
+    if raw_geo:
+        try:
+            geo = json.loads(raw_geo.decode("utf-8"))
+        except Exception:
+            geo = {}
+        primary = geo.get("primary_column")
+        if isinstance(primary, str) and primary in schema.names:
+            return primary
+
+    if "geometry" in schema.names:
+        return "geometry"
+
+    for field in schema:
+        if (field.metadata or {}).get(b"ARROW:extension:name") == b"geoarrow.wkb":
+            return field.name
+
+    raise ValueError(f"No geometry column found in GeoParquet schema: {schema.names}")

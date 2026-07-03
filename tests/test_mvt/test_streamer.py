@@ -28,3 +28,22 @@ def test_streamer_reprojects_from_geoparquet_crs_to_web_mercator():
     assert geom.x == pytest.approx(x)
     assert geom.y == pytest.approx(y)
     assert attrs == {"id": 1}
+
+
+def test_streamer_uses_geoparquet_primary_geometry_column():
+    x, y = 10.0, 20.0
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "SHAPE",
+        "columns": {"SHAPE": {"encoding": "WKB", "crs": "EPSG:3857"}},
+    }
+    table = pa.table({
+        "SHAPE": [wkb.dumps(Point(x, y))],
+        "id": [1],
+    }).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+
+    geom, attrs = next(GeometryStreamer()._decode_table(table))
+
+    assert geom.x == pytest.approx(x)
+    assert geom.y == pytest.approx(y)
+    assert attrs == {"id": 1}

@@ -119,11 +119,8 @@ def tile(
     import math
     from pathlib import Path
 
-    from starlet._internal.tiling.datasource import (
-        is_geojson_path,
-        read_spatial_sample,
-        source_for_path,
-    )
+    from starlet._internal.tiling.datasource import read_spatial_sample, source_for_path
+    from starlet._internal.tiling.geojson_source import is_geojson_path
     from starlet._internal.tiling.assigner import RSGroveAssigner
     from starlet._internal.tiling.orchestrator import RoundOrchestrator
     from starlet._internal.tiling.two_stage_orchestrator import TwoStageOrchestrator
@@ -151,6 +148,7 @@ def tile(
         csv_split_size=csv_split_size,
         src_crs=src_crs,
     )
+    geom_col = getattr(source, "geom_col", geom_col)
     if partition_size is None:
         partition_size = (
             _GEOJSON_DEFAULT_PARTITION_SIZE
@@ -200,6 +198,7 @@ def tile(
             source=source,
             assigner=assigner,
             outdir=tiles_dir,
+            geom_col=geom_col,
             max_parallel_files=max_parallel_files,
             compression=compression,
             sort_mode=sort_mode,
@@ -211,6 +210,7 @@ def tile(
             source=source,
             assigner=assigner,
             outdir=tiles_dir,
+            geom_col=geom_col,
             compression=compression,
             sort_mode=sort_mode,
             sfc_bits=sfc_bits,

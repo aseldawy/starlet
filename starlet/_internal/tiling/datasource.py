@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, Optional, List, Dict, Any, Tuple
 import logging
 import json
 from pathlib import Path
 from decimal import Decimal
-import ijson
-from numbers import Number
-import io
 
 import pandas as pd
 import pyarrow as pa
@@ -17,14 +14,13 @@ import numpy as np
 from shapely import from_wkb
 
 from starlet._internal.tiling.RSGrove import EnvelopeNDLite
-from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 from starlet._internal.tiling.utils_large import ensure_large_types
 from starlet._internal.progress import iter_with_progress
 
 logger = logging.getLogger(__name__)
 _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
 _GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
-_CSV_SUFFIXES = (".csv",)
+_CSV_SUFFIXES = (".csv",".tsv",)
 _SHAPEFILE_SUFFIXES = (".shp",)
 _ZIP_SUFFIXES = (".zip",)
 _GDB_SUFFIXES = (".gdb",)
@@ -55,18 +51,7 @@ class SpatialSample:
     batches_read: int
 
 
-
 # ------------------------- Helpers ------------------------- #
-def is_geojson_path(path: str) -> bool:
-    p = path.lower()
-    return p.endswith(_GEOJSON_SUFFIXES)
-
-
-def is_csv_path(path: str) -> bool:
-    p = path.lower()
-    return p.endswith(_CSV_SUFFIXES)
-
-
 def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     source_path = Path(path)
     if source_path.is_file():
@@ -78,10 +63,6 @@ def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
             if file_path.is_file() and file_path.suffix.lower() in suffixes
         )
     raise FileNotFoundError(f"Source path does not exist: {path}")
-
-
-def _is_geojson_source(path: str) -> bool:
-    return _source_kind(path) == "geojson"
 
 
 def _source_kind(path: str) -> str:
@@ -137,7 +118,7 @@ def source_for_path(
     if kind == "geojson":
         return GeoJSONSource(path, **geojson_kwargs)
     if kind == "geoparquet":
-        return GeoParquetSource(path)
+        return GeoParquetSource(path, geom_col=geom_col)
     if kind == "csv":
         return CSVSource(
             path,
@@ -177,22 +158,22 @@ def read_spatial_sample(
     """Read a file once and return centroid sample points plus the global MBR."""
     kind = _source_kind(path)
     if kind == "geojson":
-        return _read_geojson_spatial_sample(
+        return GeoJSONSource.read_spatial_sample(
             path,
             sample_ratio=sample_ratio,
             sample_cap=sample_cap,
             seed=seed,
-            geojson_workers=geojson_workers,
-            geojson_executor=geojson_executor,
+            workers=geojson_workers,
+            executor=geojson_executor,
         )
     if kind == "geoparquet":
-        return _read_geoparquet_spatial_sample(
+        return GeoParquetSource.read_spatial_sample(
             path,
             geom_col=geom_col,
             sample_ratio=sample_ratio,
             sample_cap=sample_cap,
             seed=seed,
-            geoparquet_workers=geoparquet_workers,
+            workers=geoparquet_workers,
         )
 
     source = source_for_path(
@@ -438,117 +419,6 @@ def _wkb_geometry_type(value: Any) -> str | None:
     return f"{name}{suffix}" if suffix else name
 
 
-def _read_geoparquet_spatial_sample(
-    path: str,
-    *,
-    geom_col: str,
-    sample_ratio: float,
-    sample_cap: Optional[int],
-    seed: int,
-    geoparquet_workers: Optional[int],
-) -> SpatialSample:
-    """Sample GeoParquet row-group splits in parallel processes."""
-    source = GeoParquetSource(path, geometry_only=True, geom_col=geom_col)
-    splits = source.create_splits()
-    sample_caps = _split_sample_cap(sample_cap, len(splits))
-
-    logger.info(
-        "Reading GeoParquet spatial sample from %s in %d row-group partitions with %s process workers",
-        path,
-        len(splits),
-        geoparquet_workers or "auto",
-    )
-
-    with ProcessPoolExecutor(max_workers=geoparquet_workers) as executor:
-        futures = [
-            executor.submit(
-                _read_geoparquet_split_spatial_sample,
-                path,
-                split,
-                geom_col,
-                sample_ratio,
-                sample_caps[index],
-                seed + index,
-            )
-            for index, split in enumerate(splits)
-        ]
-        parts: List[SpatialSample] = []
-        for future in iter_with_progress(
-            as_completed(futures),
-            total=len(futures),
-            logger=logger,
-            label="MBR + sample",
-        ):
-            parts.append(future.result())
-        return _combine_spatial_samples(parts)
-
-
-def _read_geoparquet_split_spatial_sample(
-    path: str,
-    split: GeoParquetSplit,
-    geom_col: str,
-    sample_ratio: float,
-    sample_cap: Optional[int],
-    seed: int,
-) -> SpatialSample:
-    """Read one GeoParquet row-group split for parallel spatial sampling."""
-    source = GeoParquetSource(path, geometry_only=True, geom_col=geom_col)
-    rng = np.random.default_rng(seed)
-    mins = np.array([+np.inf, +np.inf], dtype=np.float64)
-    maxs = np.array([-np.inf, -np.inf], dtype=np.float64)
-    x_sample: List[float] = []
-    y_sample: List[float] = []
-    n_seen = 0
-    n_batches = 0
-
-    for table in source.iter_tables(split):
-        table = table.combine_chunks()
-        if table.num_rows == 0:
-            continue
-        n_batches += 1
-        table = ensure_large_types(table, geom_col)
-        geometries = _decode_wkb_geometries(
-            table[geom_col].to_numpy(zero_copy_only=False),
-            geom_col=geom_col,
-            context=_split_context(path, split),
-        )
-
-        for geom in geometries:
-            if geom is None or geom.is_empty:
-                continue
-            minx, miny, maxx, maxy = geom.bounds
-            if minx < mins[0]:
-                mins[0] = minx
-            if miny < mins[1]:
-                mins[1] = miny
-            if maxx > maxs[0]:
-                maxs[0] = maxx
-            if maxy > maxs[1]:
-                maxs[1] = maxy
-
-            centroid = geom.centroid
-            n_seen += 1
-            _reservoir_add(
-                rng=rng,
-                sample_cap=sample_cap,
-                sample_ratio=sample_ratio,
-                x_sample=x_sample,
-                y_sample=y_sample,
-                n_seen=n_seen,
-                x=float(centroid.x),
-                y=float(centroid.y),
-            )
-
-    return _spatial_sample_from_state(
-        x_sample=x_sample,
-        y_sample=y_sample,
-        mins=mins,
-        maxs=maxs,
-        n_seen=n_seen,
-        batches_read=n_batches,
-    )
-
-
 def _read_datasource_spatial_sample(
     source: DataSource,
     *,
@@ -656,145 +526,6 @@ def _read_datasource_split_spatial_sample(
     )
 
 
-def _read_geojson_spatial_sample(
-    path: str,
-    *,
-    sample_ratio: float,
-    sample_cap: Optional[int],
-    seed: int,
-    geojson_workers: Optional[int],
-    geojson_executor: str,
-) -> SpatialSample:
-    source = GeoJSONSource(path)
-    splits = source.create_splits()
-    sample_caps = _split_sample_cap(sample_cap, len(splits))
-
-    executor_cls = _geojson_executor_class(geojson_executor)
-    logger.info(
-        "Reading GeoJSON spatial sample from %s in %d partitions with %s %s workers",
-        path,
-        len(splits),
-        geojson_workers or "auto",
-        geojson_executor,
-    )
-
-    with executor_cls(max_workers=geojson_workers) as executor:
-        futures = [
-            executor.submit(
-                _read_geojson_partition_spatial_sample,
-                split.path,
-                split.offset,
-                split.length,
-                sample_ratio,
-                sample_caps[idx],
-                seed + idx,
-            )
-            for idx, split in enumerate(splits)
-        ]
-        parts: List[SpatialSample] = []
-        for future in iter_with_progress(
-            as_completed(futures),
-            total=len(futures),
-            logger=logger,
-            label="MBR + sample",
-        ):
-            parts.append(future.result())
-        return _combine_spatial_samples(parts)
-
-
-def _geojson_executor_class(kind: str):
-    normalized = kind.strip().lower()
-    if normalized in {"process", "processes", "multiprocessing"}:
-        return ProcessPoolExecutor
-    if normalized in {"thread", "threads", "threading"}:
-        return ThreadPoolExecutor
-    raise ValueError(
-        "geojson_executor must be 'process' or 'thread' "
-        f"(got {kind!r})"
-    )
-
-
-def _iter_geojson_xy(feature_json):
-    try:
-        geometry = next(ijson.items(io.BytesIO(feature_json.encode("utf-8")), "geometry", use_float=True), None)
-    except:
-        print("Failed to parse feature_json:")
-        raise
-
-    stack = [geometry]
-    while stack:
-        v = stack.pop()
-        if isinstance(v, dict):
-            if v.get("type") == "GeometryCollection":
-                stack.extend(reversed(v.get("geometries") or []))
-            else:
-                coordinates = v.get("coordinates")
-                if coordinates is not None:
-                    stack.append(coordinates)
-        elif isinstance(v, list):
-            if len(v) >= 2 and isinstance(v[0], Number) and isinstance(v[1], Number):
-                yield float(v[0]), float(v[1])
-            else:
-                stack.extend(reversed(v))
-
-
-def _read_geojson_partition_spatial_sample(
-    path: str,
-    offset: int,
-    length: int,
-    sample_ratio: float,
-    sample_cap: Optional[int],
-    seed: int,
-) -> SpatialSample:
-    reader = GeoJSONPartitionReader(path, offset, length, batch_size=1_024)
-    rng = np.random.default_rng(seed)
-    min_x = min_y = float("inf")
-    max_x = max_y = float("-inf")
-    x_sample: List[float] = []
-    y_sample: List[float] = []
-    n_seen = 0
-    n_batches = 0
-
-    for batch in reader:
-        for feature_json in batch:
-            first_point = True
-            for x, y in _iter_geojson_xy(feature_json):
-                # Update MBR
-                if x < min_x:
-                    min_x = x
-                if x > max_x:
-                    max_x = x
-                if y < min_y:
-                    min_y = y
-                if y > max_y:
-                    max_y = y
-                
-                if first_point:
-                    first_point = False
-                    n_seen += 1
-                    _reservoir_add(
-                        rng=rng,
-                        sample_cap=sample_cap,
-                        sample_ratio=sample_ratio,
-                        x_sample=x_sample,
-                        y_sample=y_sample,
-                        n_seen=n_seen,
-                        x=x,
-                        y=y,
-                    )
-
-        n_batches += 1
-
-    return _spatial_sample_from_state(
-        x_sample=x_sample,
-        y_sample=y_sample,
-        mins=np.array([min_x, min_y], dtype=float),
-        maxs=np.array([max_x, max_y], dtype=float),
-        n_seen=n_seen,
-        batches_read=n_batches,
-    )
-
-
 def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> pa.Schema:
     """
     Return a copy of `schema` with a minimal GeoParquet 'geo' JSON block so
@@ -878,91 +609,6 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
             )
 
     return df
-
-
-
-
-def _geometries_to_wkb(geometries: List[Any]) -> List[Any]:
-    """
-    Vectorized geometry -> WKB conversion using shapely's GeoJSON reader.
-
-    Converting via shapely.geometry.shape per-feature is expensive for large
-    files. Using shapely.from_geojson on an array of compact JSON strings keeps
-    the heavy work inside GEOS and removes most Python-level loops.
-    """
-    from shapely import from_geojson, to_wkb
-
-    wkb: List[Any] = [None] * len(geometries)
-    non_null_idx: List[int] = []
-    geojson_strings: List[str] = []
-
-    for idx, geom in enumerate(geometries):
-        if geom is None:
-            continue
-        non_null_idx.append(idx)
-        geojson_strings.append(json.dumps(geom, separators=(",", ":")))
-
-    if not geojson_strings:
-        return wkb
-
-    shapely_geoms = from_geojson(geojson_strings)
-    encoded = to_wkb(shapely_geoms, hex=False).tolist()
-
-    for idx, val in zip(non_null_idx, encoded):
-        wkb[idx] = val
-
-    return wkb
-
-
-def _geojson_partition_ranges(file_size: int, num_splits: int) -> List[Tuple[int, int]]:
-    if file_size <= 0:
-        return []
-
-    num_splits = max(1, min(int(num_splits), file_size))
-    partition_size = max(1, (file_size + num_splits - 1) // num_splits)
-    ranges: List[Tuple[int, int]] = []
-
-    for offset in range(0, file_size, partition_size):
-        ranges.append((offset, min(partition_size, file_size - offset)))
-
-    return ranges
-
-
-def _extract_feature_collection_crs_hint(buffer: str) -> Optional[str]:
-    """
-    Try to read the CRS from the header of a FeatureCollection without loading the whole file.
-    Looks for a 'crs' object and returns its 'properties.name' if present.
-    """
-    if not buffer:
-        return None
-
-    idx = buffer.lower().find('"features"')
-    if idx == -1:
-        return None
-
-    header = buffer[:idx]
-    first_brace = header.find("{")
-    if first_brace == -1:
-        return None
-
-    candidate = header[first_brace:]
-    candidate = candidate.rstrip(", \r\n\t")
-    candidate = candidate + "}"
-
-    try:
-        parsed = json.loads(candidate)
-    except Exception:
-        return None
-
-    crs = parsed.get("crs")
-    if isinstance(crs, dict):
-        props = crs.get("properties") or {}
-        name = props.get("name")
-        if isinstance(name, str):
-            return name
-
-    return None
-
 
 # Backward-compatible re-exports for callers importing concrete sources from
 # this module.

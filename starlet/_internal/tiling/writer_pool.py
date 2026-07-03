@@ -198,7 +198,11 @@ def _maybe_sort_and_bbox(
 # ------------------------- GeoParquet metadata -------------------------
 
 
-def _with_updated_geo_metadata(tbl: pa.Table, bbox: Tuple[float, float, float, float]) -> pa.Table:
+def _with_updated_geo_metadata(
+    tbl: pa.Table,
+    bbox: Tuple[float, float, float, float],
+    geom_col: str,
+) -> pa.Table:
     """Update GeoParquet metadata with per-column bbox."""
     schema = tbl.schema
     meta = dict(schema.metadata or {})
@@ -211,7 +215,10 @@ def _with_updated_geo_metadata(tbl: pa.Table, bbox: Tuple[float, float, float, f
         except Exception:
             geo = {}
 
-    col = geo.setdefault("columns", {}).setdefault("geometry", {})
+    geo.setdefault("version", "1.1.0")
+    geo["primary_column"] = geom_col
+    col = geo.setdefault("columns", {}).setdefault(geom_col, {})
+    col.setdefault("encoding", "WKB")
     col["bbox"] = list(map(float, bbox))
 
     meta[b"geo"] = json.dumps(geo).encode("utf8")
@@ -246,7 +253,7 @@ def _finalize_one_tile(
     if config.covering_bbox:
         combined = _append_bbox_columns(combined, config.geom_col)
 
-    combined = _with_updated_geo_metadata(combined, bbox)
+    combined = _with_updated_geo_metadata(combined, bbox, config.geom_col)
 
     # Encode bbox in filename for ParquetIndex spatial lookups
     minx, miny, maxx, maxy = bbox

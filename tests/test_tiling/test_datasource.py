@@ -30,8 +30,9 @@ from starlet._internal.tiling.datasource import (
     ShapefileSource,
     read_spatial_sample,
     source_for_path,
-    _iter_geojson_xy,
 )
+from starlet._internal.tiling.geojson_source import iter_geojson_xy
+from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 
 
@@ -104,6 +105,53 @@ class TestGeoParquetSource:
         for table in source.iter_tables():
             assert table.column_names == ["geometry"]
             break
+
+    def test_detects_geoparquet_primary_geometry_column(self, temp_dir):
+        parquet_path = temp_dir / "shape_geom.parquet"
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "SHAPE",
+            "columns": {"SHAPE": {"encoding": "WKB", "crs": "EPSG:4326"}},
+        }
+        table = pa.table({
+            "id": [1],
+            "SHAPE": [wkb.dumps(Point(1, 2))],
+        }).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path), geometry_only=True)
+        result = next(source.iter_tables())
+
+        assert source.geom_col == "SHAPE"
+        assert result.column_names == ["SHAPE"]
+        assert wkb.loads(result["SHAPE"][0].as_py()).equals(Point(1, 2))
+
+    def test_geoparquet_spatial_sample_uses_detected_geometry_column(self, temp_dir):
+        parquet_path = temp_dir / "shape_sample.parquet"
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "SHAPE",
+            "columns": {"SHAPE": {"encoding": "WKB", "crs": "EPSG:4326"}},
+        }
+        table = pa.table({
+            "id": [1],
+            "SHAPE": [wkb.dumps(Point(1, 2))],
+        }).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path), geometry_only=True)
+        sample = _read_geoparquet_split_spatial_sample(
+            str(parquet_path),
+            source.create_splits()[0],
+            source.geom_col,
+            sample_ratio=1.0,
+            sample_cap=None,
+            seed=42,
+        )
+
+        assert sample.total_seen == 1
+        assert sample.mbr.getMinCoord(0) == pytest.approx(1)
+        assert sample.mbr.getMinCoord(1) == pytest.approx(2)
 
     def test_geoparquet_source_preserves_native_crs(self, temp_dir):
         lon, lat = -118.25, 34.05
@@ -571,7 +619,7 @@ class TestGeoJSONSource:
             },
         }
 
-        assert list(_iter_geojson_xy(json.dumps(feature))) == [
+        assert list(iter_geojson_xy(json.dumps(feature))) == [
             (1.0, 2.0),
             (3.0, 4.0),
             (5.0, 6.0),

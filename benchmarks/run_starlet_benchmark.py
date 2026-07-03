@@ -5,42 +5,104 @@ import argparse
 import csv
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 PERCENTAGES = [25, 50, 75, 100]
-TOTAL_ROWS = 9_961_884
-LAYER_NAME = "OSM2015_parks"
-
-ROW_COUNTS = {
-    25: 2_490_471,
-    50: 4_980_942,
-    75: 7_471_413,
-    100: TOTAL_ROWS,
-}
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-STARLET_BIN = SCRIPT_DIR.parent / "starlet_venv" / "bin" / "starlet"
-VENV_PYTHON = SCRIPT_DIR.parent / "starlet_venv" / "bin" / "python"
+DEFAULT_STARLET_BIN = (
+    os.environ.get("STARLET_BIN")
+    or shutil.which("starlet")
+    or str(SCRIPT_DIR.parent / ".venv" / "bin" / "starlet")
+)
 
 
-def get_row_count(dataset: Path) -> int:
-    """Read total row count from parquet metadata via pyarrow in the venv."""
-    code = (
-        "import pyarrow.parquet as pq, sys; "
-        f"print(pq.read_metadata('{dataset}').num_rows)"
-    )
-    result = subprocess.run(
-        [str(VENV_PYTHON), "-c", code],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"Warning: could not read row count via pyarrow: {result.stderr.strip()}")
-        print(f"Falling back to hardcoded total: {TOTAL_ROWS}")
-        return TOTAL_ROWS
-    return int(result.stdout.strip())
+def _safe_name(value: str) -> str:
+    """Return a filesystem-friendly identifier."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "dataset"
+
+
+def _is_parquet(dataset: Path) -> bool:
+    return dataset.is_file() and dataset.suffix.lower() in {".parquet", ".geoparquet"}
+
+
+def _list_vector_layers(dataset: Path) -> list[dict]:
+    """Return vector layers with feature counts, or an empty list for non-vector inputs."""
+    try:
+        import pyogrio
+    except Exception:
+        return []
+
+    try:
+        raw_layers = pyogrio.list_layers(dataset)
+    except Exception:
+        return []
+
+    layers = []
+    for row in raw_layers:
+        name = str(row[0])
+        geometry_type = str(row[1]) if len(row) > 1 else None
+        features = None
+        try:
+            info = pyogrio.read_info(dataset, layer=name)
+            features = info.get("features")
+            geometry_type = info.get("geometry_type") or geometry_type
+        except Exception:
+            pass
+        layers.append({
+            "name": name,
+            "geometry_type": geometry_type,
+            "features": int(features) if features is not None and features >= 0 else None,
+        })
+    return layers
+
+
+def resolve_dataset_info(dataset: Path, requested_layer: str | None) -> tuple[int, str | None]:
+    """Resolve the benchmarked row count and optional vector layer name."""
+    if _is_parquet(dataset):
+        import pyarrow.parquet as pq
+
+        return int(pq.read_metadata(dataset).num_rows), requested_layer
+
+    layers = _list_vector_layers(dataset)
+    if not layers:
+        raise RuntimeError(
+            "Could not determine row count. For non-Parquet inputs, install pyogrio/GDAL "
+            "or pass a supported vector dataset."
+        )
+
+    if requested_layer:
+        matches = [layer for layer in layers if layer["name"] == requested_layer]
+        if not matches:
+            available = ", ".join(layer["name"] for layer in layers)
+            raise RuntimeError(
+                f"Layer {requested_layer!r} not found. Available layers: {available}"
+            )
+        layer = matches[0]
+    else:
+        layer = max(layers, key=lambda item: item["features"] or 0)
+        print(
+            "Auto-selected layer: "
+            f"{layer['name']} ({layer['features']:,} rows, {layer['geometry_type']})"
+        )
+
+    if layer["features"] is None:
+        raise RuntimeError(f"Could not determine feature count for layer {layer['name']!r}")
+    return layer["features"], layer["name"]
+
+
+def row_counts_for_total(total_rows: int) -> dict[int, int]:
+    return {
+        25: total_rows // 4,
+        50: total_rows // 2,
+        75: (total_rows * 3) // 4,
+        100: total_rows,
+    }
 
 
 def dir_size_bytes(path: Path) -> int:
@@ -52,40 +114,58 @@ def dir_size_bytes(path: Path) -> int:
     return total
 
 
-def generate_subset(dataset: Path, output: Path, pct: int) -> bool:
-    """Generate a subset parquet file using ogr2ogr. Returns True on success."""
-    if pct == 100:
-        if output.exists() or output.is_symlink():
-            print(f"  [100%] Symlink already exists: {output}")
-            return True
-        os.symlink(dataset.resolve(), output)
-        print(f"  [100%] Symlinked {output} -> {dataset}")
-        return True
+def generate_subset(
+    dataset: Path,
+    output: Path,
+    pct: int,
+    row_counts: dict[int, int],
+    layer_name: str | None,
+) -> Path | None:
+    """Generate a subset Parquet file using ogr2ogr and return its path on success."""
+    if pct == 100 and _is_parquet(dataset) and layer_name is None:
+        print(f"  [100%] Using original Parquet dataset: {dataset}")
+        return dataset
 
     if output.exists() and output.stat().st_size > 0:
         print(f"  [{pct}%] Subset already exists: {output} ({output.stat().st_size / 1e6:.1f} MB)")
-        return True
+        return output
 
-    limit = ROW_COUNTS[pct]
-    sql = f"SELECT * FROM {LAYER_NAME} LIMIT {limit}"
-    cmd = ["ogr2ogr", "-f", "Parquet", str(output), str(dataset), "-sql", sql]
+    limit = row_counts[pct]
+    cmd = [
+        "ogr2ogr",
+        "-overwrite",
+        "-f",
+        "Parquet",
+        "-limit",
+        str(limit),
+        str(output),
+        str(dataset),
+    ]
+    if layer_name:
+        cmd.append(layer_name)
     print(f"  [{pct}%] Generating subset ({limit:,} rows)...")
     print(f"         cmd: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  [{pct}%] ERROR: ogr2ogr failed:\n{result.stderr}")
-        return False
+        return None
 
     print(f"  [{pct}%] Done. Size: {output.stat().st_size / 1e6:.1f} MB")
-    return True
+    return output
 
 
-def run_pipeline(subset: Path, results_dir: Path, pct: int) -> dict:
+def run_pipeline(
+    subset: Path,
+    results_dir: Path,
+    pct: int,
+    row_counts: dict[int, int],
+    starlet_bin: Path,
+) -> dict:
     """Run starlet tile + mvt on a subset and collect metrics."""
     metrics = {
         "pct": pct,
-        "input_rows": ROW_COUNTS[pct],
+        "input_rows": row_counts[pct],
         "input_size_mb": round(subset.stat().st_size / (1024 * 1024), 2),
         "indexing_time_s": None,
         "mvt_time_s": None,
@@ -101,7 +181,7 @@ def run_pipeline(subset: Path, results_dir: Path, pct: int) -> dict:
 
     # --- starlet tile ---
     tile_cmd = [
-        str(STARLET_BIN), "tile",
+        str(starlet_bin), "tile",
         "--input", str(subset),
         "--outdir", str(outdir),
     ]
@@ -121,7 +201,7 @@ def run_pipeline(subset: Path, results_dir: Path, pct: int) -> dict:
 
     # --- starlet mvt ---
     mvt_cmd = [
-        str(STARLET_BIN), "mvt",
+        str(starlet_bin), "mvt",
         "--dir", str(outdir),
     ]
     print(f"  [{pct}%] Running: {' '.join(mvt_cmd)}")
@@ -147,7 +227,10 @@ def run_pipeline(subset: Path, results_dir: Path, pct: int) -> dict:
 
     mvt_dir = outdir / "mvt"
     if mvt_dir.exists():
-        metrics["num_mvt_tiles"] = len(list(mvt_dir.rglob("*.pbf")))
+        metrics["num_mvt_tiles"] = (
+            len(list(mvt_dir.rglob("*.mvt")))
+            + len(list(mvt_dir.rglob("*.pbf")))
+        )
 
     metrics["output_size_mb"] = round(dir_size_bytes(outdir) / (1024 * 1024), 2)
 
@@ -196,19 +279,38 @@ def print_summary(results: list[dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Starlet pipeline across dataset sizes.")
-    parser.add_argument("--dataset", required=True, help="Path to OSM2015_parks.parquet")
-    parser.add_argument("--output-dir", required=True, help="Output directory for subsets, results, and reports")
+    parser.add_argument(
+        "--dataset",
+        required=True,
+        help="Path to a Starlet-supported source dataset",
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Output directory for subsets, results, and reports",
+    )
+    parser.add_argument(
+        "--layer",
+        default=None,
+        help="Vector layer to benchmark. Defaults to the largest layer.",
+    )
+    parser.add_argument(
+        "--starlet-bin",
+        default=DEFAULT_STARLET_BIN,
+        help="Path to the starlet CLI executable.",
+    )
     args = parser.parse_args()
 
     dataset = Path(args.dataset).resolve()
     output_dir = Path(args.output_dir).resolve()
+    starlet_bin = Path(args.starlet_bin).resolve()
 
     if not dataset.exists():
         print(f"ERROR: Dataset not found: {dataset}")
         sys.exit(1)
 
-    if not STARLET_BIN.exists():
-        print(f"ERROR: Starlet binary not found: {STARLET_BIN}")
+    if not starlet_bin.exists():
+        print(f"ERROR: Starlet binary not found: {starlet_bin}")
         sys.exit(1)
 
     datasets_dir = output_dir / "datasets"
@@ -218,25 +320,25 @@ def main():
 
     # Read actual row count
     print(f"Dataset: {dataset}")
-    total = get_row_count(dataset)
+    try:
+        total, layer_name = resolve_dataset_info(dataset, args.layer)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    if layer_name:
+        print(f"Layer: {layer_name}")
     print(f"Total rows: {total:,}")
-    if total != TOTAL_ROWS:
-        print(f"Warning: expected {TOTAL_ROWS:,}, got {total:,}. Using actual count.")
-        global ROW_COUNTS
-        ROW_COUNTS = {
-            25: total // 4,
-            50: total // 2,
-            75: (total * 3) // 4,
-            100: total,
-        }
+    row_counts = row_counts_for_total(total)
 
     # Generate subsets
     print("\n=== Generating subsets ===")
     subsets = {}
+    dataset_name = _safe_name(layer_name or dataset.stem)
     for pct in PERCENTAGES:
-        subset_path = datasets_dir / f"OSM2015_parks_{pct}pct.parquet"
-        if generate_subset(dataset, subset_path, pct):
-            subsets[pct] = subset_path
+        subset_path = datasets_dir / f"{dataset_name}_{pct}pct.parquet"
+        subset = generate_subset(dataset, subset_path, pct, row_counts, layer_name)
+        if subset:
+            subsets[pct] = subset
         else:
             print(f"  Skipping {pct}% due to subset generation failure.")
 
@@ -246,8 +348,8 @@ def main():
     for pct in PERCENTAGES:
         if pct not in subsets:
             continue
-        print(f"\n--- {pct}% ({ROW_COUNTS[pct]:,} rows) ---")
-        metrics = run_pipeline(subsets[pct], results_dir, pct)
+        print(f"\n--- {pct}% ({row_counts[pct]:,} rows) ---")
+        metrics = run_pipeline(subsets[pct], results_dir, pct, row_counts, starlet_bin)
         all_results.append(metrics)
 
     # Write and display results

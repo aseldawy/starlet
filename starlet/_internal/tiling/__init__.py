@@ -1,4 +1,6 @@
-from .datasource import DataSource, GeoJSONSplit, GeoParquetSplit, GeoParquetSource, GeoJSONSource, SpatialSample, read_spatial_sample, source_for_path
+from .datasource import DataSource, SpatialSample, read_spatial_sample, source_for_path
+from .geojson_source import GeoJSONSplit, GeoJSONSource
+from .geoparquet_source import GeoParquetSplit, GeoParquetSource
 from .partition_reader import GeoJSONPartitionReader
 from .assigner import TileAssignerFromCSV, RSGroveAssigner
 from .writer_pool import WriterPool, SortMode, SortKey

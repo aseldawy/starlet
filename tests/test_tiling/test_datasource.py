@@ -424,6 +424,34 @@ class TestGeoJSONSource:
             '{"b":"2"}',
         ]
 
+    def test_geojson_null_first_batch_promotes_later_string_column(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"OLD_BLD_ID": None},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"OLD_BLD_ID": "B123"},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "null_then_string.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        source.schema()
+        tables = list(source.iter_tables())
+
+        assert pa.types.is_large_string(tables[-1].schema.field("OLD_BLD_ID").type)
+        assert tables[-1]["OLD_BLD_ID"].to_pylist() == ["B123"]
+
     def test_geojson_splits_read_independently_from_threads(self, temp_dir):
         """Test GeoJSON byte splits can be read independently by threads."""
         geojson = {

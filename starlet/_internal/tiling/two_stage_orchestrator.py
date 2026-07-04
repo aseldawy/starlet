@@ -113,10 +113,33 @@ def _nullable_schema(schema: pa.Schema) -> pa.Schema:
     )
 
 
+def _ipc_file_schema(path: str) -> pa.Schema:
+    with pa.memory_map(path, "r") as source:
+        return ipc.open_file(source).schema
+
+
+def _unified_nullable_schema(input_paths: Sequence[str]) -> pa.Schema:
+    schemas = [_ipc_file_schema(path) for path in input_paths]
+    if not schemas:
+        raise ValueError("Cannot unify schemas for an empty input path list")
+    unified = pa.unify_schemas(schemas, promote_options="default")
+    return _nullable_schema(unified)
+
+
 def _cast_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     if table.schema.equals(schema):
         return table
-    return table.cast(schema, safe=False)
+
+    columns = []
+    for field in schema:
+        if field.name in table.column_names:
+            column = table[field.name]
+            if not column.type.equals(field.type):
+                column = column.cast(field.type, safe=False)
+            columns.append(column)
+        else:
+            columns.append(pa.nulls(table.num_rows, type=field.type))
+    return pa.table(columns, schema=schema)
 
 
 def _write_intermediate_table(path: str, table: pa.Table, schema: Optional[pa.Schema] = None) -> None:
@@ -243,7 +266,7 @@ def _merge_sorted_partition_files(
     heap: List[Tuple[int, int, pa.Table]] = []
     writer: Optional[ipc.RecordBatchFileWriter] = None
     sink: Optional[pa.OSFile] = None
-    writer_schema: Optional[pa.Schema] = None
+    writer_schema: Optional[pa.Schema] = _unified_nullable_schema(input_paths)
 
     for iterator_id, iterator in enumerate(iterators):
         try:
@@ -259,10 +282,8 @@ def _merge_sorted_partition_files(
         while heap:
             partition_id, iterator_id, table = heapq.heappop(heap)
             if writer is None:
-                writer_schema = _nullable_schema(table.schema)
                 sink = pa.OSFile(output_path, "wb")
                 writer = ipc.new_file(sink, writer_schema)
-            assert writer_schema is not None
             writer.write_table(
                 _cast_table_to_schema(table, writer_schema),
                 max_chunksize=_INTERMEDIATE_BATCH_SIZE,

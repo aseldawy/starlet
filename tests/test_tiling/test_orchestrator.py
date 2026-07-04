@@ -166,6 +166,41 @@ class TestTwoStageOrchestrator:
         assert result["MADRank"].to_pylist() == [10, None]
         assert result.schema.field("MADRank").nullable
 
+    def test_merge_promotes_null_field_to_later_string_type(self, temp_dir):
+        schema_null = pa.schema([
+            pa.field("_tile_id", pa.int64(), nullable=False),
+            pa.field("OLD_BLD_ID", pa.null(), nullable=True),
+        ])
+        schema_string = pa.schema([
+            pa.field("_tile_id", pa.int64(), nullable=False),
+            pa.field("OLD_BLD_ID", pa.large_string(), nullable=True),
+        ])
+        first = pa.table(
+            [pa.array([1], type=pa.int64()), pa.array([None], type=pa.null())],
+            schema=schema_null,
+        )
+        second = pa.table(
+            [pa.array([1], type=pa.int64()), pa.array(["B123"], type=pa.large_string())],
+            schema=schema_string,
+        )
+        first_path = temp_dir / "first.arrow"
+        second_path = temp_dir / "second.arrow"
+        output_path = temp_dir / "merged.arrow"
+        two_stage_module._write_intermediate_table(str(first_path), first)
+        two_stage_module._write_intermediate_table(str(second_path), second)
+
+        merged = two_stage_module._merge_sorted_partition_files(
+            [str(first_path), str(second_path)],
+            str(output_path),
+            compression=None,
+        )
+
+        assert merged == str(output_path)
+        with pa.memory_map(str(output_path), "r") as source:
+            result = ipc.open_file(source).read_all()
+        assert result["OLD_BLD_ID"].to_pylist() == [None, "B123"]
+        assert result.schema.field("OLD_BLD_ID").type == pa.large_string()
+
     def test_two_stage_orchestrator_writes_all_rows(self, sample_parquet_file, sample_polygons, temp_dir):
         source = GeoParquetSource(str(sample_parquet_file))
         centers = np.array(

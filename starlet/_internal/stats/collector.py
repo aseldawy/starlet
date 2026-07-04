@@ -29,17 +29,7 @@ class AttributeStatsCollector:
                 self.sketches[name] = GeometrySketch(global_mbr=global_mbr)
                 continue
 
-            t = field.type
-            if pa.types.is_integer(t) or pa.types.is_floating(t):
-                self.sketches[name] = NumericSketch()
-            elif pa.types.is_boolean(t):
-                self.sketches[name] = CategoricalSketch()
-            elif pa.types.is_timestamp(t) or pa.types.is_date(t) or pa.types.is_time(t):
-                self.sketches[name] = TemporalSketch()
-            elif pa.types.is_string(t) or pa.types.is_large_string(t):
-                self.sketches[name] = TextSketch()
-            else:
-                self.sketches[name] = CategoricalSketch()
+            self.sketches[name] = _sketch_for_type(field.type)
 
     def consume_table(self, table: pa.Table):
         for col_name, sketch in self.sketches.items():
@@ -54,6 +44,11 @@ class AttributeStatsCollector:
                 sketch.update(geoms)
                 continue
 
+            desired_sketch = _sketch_for_type(col.type)
+            if type(sketch) is not type(desired_sketch) and _is_empty_sketch(sketch):
+                sketch = desired_sketch
+                self.sketches[col_name] = sketch
+
             # fast path for primitive columns
             arr = col.combine_chunks()
             values = arr.to_pylist()
@@ -67,6 +62,10 @@ class AttributeStatsCollector:
             mine = self.sketches.get(name)
             if mine is None:
                 self.sketches[name] = other_sketch
+            elif type(mine) is not type(other_sketch) and _is_empty_sketch(mine):
+                self.sketches[name] = other_sketch
+            elif type(mine) is not type(other_sketch) and _is_empty_sketch(other_sketch):
+                continue
             else:
                 mine.merge(other_sketch)
         return self
@@ -82,3 +81,23 @@ class AttributeStatsCollector:
             out.append(entry)
 
         return {"attributes": out}
+
+
+def _sketch_for_type(t: pa.DataType):
+    if pa.types.is_integer(t) or pa.types.is_floating(t):
+        return NumericSketch()
+    if pa.types.is_boolean(t):
+        return CategoricalSketch()
+    if pa.types.is_timestamp(t) or pa.types.is_date(t) or pa.types.is_time(t):
+        return TemporalSketch()
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return TextSketch()
+    return CategoricalSketch()
+
+
+def _is_empty_sketch(sketch) -> bool:
+    if isinstance(sketch, GeometrySketch):
+        return sketch.total_points == 0
+    if isinstance(sketch, NumericSketch):
+        return sketch.count == 0
+    return getattr(sketch, "non_null", 0) == 0

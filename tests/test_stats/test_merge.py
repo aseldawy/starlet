@@ -77,6 +77,48 @@ def test_merge_into_empty_adopts_other():
     assert merged["num"]["non_null_count"] == 100
 
 
+def test_collector_promotes_null_placeholder_to_text_sketch():
+    null_table = pa.table({
+        "geometry": [wkb.dumps(Point(0, 0))],
+        "OLD_BLD_ID": pa.array([None], type=pa.null()),
+    })
+    text_table = pa.table({
+        "geometry": [wkb.dumps(Point(1, 1))],
+        "OLD_BLD_ID": pa.array(["B123"], type=pa.large_string()),
+    })
+
+    collector = AttributeStatsCollector(null_table.schema)
+    collector.consume_table(null_table)
+    collector.consume_table(text_table)
+
+    stats = _by_name(collector.finalize())["OLD_BLD_ID"]
+    assert stats["non_null_count"] == 1
+    assert stats["min_length"] == 4
+    assert stats["max_length"] == 4
+
+
+def test_merge_adopts_non_empty_text_sketch_over_empty_null_placeholder():
+    null_table = pa.table({
+        "geometry": [wkb.dumps(Point(0, 0))],
+        "OLD_BLD_ID": pa.array([None], type=pa.null()),
+    })
+    text_table = pa.table({
+        "geometry": [wkb.dumps(Point(1, 1))],
+        "OLD_BLD_ID": pa.array(["B123"], type=pa.large_string()),
+    })
+
+    left = AttributeStatsCollector(null_table.schema)
+    left.consume_table(null_table)
+    right = AttributeStatsCollector(text_table.schema)
+    right.consume_table(text_table)
+    left.merge(right)
+
+    stats = _by_name(left.finalize())["OLD_BLD_ID"]
+    assert stats["non_null_count"] == 1
+    assert stats["min_length"] == 4
+    assert stats["max_length"] == 4
+
+
 def test_merge_three_partials():
     full = _make_table(900, seed=3)
     single = AttributeStatsCollector(full.schema)

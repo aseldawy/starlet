@@ -215,23 +215,45 @@ class GeoJSONSource(DataSource):
             return t
 
         out_cols = []
+        out_fields = []
+        promoted = False
         for fld in schema:
             name = fld.name
             if name in t.column_names:
                 col = t[name]
                 if not col.type.equals(fld.type):
-                    try:
-                        col = col.cast(fld.type)
-                    except Exception:
-                        logger.warning(
-                            "Type mismatch for column '%s': %s -> %s (kept original)",
-                            name, col.type, fld.type
+                    if pa.types.is_null(fld.type) and not pa.types.is_null(col.type):
+                        fld = pa.field(
+                            fld.name,
+                            col.type,
+                            nullable=True,
+                            metadata=fld.metadata,
                         )
+                        promoted = True
+                    else:
+                        try:
+                            col = col.cast(fld.type)
+                        except Exception:
+                            logger.warning(
+                                "Type mismatch for column '%s': %s -> %s (kept original)",
+                                name, col.type, fld.type
+                            )
+                            fld = pa.field(
+                                fld.name,
+                                col.type,
+                                nullable=fld.nullable,
+                                metadata=fld.metadata,
+                            )
                 out_cols.append(col)
+                out_fields.append(fld)
             else:
                 out_cols.append(pa.nulls(t.num_rows, type=fld.type))
+                out_fields.append(fld)
 
-        return pa.table(out_cols, names=[f.name for f in schema])
+        out_schema = pa.schema(out_fields, metadata=schema.metadata)
+        if promoted:
+            self._schema = out_schema
+        return pa.table(out_cols, schema=out_schema)
 
     @classmethod
     def read_spatial_sample(

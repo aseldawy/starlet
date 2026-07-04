@@ -320,7 +320,7 @@ Supported sources:
 | GeoJSON | `.geojson`, `.geojsonl`, `.json`, `.jsonl`, or a directory containing only GeoJSON files | Geometry comes from GeoJSON feature geometry | FeatureCollection inputs are byte-partitioned; GeoJSONL is streamed by feature records. |
 | Shapefile | `.shp`, `.zip` containing shapefile sidecars, or a directory containing `.shp` and/or `.zip` files | Geometry comes from the Shapefile geometry | Uses `pyogrio`. Feature-range splits are used when feature counts are available. Geometry-only sampling reads geometry without attributes. |
 | CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, or `csv_wkt_col` | Files are read in row chunks. `src_crs` provides the CRS hint. |
-| File Geodatabase | `.gdb` directory, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. |
+| File Geodatabase | `.gdb` directory, `.gdb.zip` archive, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. Zipped GDBs are extracted to a temp cache before reading. |
 
 Directories must contain one supported source type. For example, a directory
 containing both CSV/TSV and GeoJSON files is rejected to avoid ambiguous
@@ -463,6 +463,15 @@ result = starlet.tile(
 )
 ```
 
+Use a zipped File Geodatabase:
+
+```python
+result = starlet.tile(
+    input="data/city.gdb.zip",
+    outdir="datasets/city",
+)
+```
+
 Use a parent directory containing one or more `.gdb` directories:
 
 ```python
@@ -513,6 +522,12 @@ File Geodatabase:
 
 ```bash
 starlet tile --input data/city.gdb --outdir datasets/city
+```
+
+Zipped File Geodatabase:
+
+```bash
+starlet tile --input data/city.gdb.zip --outdir datasets/city
 ```
 
 The `starlet build` command supports the same input options.

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
+import os
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Iterable, List, Optional, Tuple
+import zipfile
 
 import pandas as pd
 import pyarrow as pa
@@ -16,6 +21,7 @@ from starlet._internal.tiling.datasource import (
     _ZIP_SUFFIXES,
     _attach_geoparquet_metadata,
     _normalize_decimal_columns,
+    _zip_gdb_member_dirs,
     _wkb_geometry_type,
 )
 from starlet._internal.tiling.nonlinear_wkb import linearize_wkb
@@ -299,7 +305,9 @@ class GDBSource(_OGRVectorSource):
     def _discover_layers(self, path: str) -> List[_VectorLayer]:
         source = Path(path)
         gdb_paths: List[Path]
-        if source.suffix.lower() in _GDB_SUFFIXES:
+        if source.is_file() and source.suffix.lower() in _ZIP_SUFFIXES:
+            gdb_paths = _extract_zipped_gdbs(source)
+        elif source.suffix.lower() in _GDB_SUFFIXES:
             gdb_paths = [source]
         elif source.is_dir():
             gdb_paths = sorted(child for child in source.rglob("*.gdb") if child.is_dir())
@@ -314,6 +322,50 @@ class GDBSource(_OGRVectorSource):
 
 def _zip_vsi_path(path: Path) -> str:
     return f"/vsizip/{path}"
+
+
+def _extract_zipped_gdbs(path: Path) -> List[Path]:
+    gdb_member_dirs = _zip_gdb_member_dirs(path)
+    if not gdb_member_dirs:
+        raise ValueError(f"No File Geodatabase directory found in zip archive: {path}")
+
+    stat = path.stat()
+    key_material = f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
+    cache_key = hashlib.sha256(key_material).hexdigest()[:24]
+    cache_root = Path(tempfile.gettempdir()) / "starlet_gdb_zip_cache" / cache_key
+    complete_marker = cache_root / ".complete"
+    if complete_marker.exists():
+        return [cache_root / member_dir for member_dir in gdb_member_dirs]
+
+    cache_parent = cache_root.parent
+    cache_parent.mkdir(parents=True, exist_ok=True)
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"{cache_key}.", dir=str(cache_parent)))
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                member = info.filename
+                if not _is_safe_zip_member(member):
+                    continue
+                if not any(
+                    member == member_dir or member.startswith(f"{member_dir.rstrip('/')}/")
+                    for member_dir in gdb_member_dirs
+                ):
+                    continue
+                archive.extract(info, tmp_root)
+        (tmp_root / ".complete").write_text("ok\n")
+        try:
+            os.replace(tmp_root, cache_root)
+        except FileExistsError:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise
+    return [cache_root / member_dir for member_dir in gdb_member_dirs]
+
+
+def _is_safe_zip_member(member: str) -> bool:
+    path = Path(member)
+    return not path.is_absolute() and ".." not in path.parts
 
 
 def _vector_split_context(split: VectorLayerSplit) -> str:

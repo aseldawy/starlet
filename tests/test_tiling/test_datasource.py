@@ -10,6 +10,7 @@ Tests cover:
 import json
 import logging
 import struct
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,7 +28,9 @@ from starlet._internal.tiling.datasource import (
     GeoParquetSource,
     GeoParquetSplit,
     CSVSource,
+    GDBSource,
     ShapefileSource,
+    _zip_gdb_member_dirs,
     read_spatial_sample,
     source_for_path,
 )
@@ -822,6 +825,41 @@ class TestShapefileSource:
         assert "geometry_type=CurvePolygon" in caplog.text
         assert "linearized_records=1" in caplog.text
         assert "skip_features=0" in caplog.text
+
+
+class TestGDBSource:
+    def test_detects_gdb_directory_inside_zip(self, temp_dir):
+        zip_path = temp_dir / "Export.gdb.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        assert _zip_gdb_member_dirs(zip_path) == ["CAMS-Export.gdb"]
+
+    def test_source_for_path_detects_zipped_gdb(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        zip_path = temp_dir / "Export.gdb.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path.endswith("CAMS-Export.gdb")
 
 
 class TestDataSourceIntegration:

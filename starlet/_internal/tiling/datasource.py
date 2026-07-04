@@ -7,6 +7,7 @@ import logging
 import json
 from pathlib import Path
 from decimal import Decimal
+import zipfile
 
 import pandas as pd
 import pyarrow as pa
@@ -65,6 +66,24 @@ def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     raise FileNotFoundError(f"Source path does not exist: {path}")
 
 
+def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
+    """Return .gdb directory names contained in a zip archive."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile:
+        return []
+
+    gdb_dirs = set()
+    for name in names:
+        parts = [part for part in Path(name).parts if part not in {"", "."}]
+        for index, part in enumerate(parts):
+            if part.lower().endswith(_GDB_SUFFIXES):
+                gdb_dirs.add("/".join(parts[: index + 1]))
+                break
+    return sorted(gdb_dirs)
+
+
 def _source_kind(path: str) -> str:
     source_path = Path(path)
     if source_path.is_file():
@@ -75,6 +94,8 @@ def _source_kind(path: str) -> str:
             return "geoparquet"
         if suffix in _CSV_SUFFIXES:
             return "csv"
+        if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
+            return "gdb"
         if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
             return "shapefile"
         raise ValueError(f"Unsupported source file type: {path}")

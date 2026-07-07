@@ -97,7 +97,6 @@ class DatasetMVTGenerator:
         feature_capacity: int = 10_000,
         extent: int = 4096,
         buffer: int = 256,
-        partition_buffer: float = 0.0,
         geom_col: str = "geometry",
         seed: int = 42,
         temp_dir: str | None = None,
@@ -116,7 +115,7 @@ class DatasetMVTGenerator:
         self.feature_capacity = int(feature_capacity)
         self.extent = int(extent)
         self.buffer = int(buffer)
-        self.partition_buffer = float(partition_buffer)
+        self.partition_buffer = float(self.buffer) / float(self.extent)
         self.geom_col = geom_col
         self.seed = int(seed)
         self.temp_dir = temp_dir
@@ -127,6 +126,8 @@ class DatasetMVTGenerator:
             raise ValueError("threshold must be non-negative")
         if self.output_format not in {"mvt", "pmtiles"}:
             raise ValueError("output_format must be 'mvt' or 'pmtiles'")
+        if self.extent <= 0:
+            raise ValueError("extent must be positive")
 
     def run(self) -> DatasetMVTGenerationResult:
         if not self.parquet_dir.is_dir():

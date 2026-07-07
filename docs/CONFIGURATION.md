@@ -50,7 +50,7 @@ The config is split into sections:
   `parallelism`, and `log_level`
 - `[tile]`: defaults for `starlet tile`
 - `[mvt]`: defaults for `starlet mvt`
-- `[build]`: overrides specific to `starlet build`
+- `[build]`: flags specific to `starlet build` itself
 - `[serve]`: defaults for `starlet serve`
 
 ## Example

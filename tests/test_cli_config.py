@@ -83,13 +83,12 @@ threshold = 777
 feature_capacity = 333
 extent = 2048
 buffer = 64
-partition_buffer = 0.25
 """.strip()
     )
 
     captured = {}
 
-    def fake_generate_mvt(*, tile_dir, zoom, threshold, outdir, parallelism, temp_dir, feature_capacity, extent, buffer, partition_buffer):
+    def fake_generate_mvt(*, tile_dir, zoom, threshold, outdir, parallelism, temp_dir, feature_capacity, extent, buffer):
         captured.update(
             tile_dir=tile_dir,
             zoom=zoom,
@@ -100,7 +99,6 @@ partition_buffer = 0.25
             feature_capacity=feature_capacity,
             extent=extent,
             buffer=buffer,
-            partition_buffer=partition_buffer,
         )
         return SimpleNamespace(tile_count=1, outdir=outdir or "mvt", zoom_levels=[0, 1])
 
@@ -127,7 +125,6 @@ partition_buffer = 0.25
     assert captured["feature_capacity"] == 333
     assert captured["extent"] == 2048
     assert captured["buffer"] == 64
-    assert captured["partition_buffer"] == 0.25
 
 
 def test_serve_command_uses_config_host_port_and_cache(tmp_path, monkeypatch):

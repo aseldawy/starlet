@@ -249,7 +249,6 @@ def generate_mvt(
     feature_capacity: int = 10_000,
     extent: int = 4096,
     buffer: int = 256,
-    partition_buffer: float = 0.0,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -273,8 +272,6 @@ def generate_mvt(
         Vector tile extent.
     buffer : int
         Vector tile buffer in extent units.
-    partition_buffer : float
-        Overlap buffer used by the partitioner as a fraction of tile size.
 
     Returns
     -------
@@ -282,7 +279,10 @@ def generate_mvt(
     """
     from pathlib import Path
 
+    if extent <= 0:
+        raise ValueError("extent must be positive")
     mvt_outdir = outdir or str(Path(tile_dir) / "mvt")
+    partition_buffer = float(buffer) / float(extent)
 
     from starlet._internal.mvt.dataset_generator import DatasetMVTGenerator
 
@@ -297,7 +297,6 @@ def generate_mvt(
         feature_capacity=feature_capacity,
         extent=extent,
         buffer=buffer,
-        partition_buffer=partition_buffer,
     ).run()
 
     # Count generated tiles
@@ -329,7 +328,6 @@ def build(
     feature_capacity: int = 10_000,
     extent: int = 4096,
     buffer: int = 256,
-    partition_buffer: float = 0.0,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
@@ -364,8 +362,6 @@ def build(
         Vector tile extent.
     buffer : int
         Vector tile buffer in extent units.
-    partition_buffer : float
-        Overlap buffer used by the partitioner as a fraction of tile size.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
         (e.g. ``covering_bbox=False``).
@@ -400,7 +396,6 @@ def build(
         feature_capacity=feature_capacity,
         extent=extent,
         buffer=buffer,
-        partition_buffer=partition_buffer,
     )
 
     pmtiles_path = None

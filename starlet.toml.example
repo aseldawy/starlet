@@ -62,24 +62,15 @@ extent = 4096
 # Vector tile buffer in extent units.
 buffer = 256
 
-# Overlap buffer used by the partitioner as a fraction of tile size.
-partition_buffer = 0.0
-
 # Compression format used when exporting PMTiles.
 pmtiles_compression = "gzip"
 
 [build]
-# Maximum zoom level for the full build pipeline.
-zoom = 7
-
-# Minimum feature count required for MVT generation during build.
-threshold = 100000
+# Build reuses MVT settings such as zoom, threshold, and PMTiles compression
+# from [mvt]. Only build-specific flags belong here.
 
 # Export a PMTiles archive after generating MVTs.
 pmtiles = false
-
-# Optional build-specific MVT compression override for PMTiles export.
-pmtiles_compression = "gzip"
 
 [serve]
 # Host and port used by `starlet serve`.

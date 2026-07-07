@@ -31,11 +31,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "feature_capacity": 10_000,
         "extent": 4096,
         "buffer": 256,
-        "partition_buffer": 0.0,
         "pmtiles_compression": "gzip",
     },
     "build": {
-        "zoom": 7,
         "pmtiles": False,
     },
     "serve": {

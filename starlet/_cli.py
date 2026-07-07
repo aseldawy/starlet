@@ -141,7 +141,6 @@ def mvt(tile_dir, zoom, outdir, log_level):
         feature_capacity=int(resolve_command_value("mvt", "feature_capacity", None, default=10_000)),
         extent=int(resolve_command_value("mvt", "extent", None, default=4096)),
         buffer=int(resolve_command_value("mvt", "buffer", None, default=256)),
-        partition_buffer=float(resolve_command_value("mvt", "partition_buffer", None, default=0.0)),
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
     click.echo(f"  Output: {result.outdir}")
@@ -191,7 +190,6 @@ def build(
         feature_capacity=int(resolve_command_value("build", "feature_capacity", None, fallback_sections=("mvt",), default=10_000)),
         extent=int(resolve_command_value("build", "extent", None, fallback_sections=("mvt",), default=4096)),
         buffer=int(resolve_command_value("build", "buffer", None, fallback_sections=("mvt",), default=256)),
-        partition_buffer=float(resolve_command_value("build", "partition_buffer", None, fallback_sections=("mvt",), default=0.0)),
         sort=str(resolve_command_value("build", "sort", None, fallback_sections=("tile",), default="zorder")),
         compression=str(resolve_command_value("build", "compression", None, fallback_sections=("tile",), default="zstd")),
         sample_cap=resolve_command_value("build", "sample_cap", None, fallback_sections=("tile",), default=10_000),

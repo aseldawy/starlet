@@ -48,14 +48,13 @@ try:
     for line in proc.stdout:
         print(line, end="")
 
-        if "Starting MVT generation pipeline" in line:
+        if "DatasetMVTGenerator map stage" in line:
             saw_mvt_start = True
             print(f"\n[marker] MVT stage started at {time.time() - start:.2f}s\n")
 
         if "Computing nonempty tiles" in line:
             saw_nonempty = True
-            print(f"\n[marker] Reached old nonempty-tile scan at {time.time() - start:.2f}s\n")
-            print("[marker] If it stays here, you are still running the old slow path.\n")
+            print(f"\n[marker] Unexpected legacy MVT marker at {time.time() - start:.2f}s\n")
 
     rc = proc.wait()
     elapsed = time.time() - start

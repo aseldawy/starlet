@@ -57,7 +57,10 @@ def create_app(
 
     def get_tiler(dataset: str) -> VectorTiler:
         if dataset not in tiler_cache:
-            tiler_cache[dataset] = VectorTiler(str(data_root / dataset), memory_cache_size=cache_size)
+            tiler_cache[dataset] = VectorTiler(
+                str(data_root / dataset),
+                memory_cache_size=cache_size,
+            )
         return tiler_cache[dataset]
 
     @app.get("/<dataset>/<int:z>/<int:x>/<int:y>.mvt")

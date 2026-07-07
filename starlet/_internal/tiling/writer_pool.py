@@ -28,10 +28,9 @@ from .utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
 
-# Optional read-time pruning (opt-in via ``covering_bbox``): four per-row
-# bounding-box "covering" columns + bounded, spatially-coherent row groups so
-# the on-demand tile server can skip row groups/rows at read time. Off by
-# default — writing them is pure overhead unless you serve tiles on the fly.
+# Optional read-time pruning via ``covering_bbox``: four per-row bounding-box
+# "covering" columns + bounded, spatially-coherent row groups so the on-demand
+# tile server can skip row groups/rows at read time.
 BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 DEFAULT_ROW_GROUP_SIZE = 16384
 

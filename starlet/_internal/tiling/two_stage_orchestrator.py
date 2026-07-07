@@ -570,9 +570,8 @@ class TwoStageOrchestrator:
         self.temp_dir = temp_dir
         self.keep_temp = bool(keep_temp)
         self._pq_args = dict(pq_args or {})
-        # Opt-in read-time pruning (fast-branch feature): write per-row bbox
-        # covering columns + bounded row groups so the on-demand server can skip
-        # row groups/rows. Off by default; plumbed through to _finalize_one_tile.
+        # Optional read-time pruning: write per-row bbox covering columns +
+        # bounded row groups so the on-demand server can skip row groups/rows.
         self.covering_bbox = bool(covering_bbox)
         # Collect attribute statistics during the assignment stage so the
         # two-stage path writes stats/attributes.json (used by the tile server's

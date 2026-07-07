@@ -76,9 +76,9 @@ def main():
 @click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
 @click.option("--sfc-bits", type=int, default=16, show_default=True, help="Bits per axis for Z-order key.")
 @click.option("--max-parallel-files", type=int, default=64, show_default=True, help="Max concurrent tile writes.")
-@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
-              help="Opt-in: write per-row bbox covering columns + bounded row groups for "
-                   "fast on-demand serving. Off by default (faster batch tiling, smaller files).")
+@click.option("--covering-bbox/--no-covering-bbox", default=True, show_default=True,
+              help="Write per-row bbox covering columns + bounded row groups for "
+                   "fast on-demand serving. Use --no-covering-bbox to disable.")
 @click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
 @click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
 @click.option("--two-stage-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for the two-stage orchestrator.")
@@ -131,7 +131,7 @@ def tile(input_path, outdir, partition_size, sort, compression,
 @main.command()
 @click.option("--dir", "tile_dir", required=True, help="Dataset directory with parquet_tiles/ and histograms/.")
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
-@click.option("--threshold", type=float, default=0, show_default=True, help="Minimum feature count per tile.")
+@click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per tile.")
 @click.option("--outdir", default=None, help="MVT output directory (default: <dir>/mvt/).")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def mvt(tile_dir, zoom, threshold, outdir, log_level):
@@ -156,8 +156,9 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
 @click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
 @click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per MVT tile.")
-@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
-              help="Opt-in: write per-row bbox covering columns for fast on-demand serving.")
+@click.option("--covering-bbox/--no-covering-bbox", default=True, show_default=True,
+              help="Write per-row bbox covering columns for fast on-demand serving. "
+                   "Use --no-covering-bbox to disable.")
 @click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
 @click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
 @click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
@@ -170,7 +171,8 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
           csv_x_col, csv_y_col, csv_wkt_col, csv_split_size, src_crs,
-          geojson_executor, orchestrator, pmtiles, pmtiles_compression, log_level):
+          geojson_executor, orchestrator, pmtiles,
+          pmtiles_compression, log_level):
     """Run the full pipeline: tile then generate MVTs."""
     _setup_logging(log_level)
     import starlet
@@ -210,7 +212,10 @@ def serve(data_dir, host, port, cache_size, log_level):
     _setup_logging(log_level)
     import starlet
 
-    app = starlet.create_app(data_dir=data_dir, cache_size=cache_size)
+    app = starlet.create_app(
+        data_dir=data_dir,
+        cache_size=cache_size,
+    )
     click.echo(f"Starting starlet server on {host}:{port}")
     click.echo(f"  Data root: {data_dir}")
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)

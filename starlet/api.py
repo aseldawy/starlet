@@ -6,7 +6,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -15,9 +15,6 @@ if TYPE_CHECKING:
 BBox = tuple[float, float, float, float]
 LIM = 20037508.342789244
 GLOBAL_BBOX: BBox = (-LIM, -LIM, LIM, LIM)
-_INTERNAL_QUERY_COLUMNS = ("_tile_id",)
-
-
 def list_datasets(datasets_dir: str | Path) -> list[str]:
     """Return dataset directory names under ``datasets_dir``."""
     root = Path(datasets_dir)
@@ -150,35 +147,13 @@ def query_dataset(
     """
     from starlet._internal.server.tiler.parquet_index import ParquetIndex
 
-    query_geom = _coerce_geometry(geometry)
-    if geometry_crs.upper() != "EPSG:4326":
-        query_geom = _transform_geometry(query_geom, geometry_crs, "EPSG:4326")
-
     index = ParquetIndex(Path(dataset_dir) / "parquet_tiles")
-    paths = index.find_intersecting_files(_bounds_tuple(query_geom.bounds))
-    for path in paths:
-        gdf = _read_partition_as_gdf(path, geom_col=geom_col)
-        if gdf.empty:
-            continue
-        bounds = gdf.geometry.bounds
-        minx, miny, maxx, maxy = query_geom.bounds
-        bbox_mask = ~(
-            (bounds["maxx"] < minx)
-            | (bounds["minx"] > maxx)
-            | (bounds["maxy"] < miny)
-            | (bounds["miny"] > maxy)
-        )
-        candidates = gdf.loc[bbox_mask]
-        if candidates.empty:
-            continue
-        matches = candidates.loc[candidates.geometry.intersects(query_geom)]
-        if matches.empty:
-            continue
-        if batch_size is None or batch_size <= 0 or len(matches) <= batch_size:
-            yield matches
-            continue
-        for offset in range(0, len(matches), batch_size):
-            yield matches.iloc[offset:offset + batch_size]
+    yield from index.iter_query_batches(
+        geometry,
+        geometry_crs=geometry_crs,
+        target_crs="EPSG:4326",
+        batch_size=batch_size,
+    )
 
 
 def query_dataset_count(
@@ -566,24 +541,6 @@ def _attribute_role(stats: dict[str, Any]) -> str:
     return "categorical"
 
 
-def _coerce_geometry(geometry: Sequence[float] | dict[str, Any] | "BaseGeometry") -> "BaseGeometry":
-    from shapely.geometry import box, shape
-    from shapely.geometry.base import BaseGeometry
-
-    if isinstance(geometry, BaseGeometry):
-        return geometry
-    if isinstance(geometry, dict):
-        return shape(geometry)
-    if len(geometry) != 4:
-        raise ValueError("Rectangle geometry must be (minx, miny, maxx, maxy)")
-    return box(*[float(v) for v in geometry])
-
-
-def _bounds_tuple(bounds: Iterable[float]) -> BBox:
-    minx, miny, maxx, maxy = bounds
-    return (float(minx), float(miny), float(maxx), float(maxy))
-
-
 def _rectangle_to_3857(rectangle: Sequence[float], rectangle_crs: str) -> BBox:
     if len(rectangle) != 4:
         raise ValueError("rectangle must be (minx, miny, maxx, maxy)")
@@ -595,14 +552,6 @@ def _rectangle_to_3857(rectangle: Sequence[float], rectangle_crs: str) -> BBox:
     transformer = Transformer.from_crs(rectangle_crs, "EPSG:3857", always_xy=True)
     xs, ys = transformer.transform([minx, minx, maxx, maxx], [miny, maxy, miny, maxy])
     return (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
-
-
-def _transform_geometry(geom: "BaseGeometry", src_crs: str, dst_crs: str) -> "BaseGeometry":
-    import shapely.ops
-    from pyproj import Transformer
-
-    transformer = Transformer.from_crs(src_crs, dst_crs, always_xy=True)
-    return shapely.ops.transform(transformer.transform, geom)
 
 
 def _prefix_sum_rectangle(prefix: Any, bbox_3857: BBox) -> float:
@@ -638,27 +587,3 @@ def _prefix_area(prefix: Any, row0: int, col0: int, row1: int, col1: int) -> flo
     corner = prefix[row0 - 1, col0 - 1] if row0 > 0 and col0 > 0 else 0
     return float(total - above - left + corner)
 
-
-def _read_partition_as_gdf(path: Path, geom_col: str) -> "gpd.GeoDataFrame":
-    import geopandas as gpd
-    import pyarrow.parquet as pq
-    from shapely import from_wkb
-    from shapely.geometry.base import BaseGeometry
-
-    from starlet._internal.server.tiler.parquet_index import BBOX_COLS
-
-    table = pq.read_table(path)
-    drop = [c for c in (*BBOX_COLS, *_INTERNAL_QUERY_COLUMNS) if c in table.column_names]
-    if drop:
-        table = table.drop(drop)
-    df = table.to_pandas()
-    if geom_col not in df.columns:
-        return gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=4326))
-
-    geometry = df[geom_col]
-    first = next((value for value in geometry if value is not None), None)
-    if isinstance(first, BaseGeometry):
-        geoms = gpd.GeoSeries(geometry, crs=4326)
-    else:
-        geoms = gpd.GeoSeries(from_wkb(geometry.to_numpy()), crs=4326)
-    return gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geoms, crs=4326)

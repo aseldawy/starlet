@@ -47,7 +47,7 @@ def tile(
     geom_col: str = "geometry",
     sfc_bits: int = 16,
     max_parallel_files: int = 64,
-    covering_bbox: bool = False,
+    covering_bbox: bool = True,
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
@@ -92,11 +92,10 @@ def tile(
     max_parallel_files : int
         Maximum concurrent tile files during write.
     covering_bbox : bool
-        Opt-in read-time pruning. If True, write four per-row bbox covering
+        Read-time pruning support. If True, write four per-row bbox covering
         columns plus bounded, spatially-coherent row groups so the on-demand
-        tile server can skip row groups/rows at read time. Off by default
-        (faster batch tiling, smaller files); enable when serving tiles
-        on the fly from these partitions.
+        tile server can skip row groups/rows at read time. Enabled by default;
+        disable when optimizing only for batch tiling speed and smaller files.
     csv_x_col, csv_y_col : str | None
         Column names containing x/y coordinates for CSV inputs. Provide both,
         or provide ``csv_wkt_col`` instead.
@@ -275,8 +274,6 @@ def generate_mvt(
     zoom: int = 7,
     threshold: float = 0,
     outdir: str | None = None,
-    auto_zoom: bool = True,
-    occupancy_threshold: float = 0.01,
     max_workers: int | None = None,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
@@ -291,40 +288,25 @@ def generate_mvt(
         Minimum feature count per tile.
     outdir : str | None
         MVT output directory. Defaults to ``<tile_dir>/mvt/``.
-    auto_zoom : bool
-        Automatically detect maximum useful zoom level from histogram density.
-        If True and data becomes sparse before ``zoom``, generation stops early.
-        Default True.
-    occupancy_threshold : float
-        Minimum tile occupancy (nonempty_tiles / total_tiles) for auto-zoom detection.
-        Default 0.01 (1% occupancy).
 
     Returns
     -------
     MVTResult
     """
     from pathlib import Path
-    from starlet._internal.mvt.generator import BucketMVTGenerator
 
-    parquet_dir = str(Path(tile_dir) / "parquet_tiles")
-    # Prefer the precomputed integral image written by the tiling stage; fall
-    # back to the raw histogram (recomputing the prefix sum) for older datasets.
-    hist_dir = Path(tile_dir) / "histograms"
-    prefix_path = hist_dir / "global_prefix.npy"
-    hist_path = str(prefix_path if prefix_path.exists() else hist_dir / "global.npy")
     mvt_outdir = outdir or str(Path(tile_dir) / "mvt")
 
-    gen = BucketMVTGenerator(
-        parquet_dir=parquet_dir,
-        hist_path=hist_path,
-        outdir=mvt_outdir,
-        last_zoom=zoom,
+    from starlet._internal.mvt.dataset_generator import DatasetMVTGenerator
+
+    DatasetMVTGenerator(
+        tile_dir,
+        num_zoom_levels=zoom + 1,
         threshold=threshold,
-        auto_zoom=auto_zoom,
-        occupancy_threshold=occupancy_threshold,
-        max_workers=max_workers,
-    )
-    gen.run()
+        output_format="mvt",
+        outdir=mvt_outdir,
+        workers=max_workers,
+    ).run()
 
     # Count generated tiles
     mvt_path = Path(mvt_outdir)
@@ -375,7 +357,7 @@ def build(
         Default "gzip". Only used if pmtiles=True.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
-        (e.g. ``covering_bbox=True``, ``orchestrator="round"``,
+        (e.g. ``covering_bbox=False``, ``orchestrator="round"``,
         ``geojson_executor="thread"``).
 
     Returns
@@ -389,7 +371,11 @@ def build(
     tile_result = tile(
         input=input, outdir=outdir, partition_size=partition_size, **tile_kwargs
     )
-    mvt_result = generate_mvt(tile_dir=outdir, zoom=zoom, threshold=threshold)
+    mvt_result = generate_mvt(
+        tile_dir=outdir,
+        zoom=zoom,
+        threshold=threshold,
+    )
 
     pmtiles_path = None
     if pmtiles:
@@ -447,7 +433,10 @@ def export_pmtiles(
     return export_to_pmtiles(mvt_dir, output_path, tile_type, compression)
 
 
-def create_app(data_dir: str, cache_size: int = 256):
+def create_app(
+    data_dir: str,
+    cache_size: int = 256,
+):
     """Create a Flask tile server application.
 
     Parameters
@@ -456,14 +445,16 @@ def create_app(data_dir: str, cache_size: int = 256):
         Root directory containing dataset subdirectories.
     cache_size : int
         Number of tiles in the in-memory LRU cache.
-
     Returns
     -------
     Flask
         Configured Flask application.
     """
     from starlet._internal.server.app import create_app as _create_app
-    return _create_app(data_dir=data_dir, cache_size=cache_size)
+    return _create_app(
+        data_dir=data_dir,
+        cache_size=cache_size,
+    )
 
 
 from starlet.api import (  # noqa: E402

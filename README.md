@@ -64,7 +64,7 @@ starlet tile --input data.parquet --outdir datasets/mydata
 | `--sort` | zorder | Within-tile row order: `zorder`, `hilbert`, `columns`, `none` |
 | `--orchestrator` | two-stage | Tiling engine: `two-stage` (fast, map-reduce) or `round` |
 | `--geojson-executor` | process | `process` for large files, `thread` for small GeoJSON |
-| `--covering-bbox` | off | Write per-row bbox columns for faster on-demand serving |
+| `--covering-bbox` | on | Write per-row bbox columns for faster on-demand serving |
 | `--geom-col` | geometry | Geometry column name (e.g. `wkb_geometry` for OGR exports) |
 | `--compression` | zstd | Parquet compression codec |
 
@@ -120,8 +120,10 @@ Once `starlet serve` is running:
   startup overhead.
 - **Geometry column** not named `geometry` (common with OGR/`pyogrio`
   exports)? Pass `--geom-col wkb_geometry`.
-- **Serving tiles on the fly** (zooming past the pre-generated levels)? Build
-  with `--covering-bbox` so the server can prune row groups at read time.
+- **Serving tiles on the fly** (zooming past the pre-generated levels)? The
+  default tiling output includes covering bbox columns so the server can prune
+  row groups at read time. Use `--no-covering-bbox` only when optimizing for
+  smaller Parquet files and batch generation speed.
 - **One-file distribution:** `starlet build --pmtiles` writes a single
   `datasets/mydata.pmtiles` archive alongside the dataset.
 

@@ -25,6 +25,8 @@ __all__ = [
     "delete_dataset",
     "add_dataset_async",
     "AsyncDatasetHandle",
+    "set_temp_dir",
+    "get_temp_dir",
     "TileResult",
     "MVTResult",
     "Dataset",
@@ -275,6 +277,7 @@ def generate_mvt(
     threshold: float = 0,
     outdir: str | None = None,
     max_workers: int | None = None,
+    temp_dir: str | None = None,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -288,6 +291,10 @@ def generate_mvt(
         Minimum feature count per tile.
     outdir : str | None
         MVT output directory. Defaults to ``<tile_dir>/mvt/``.
+    temp_dir : str | None
+        Parent directory for temporary MVT map/reduce files. If omitted, uses
+        the process-wide Starlet temp directory when configured, otherwise
+        ``<tile_dir>/tmp``.
 
     Returns
     -------
@@ -306,6 +313,7 @@ def generate_mvt(
         output_format="mvt",
         outdir=mvt_outdir,
         workers=max_workers,
+        temp_dir=temp_dir,
     ).run()
 
     # Count generated tiles
@@ -332,6 +340,7 @@ def build(
     threshold: float = 100_000,
     pmtiles: bool = False,
     pmtiles_compression: str = "gzip",
+    temp_dir: str | None = None,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
@@ -355,6 +364,9 @@ def build(
     pmtiles_compression : str
         Compression for PMTiles export: "gzip", "brotli", "zstd", "none".
         Default "gzip". Only used if pmtiles=True.
+    temp_dir : str | None
+        Parent directory for temporary files used by all build steps. Explicit
+        values override the process-wide Starlet temp directory.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
         (e.g. ``covering_bbox=False``, ``orchestrator="round"``,
@@ -368,13 +380,23 @@ def build(
     """
     from pathlib import Path
 
+    if "temp_dir" in tile_kwargs:
+        if temp_dir is not None:
+            raise ValueError("temp_dir was provided twice")
+        temp_dir = tile_kwargs.pop("temp_dir")
+
     tile_result = tile(
-        input=input, outdir=outdir, partition_size=partition_size, **tile_kwargs
+        input=input,
+        outdir=outdir,
+        partition_size=partition_size,
+        temp_dir=temp_dir,
+        **tile_kwargs,
     )
     mvt_result = generate_mvt(
         tile_dir=outdir,
         zoom=zoom,
         threshold=threshold,
+        temp_dir=temp_dir,
     )
 
     pmtiles_path = None
@@ -455,6 +477,18 @@ def create_app(
         data_dir=data_dir,
         cache_size=cache_size,
     )
+
+
+def set_temp_dir(path: str | None):
+    """Set the process-wide parent directory for Starlet temporary files."""
+    from starlet._internal.config import set_temp_dir as _set_temp_dir
+    return _set_temp_dir(path)
+
+
+def get_temp_dir():
+    """Return the configured process-wide Starlet temp directory, if any."""
+    from starlet._internal.config import get_temp_dir as _get_temp_dir
+    return _get_temp_dir()
 
 
 from starlet.api import (  # noqa: E402

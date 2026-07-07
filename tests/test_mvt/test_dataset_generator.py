@@ -118,3 +118,32 @@ def test_single_tile_parquet_index_is_cached_by_path(tmp_path):
     second = _single_tile_parquet_index(parquet_dir)
 
     assert first is second
+
+
+def test_generate_mvt_forwards_temp_dir(monkeypatch, tmp_path):
+    import starlet
+
+    captured = {}
+
+    class FakeDatasetMVTGenerator:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator.DatasetMVTGenerator",
+        FakeDatasetMVTGenerator,
+    )
+    outdir = tmp_path / "mvt"
+    outdir.mkdir()
+    temp_dir = tmp_path / "scratch"
+
+    starlet.generate_mvt(
+        str(tmp_path / "dataset"),
+        outdir=str(outdir),
+        temp_dir=str(temp_dir),
+    )
+
+    assert captured["temp_dir"] == str(temp_dir)

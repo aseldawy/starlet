@@ -26,6 +26,7 @@ from starlet._internal.tiling.writer_pool import (
 )
 from starlet._internal.stats import write_attribute_stats, AttributeStatsCollector
 from starlet._internal.progress import iter_with_progress
+from starlet._internal.config import resolve_temp_dir
 
 logger = logging.getLogger(__name__)
 
@@ -580,8 +581,7 @@ class TwoStageOrchestrator:
 
     def run(self) -> None:
         total_start = perf_counter()
-        temp_parent = Path(self.temp_dir) if self.temp_dir is not None else Path.cwd() / "tmp"
-        temp_parent.mkdir(parents=True, exist_ok=True)
+        temp_parent = resolve_temp_dir(self.temp_dir, Path.cwd() / "tmp")
         temp_root = Path(tempfile.mkdtemp(prefix="starlet_two_stage_", dir=str(temp_parent)))
         logger.info("TwoStageOrchestrator temp dir: %s", temp_root)
 

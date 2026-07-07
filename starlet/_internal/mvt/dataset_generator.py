@@ -19,6 +19,7 @@ import shapely
 from shapely import from_wkb
 
 from starlet._internal.histogram.loader import HistogramLoader
+from starlet._internal.config import resolve_temp_dir
 from starlet._internal.mvt.helpers import (
     WORLD_MAXX,
     WORLD_MAXY,
@@ -99,6 +100,7 @@ class DatasetMVTGenerator:
         partition_buffer: float = 0.0,
         geom_col: str = "geometry",
         seed: int = 42,
+        temp_dir: str | None = None,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.parquet_dir = self.dataset_dir / "parquet_tiles"
@@ -117,6 +119,7 @@ class DatasetMVTGenerator:
         self.partition_buffer = float(partition_buffer)
         self.geom_col = geom_col
         self.seed = int(seed)
+        self.temp_dir = temp_dir
 
         if self.num_zoom_levels <= 0:
             raise ValueError("num_zoom_levels must be positive")
@@ -136,8 +139,7 @@ class DatasetMVTGenerator:
         if not map_groups:
             return DatasetMVTGenerationResult(str(self.outdir), 0, [], None)
 
-        temp_parent = self.dataset_dir / "tmp"
-        temp_parent.mkdir(parents=True, exist_ok=True)
+        temp_parent = resolve_temp_dir(self.temp_dir, self.dataset_dir / "tmp")
         with tempfile.TemporaryDirectory(prefix="starlet_mvt_", dir=temp_parent) as temp_dir:
             map_results = self._run_map_stage(map_groups, source, Path(temp_dir))
             self._run_reduce_stage(map_results)

@@ -14,6 +14,7 @@ import pandas as pd
 import pyarrow as pa
 from shapely import to_wkb
 
+from starlet._internal.config import resolve_temp_dir
 from starlet._internal.tiling.datasource import (
     DataSource,
     _GDB_SUFFIXES,
@@ -332,7 +333,7 @@ def _extract_zipped_gdbs(path: Path) -> List[Path]:
     stat = path.stat()
     key_material = f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8")
     cache_key = hashlib.sha256(key_material).hexdigest()[:24]
-    cache_root = Path(tempfile.gettempdir()) / "starlet_gdb_zip_cache" / cache_key
+    cache_root = resolve_temp_dir(default=Path(tempfile.gettempdir())) / "starlet_gdb_zip_cache" / cache_key
     complete_marker = cache_root / ".complete"
     if complete_marker.exists():
         return [cache_root / member_dir for member_dir in gdb_member_dirs]

@@ -34,6 +34,14 @@ def _setup_logging(log_level: str) -> None:
     )
 
 
+def _configure_temp_dir(temp_dir: str | None) -> None:
+    if temp_dir is None:
+        return
+    from starlet._internal.config import set_temp_dir
+
+    set_temp_dir(temp_dir)
+
+
 _SIZE_SUFFIXES = {
     "kb": 1024,
     "mb": 1024 ** 2,
@@ -85,7 +93,7 @@ def main():
 @click.option("--two-stage-assignment-workers", type=int, default=None, help="Assignment workers for the two-stage orchestrator.")
 @click.option("--two-stage-write-workers", type=int, default=None, help="Write workers for the two-stage orchestrator.")
 @click.option("--two-stage-reducers", type=int, default=None, help="Hash-shuffle reducers for the two-stage orchestrator.")
-@click.option("--temp-dir", default=None, help="Parent directory for two-stage temporary shard files (default: ./tmp).")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary files used by all steps.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def tile(input_path, outdir, partition_size, sort, compression,
          sample_cap, sample_ratio, seed, geom_col, sfc_bits, max_parallel_files,
@@ -95,6 +103,7 @@ def tile(input_path, outdir, partition_size, sort, compression,
          temp_dir, log_level):
     """Partition a geospatial dataset into spatially-tiled Parquet files."""
     _setup_logging(log_level)
+    _configure_temp_dir(temp_dir)
     import starlet
 
     result = starlet.tile(
@@ -133,10 +142,12 @@ def tile(input_path, outdir, partition_size, sort, compression,
 @click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
 @click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per tile.")
 @click.option("--outdir", default=None, help="MVT output directory (default: <dir>/mvt/).")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary files used by all steps.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def mvt(tile_dir, zoom, threshold, outdir, log_level):
+def mvt(tile_dir, zoom, threshold, outdir, temp_dir, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
     _setup_logging(log_level)
+    _configure_temp_dir(temp_dir)
     import starlet
 
     result = starlet.generate_mvt(
@@ -144,6 +155,7 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
         zoom=zoom,
         threshold=threshold,
         outdir=outdir,
+        temp_dir=temp_dir,
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
     click.echo(f"  Output: {result.outdir}")
@@ -168,13 +180,15 @@ def mvt(tile_dir, zoom, threshold, outdir, log_level):
 @click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
 @click.option("--pmtiles", is_flag=True, help="Export MVT tiles to PMTiles archive after generation.")
 @click.option("--pmtiles-compression", default="gzip", show_default=True, type=click.Choice(["gzip", "brotli", "zstd", "none"]), help="PMTiles compression format.")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary files used by all steps.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
           csv_x_col, csv_y_col, csv_wkt_col, csv_split_size, src_crs,
           geojson_executor, orchestrator, pmtiles,
-          pmtiles_compression, log_level):
+          pmtiles_compression, temp_dir, log_level):
     """Run the full pipeline: tile then generate MVTs."""
     _setup_logging(log_level)
+    _configure_temp_dir(temp_dir)
     import starlet
 
     tile_result, mvt_result, pmtiles_path = starlet.build(
@@ -193,6 +207,7 @@ def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
         orchestrator=orchestrator,
         pmtiles=pmtiles,
         pmtiles_compression=pmtiles_compression,
+        temp_dir=temp_dir,
     )
     click.echo(f"Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
@@ -206,10 +221,12 @@ def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
 @click.option("--host", default="0.0.0.0", show_default=True, help="Host to bind.")
 @click.option("--port", type=int, default=8765, show_default=True, help="Port to bind.")
 @click.option("--cache-size", type=int, default=256, show_default=True, help="In-memory tile cache size.")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary files used by all steps.")
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def serve(data_dir, host, port, cache_size, log_level):
+def serve(data_dir, host, port, cache_size, temp_dir, log_level):
     """Launch the tile server."""
     _setup_logging(log_level)
+    _configure_temp_dir(temp_dir)
     import starlet
 
     app = starlet.create_app(
@@ -223,8 +240,10 @@ def serve(data_dir, host, port, cache_size, log_level):
 
 @main.command()
 @click.option("--dir", "data_dir", required=True, help="Dataset directory to inspect.")
-def info(data_dir):
+@click.option("--temp-dir", default=None, help="Parent directory for temporary files used by all steps.")
+def info(data_dir, temp_dir):
     """Print dataset metadata summary."""
+    _configure_temp_dir(temp_dir)
     import starlet
     from pathlib import Path
 

@@ -10,6 +10,19 @@ def test_list_datasets(sample_dataset_dir):
     assert starlet.list_datasets(sample_dataset_dir.parent) == ["test_dataset"]
 
 
+def test_process_wide_temp_dir_can_be_configured(temp_dir):
+    previous = starlet.get_temp_dir()
+    custom_temp = temp_dir / "starlet_tmp"
+    try:
+        configured = starlet.set_temp_dir(str(custom_temp))
+
+        assert configured == custom_temp
+        assert starlet.get_temp_dir() == custom_temp
+        assert custom_temp.is_dir()
+    finally:
+        starlet.set_temp_dir(str(previous) if previous is not None else None)
+
+
 def test_get_dataset_metadata(sample_dataset_dir):
     metadata = starlet.get_dataset_metadata(sample_dataset_dir)
     assert metadata["name"] == "test_dataset"

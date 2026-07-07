@@ -100,7 +100,7 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
     tile_bytes = generate_single_mvt_tile(
         str(dataset_dir),
         (1, 0, 0),
-        coordinate_capacity=10,
+        feature_capacity=10,
     )
     decoded = mapbox_vector_tile.decode(tile_bytes)
 

@@ -8,6 +8,7 @@ coordinates only when encoding MVT bytes.
 """
 from __future__ import annotations
 
+import json
 import math
 import random
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any, Iterable
 
 import mapbox_vector_tile
 import numpy as np
+import pyarrow as pa
 from shapely import get_coordinates
 import shapely
 from shapely.affinity import affine_transform
@@ -83,8 +85,7 @@ class IntermediateVectorTile:
         self._features: list[_TileFeature] = []
         self._coordinate_count = 0
         self._features_seen = 0
-        _pixel_area = (width * height) / (self.extent * self.extent) if self.extent > 0 else 0.0
-        self._small_geometry_area = _pixel_area * 10.0
+        self._small_geometry_area = 10.0
 
     @property
     def coordinate_count(self) -> int:
@@ -165,6 +166,7 @@ class IntermediateVectorTile:
         # Simplify the geometry to reduce the number of coordinates. Use tolerance of one pixel.
         if shapely.count_coordinates(geometry) > 10:
             geometry = shapely.simplify(geometry, 1.0, preserve_topology=False)
+        if geometry.geom_type not in {"Point", "MultiPoint"}:
             geometry = shapely.clip_by_rect(
                 geometry,
                 -self.buffer, -self.buffer, self.extent + self.buffer, self.extent + self.buffer,
@@ -191,6 +193,49 @@ class IntermediateVectorTile:
                 replaced = self._features[slot]
                 self._coordinate_count += feature.coordinate_count - replaced.coordinate_count
                 self._features[slot] = feature
+
+    def write_features(self, path) -> None:
+        """Write retained features to an Arrow IPC file."""
+        table = pa.table(
+            {
+                "geometry": pa.array(
+                    [feature.geometry.wkb for feature in self._features],
+                    type=pa.binary(),
+                ),
+                "properties": pa.array(
+                    [
+                        json.dumps(feature.properties, separators=(",", ":"))
+                        for feature in self._features
+                    ],
+                    type=pa.string(),
+                ),
+            }
+        )
+        with pa.OSFile(str(path), "wb") as sink:
+            with pa.ipc.new_file(sink, table.schema) as writer:
+                writer.write_table(table)
+
+    def load_features(self, path) -> None:
+        """Load retained features from an Arrow IPC file without resampling."""
+        with pa.memory_map(str(path), "r") as source:
+            table = pa.ipc.open_file(source).read_all()
+
+        geometries = table["geometry"].to_pylist()
+        properties = table["properties"].to_pylist()
+        for geometry_bytes, property_json in zip(geometries, properties):
+            geometry = shapely.from_wkb(geometry_bytes)
+            coordinate_count = shapely.count_coordinates(geometry)
+            if coordinate_count == 0:
+                continue
+            self._features.append(
+                _TileFeature(
+                    geometry=geometry,
+                    properties=json.loads(property_json),
+                    coordinate_count=coordinate_count,
+                )
+            )
+            self._coordinate_count += coordinate_count
+            self._features_seen += 1
 
     def encode(self, layer_name: str = "layer0") -> bytes:
         """Encode the retained features as an MVT binary payload."""

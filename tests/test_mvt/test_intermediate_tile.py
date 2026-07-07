@@ -38,13 +38,13 @@ def test_initializes_web_mercator_to_tile_pixel_transform():
 
 def test_simplify_geometry_trims_lines_to_buffered_tile_bounds():
     tile = IntermediateVectorTile(0, 0, 0)
-    left = _mercator_from_tile_pixel(tile, -1000, 2048)
-    right = _mercator_from_tile_pixel(tile, 5000, 2048)
+    left = _mercator_from_tile_pixel(tile, -1000, -1000)
+    right = _mercator_from_tile_pixel(tile, 5000, 5000)
 
     transformed = tile.simplify_geometry(LineString([left, right]))
 
     assert len(transformed) == 1
-    assert list(transformed[0].coords) == [(-256.0, 2048.0), (4352.0, 2048.0)]
+    assert list(transformed[0].coords) == [(-256.0, -256.0), (4352.0, 4352.0)]
 
 
 def test_simplify_geometry_clips_containing_polygon_to_tile_ring():
@@ -64,9 +64,9 @@ def test_simplify_geometry_clips_containing_polygon_to_tile_ring():
 
 
 def test_add_feature_filters_null_properties_and_tracks_coordinates():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=10)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
 
-    assert tile.add_feature(Point(0, 0), {"id": 1, "name": None}, coordinate_count=1)
+    assert tile.add_feature(Point(0, 0), {"id": 1, "name": None})
 
     assert tile.coordinate_count == 1
     assert tile.feature_count == 1
@@ -74,7 +74,7 @@ def test_add_feature_filters_null_properties_and_tracks_coordinates():
 
 
 def test_add_feature_delays_simplification_until_features_are_requested():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=10)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
     called = False
     original_simplify_geometry = tile.simplify_geometry
 
@@ -84,7 +84,7 @@ def test_add_feature_delays_simplification_until_features_are_requested():
         raise AssertionError("add_feature should only sample raw geometries")
 
     tile.simplify_geometry = fail_if_called
-    assert tile.add_feature(Point(0, 0), {"id": 1}, coordinate_count=1)
+    assert tile.add_feature(Point(0, 0), {"id": 1})
     assert tile._features[0].properties == {"id": 1}
     assert not called
 
@@ -93,8 +93,8 @@ def test_add_feature_delays_simplification_until_features_are_requested():
 
 
 def test_feature_can_be_skipped_by_reservoir_probability():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=1, rng=_FixedRng([1.0]))
-    assert tile.add_feature(Point(0, 0), {"id": 1}, coordinate_count=1)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1, rng=_FixedRng(randrange_values=[1]))
+    assert tile.add_feature(Point(0, 0), {"id": 1})
 
     called = False
 
@@ -105,42 +105,34 @@ def test_feature_can_be_skipped_by_reservoir_probability():
 
     tile.simplify_geometry = fail_if_called
 
-    assert not tile.add_feature(Point(1000, 0), {"id": 2}, coordinate_count=1)
+    assert not tile.add_feature(Point(1000, 0), {"id": 2})
     assert not called
 
 
-def test_coordinate_capacity_replaces_random_features_to_make_room():
+def test_feature_capacity_replaces_random_features_to_make_room():
     tile = IntermediateVectorTile(
         0,
         0,
         0,
-        coordinate_capacity=2,
-        rng=_FixedRng(random_values=[0.0, 0.0], randrange_values=[0]),
+        feature_capacity=2,
+        rng=_FixedRng(randrange_values=[0, 0]),
     )
 
-    assert tile.add_feature(Point(-1000, 0), {"id": 1}, coordinate_count=1)
-    assert tile.add_feature(Point(0, 0), {"id": 2}, coordinate_count=1)
-    assert tile.add_feature(Point(1000, 0), {"id": 3}, coordinate_count=1)
+    assert tile.add_feature(Point(-1000, 0), {"id": 1})
+    assert tile.add_feature(Point(0, 0), {"id": 2})
+    assert tile.add_feature(Point(1000, 0), {"id": 3})
 
     retained_ids = {feature.properties["id"] for feature in tile._features}
     assert retained_ids == {2, 3}
     assert tile.coordinate_count == 2
 
 
-def test_oversized_feature_is_skipped():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=2)
-
-    assert not tile.add_feature(Point(0, 0), {"id": 1}, coordinate_count=3)
-    assert tile.feature_count == 0
-    assert tile.coordinate_count == 0
-
-
 def test_merge_combines_same_tile_without_simplifying_again():
-    left = IntermediateVectorTile(0, 0, 0, coordinate_capacity=2, rng=_FixedRng(randrange_values=[0]))
-    right = IntermediateVectorTile(0, 0, 0, coordinate_capacity=2, rng=_FixedRng([1.0]))
-    left.add_feature(Point(-1000, 0), {"id": 1}, coordinate_count=1)
-    right.add_feature(Point(0, 0), {"id": 2}, coordinate_count=1)
-    right.add_feature(Point(1000, 0), {"id": 3}, coordinate_count=1)
+    left = IntermediateVectorTile(0, 0, 0, feature_capacity=2, rng=_FixedRng(randrange_values=[0]))
+    right = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
+    left.add_feature(Point(-1000, 0), {"id": 1})
+    right.add_feature(Point(0, 0), {"id": 2})
+    right.add_feature(Point(1000, 0), {"id": 3})
 
     def fail_if_called(geometry):
         raise AssertionError("merge should not simplify geometries")
@@ -157,7 +149,7 @@ def test_merge_combines_same_tile_without_simplifying_again():
     left.simplify_geometry = original_simplify_geometry
     left.add_feature = original_add_feature
     retained_ids = {feature.properties["id"] for feature in left._features}
-    assert retained_ids == {1, 2}
+    assert retained_ids == {2, 3}
     assert left.coordinate_count == 2
 
 
@@ -170,8 +162,8 @@ def test_merge_rejects_different_tile_ids():
 
 
 def test_encode_returns_valid_mvt_binary():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=10)
-    tile.add_feature(Point(0, 0), {"id": 1}, coordinate_count=1)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    tile.add_feature(Point(0, 0), {"id": 1})
 
     decoded = mapbox_vector_tile.decode(tile.encode())
 
@@ -181,9 +173,23 @@ def test_encode_returns_valid_mvt_binary():
 
 
 def test_encode_accepts_layer_name():
-    tile = IntermediateVectorTile(0, 0, 0, coordinate_capacity=10)
-    tile.add_feature(Point(0, 0), {"id": 1}, coordinate_count=1)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    tile.add_feature(Point(0, 0), {"id": 1})
 
     decoded = mapbox_vector_tile.decode(tile.encode(layer_name="custom"))
 
     assert "custom" in decoded
+
+
+def test_feature_arrow_roundtrip_populates_tile_state(tmp_path):
+    path = tmp_path / "0-0-0.pyarrow"
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    tile.add_feature(Point(0, 0), {"id": 1})
+    tile.write_features(path)
+
+    loaded = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    loaded.load_features(path)
+
+    assert loaded.feature_count == 1
+    assert loaded.coordinate_count == 1
+    assert loaded._features[0].properties == {"id": 1}

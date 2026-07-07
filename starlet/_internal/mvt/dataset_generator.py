@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 import logging
 import math
 import multiprocessing
 from pathlib import Path
+import random
+import tempfile
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -57,6 +59,12 @@ class DatasetMVTGenerationResult:
 class _MapStageResult:
     intermediate_dir: str
     tile_ids: list[int]
+
+
+@dataclass(frozen=True)
+class _ReduceTileInput:
+    tile_id: int
+    intermediate_dirs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -128,8 +136,11 @@ class DatasetMVTGenerator:
         if not map_groups:
             return DatasetMVTGenerationResult(str(self.outdir), 0, [], None)
 
-        intermediate_tiles = self._run_map_stage(map_groups, source)
-        self._run_reduce_stage(intermediate_tiles)
+        temp_parent = self.dataset_dir / "tmp"
+        temp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="starlet_mvt_", dir=temp_parent) as temp_dir:
+            map_results = self._run_map_stage(map_groups, source, Path(temp_dir))
+            self._run_reduce_stage(map_results)
 
         pmtiles_path = None
         if self.output_format == "pmtiles":
@@ -154,7 +165,8 @@ class DatasetMVTGenerator:
         self,
         map_groups: Sequence[Sequence[_MapInput]],
         source: GeoParquetSource,
-    ) -> list[IntermediateVectorTile]:
+        temp_root: Path,
+    ) -> list[_MapStageResult]:
         logger.info(
             "DatasetMVTGenerator map stage: groups=%d workers=%d",
             len(map_groups),
@@ -174,37 +186,44 @@ class DatasetMVTGenerator:
                     self.extent,
                     self.buffer,
                     self.seed + index,
+                    str(temp_root),
+                    index,
                 )
                 for index, group in enumerate(map_groups)
             ]
             return [
-                tile
+                future.result()
                 for future in iter_with_progress(
                     as_completed(futures),
                     total=len(futures),
                     logger=logger,
                     label="dataset-mvt: map",
                 )
-                for tile in future.result()
             ]
 
-    def _run_reduce_stage(self, intermediate_tiles: list[IntermediateVectorTile]) -> None:
-        if not intermediate_tiles:
+    def _run_reduce_stage(self, map_results: list[_MapStageResult]) -> None:
+        if not map_results:
             logger.info("DatasetMVTGenerator reduce stage: no intermediate tiles")
             return
 
         self.outdir.mkdir(parents=True, exist_ok=True)
-        tile_groups: list[list[IntermediateVectorTile]] = [
+        tile_locations: dict[int, list[str]] = defaultdict(list)
+        for result in map_results:
+            for tile_id in result.tile_ids:
+                tile_locations[tile_id].append(result.intermediate_dir)
+
+        reduce_groups: list[list[_ReduceTileInput]] = [
             [] for _ in range(self.workers)
         ]
-
-        for tile in intermediate_tiles:
-            group_index = hash(tile.tile_id) % self.workers
-            tile_groups[group_index].append(tile)
+        for tile_id, intermediate_dirs in tile_locations.items():
+            group_index = tile_id % self.workers
+            reduce_groups[group_index].append(
+                _ReduceTileInput(tile_id, tuple(intermediate_dirs))
+            )
         logger.info(
             "DatasetMVTGenerator reduce stage: tile_ids=%d groups=%d workers=%d",
-            len(intermediate_tiles),
-            len(tile_groups),
+            len(tile_locations),
+            len(reduce_groups),
             self.workers,
         )
         with ProcessPoolExecutor(max_workers=self.workers) as executor:
@@ -213,8 +232,11 @@ class DatasetMVTGenerator:
                     _reduce_tile_group,
                     tuple(group),
                     str(self.outdir),
+                    self.feature_capacity,
+                    self.extent,
+                    self.buffer,
                 )
-                for group in tile_groups
+                for group in reduce_groups
                 if group
             ]
             for future in iter_with_progress(
@@ -237,7 +259,9 @@ def _map_split_group(
     extent: int,
     buffer: int,
     seed: int,
-) -> list[IntermediateVectorTile]:
+    temp_root: str,
+    mapper_index: int,
+) -> _MapStageResult:
     prefix = HistogramLoader(hist_path).load()
     partitioner = PyramidPartitioner(
         (WORLD_MINX, WORLD_MINY, WORLD_MAXX, WORLD_MAXY),
@@ -265,13 +289,23 @@ def _map_split_group(
                         feature_capacity=feature_capacity,
                         extent=extent,
                         buffer=buffer,
+                        rng=random.Random(seed + tile_id),
                     )
                     tiles[tile_id] = tile
                 tile.add_feature(
                     geom,
                     attrs,
                 )
-    return list(tiles.values())
+    intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    tile_ids = []
+    for tile_id, tile in tiles.items():
+        if tile.feature_count == 0:
+            continue
+        z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
+        tile.write_features(intermediate_dir / _intermediate_tile_filename(z, x, y))
+        tile_ids.append(tile_id)
+    return _MapStageResult(str(intermediate_dir), tile_ids)
 
 
 def _iter_map_input_tables(
@@ -285,28 +319,57 @@ def _iter_map_input_tables(
             yield from source.iter_tables(item)
 
 
-def _reduce_tile_group(tiles: list[IntermediateVectorTile], outdir: str) -> None:
+def _reduce_tile_group(
+    reduce_inputs: Sequence[_ReduceTileInput],
+    outdir: str,
+    feature_capacity: int,
+    extent: int,
+    buffer: int,
+) -> None:
     out_path = Path(outdir)
-    from collections import defaultdict
-    tiles_by_id: dict[int, list[IntermediateVectorTile]] = defaultdict(list)
-    for tile in tiles:
-        tiles_by_id[tile.tile_id].append(tile)
-
-    for tile_id, tiles in tiles_by_id.items():
-        merged: IntermediateVectorTile | None = None
-        for tile in tiles:
-            if merged is None:
-                merged = tile
-            else:
-                merged.merge(tile)
-
-        if merged is None or merged.feature_count == 0:
-            continue
+    for reduce_input in reduce_inputs:
+        tile_id = reduce_input.tile_id
         z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
+        filename = _intermediate_tile_filename(z, x, y)
+        merged = IntermediateVectorTile(
+            z,
+            x,
+            y,
+            feature_capacity=feature_capacity,
+            extent=extent,
+            buffer=buffer,
+            rng=random.Random(tile_id),
+        )
+        first_tile = True
+        for intermediate_dir in reduce_input.intermediate_dirs:
+            path = Path(intermediate_dir) / filename
+            if not path.exists():
+                continue
+            if first_tile:
+                merged.load_features(path)
+                first_tile = False
+            else:
+                partial = IntermediateVectorTile(
+                    z,
+                    x,
+                    y,
+                    feature_capacity=feature_capacity,
+                    extent=extent,
+                    buffer=buffer,
+                )
+                partial.load_features(path)
+                merged.merge(partial)
+
+        if merged.feature_count == 0:
+            continue
         x_dir = out_path / str(z) / str(x)
         x_dir.mkdir(parents=True, exist_ok=True)
         with open(x_dir / f"{y}.mvt", "wb") as output:
             output.write(merged.encode())
+
+
+def _intermediate_tile_filename(z: int, x: int, y: int) -> str:
+    return f"{z}-{x}-{y}.pyarrow"
 
 
 def generate_single_mvt_tile(

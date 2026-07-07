@@ -4,13 +4,14 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.progress import iter_with_progress
 from starlet._internal.tiling.datasource import (
     DataSource,
@@ -146,7 +147,11 @@ class GeoParquetSource(DataSource):
             workers or "auto",
         )
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with create_process_executor(
+            max_workers=workers,
+            logger=logger,
+            context="GeoParquet spatial sampling",
+        ) as executor:
             futures = [
                 executor.submit(
                     _read_geoparquet_split_spatial_sample,

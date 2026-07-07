@@ -172,7 +172,6 @@ def read_spatial_sample(
     sample_cap: Optional[int] = None,
     seed: int = 42,
     geojson_workers: Optional[int] = None,
-    geojson_executor: str = "process",
     geoparquet_workers: Optional[int] = None,
     source_workers: Optional[int] = None,
 ) -> SpatialSample:
@@ -185,7 +184,6 @@ def read_spatial_sample(
             sample_cap=sample_cap,
             seed=seed,
             workers=geojson_workers,
-            executor=geojson_executor,
         )
     if kind == "geoparquet":
         return GeoParquetSource.read_spatial_sample(

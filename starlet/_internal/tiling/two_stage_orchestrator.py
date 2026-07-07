@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 import errno
 import gc
@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.tiling.datasource import DataSource
 from starlet._internal.tiling.writer_pool import (
     SortKey,
@@ -58,15 +59,6 @@ class _ShardManifest:
     # Optional per-split attribute stats; the parent merges these after all
     # mapper workers finish so stats are collected without re-reading input.
     stats: Optional[AttributeStatsCollector] = None
-
-
-def _executor_class(kind: str):
-    normalized = kind.strip().lower()
-    if normalized in {"process", "processes", "multiprocessing"}:
-        return ProcessPoolExecutor
-    if normalized in {"thread", "threads", "threading"}:
-        return ThreadPoolExecutor
-    raise ValueError(f"executor must be 'process' or 'thread' (got {kind!r})")
 
 
 def _table_with_partition_column(original_table: pa.Table, partition_table: pa.Table) -> pa.Table:
@@ -540,10 +532,10 @@ class TwoStageOrchestrator:
         assigner,
         outdir: str,
         geom_col: str = "geometry",
+        parallelism: Optional[int] = None,
         assignment_workers: Optional[int] = None,
         write_workers: Optional[int] = None,
         num_reducers: Optional[int] = None,
-        executor: str = "process",
         compression: Optional[str] = "zstd",
         sort_mode: str = SortMode.ZORDER,
         sort_keys: Optional[Sequence[Union[SortKey, Tuple[str, bool], str]]] = None,
@@ -559,10 +551,10 @@ class TwoStageOrchestrator:
         self.assigner = assigner
         self.outdir = outdir
         self.geom_col = geom_col
-        self.assignment_workers = assignment_workers
-        self.write_workers = write_workers
-        self.num_reducers = num_reducers
-        self.executor = executor
+        self.parallelism = parallelism
+        self.assignment_workers = assignment_workers if assignment_workers is not None else parallelism
+        self.write_workers = write_workers if write_workers is not None else parallelism
+        self.num_reducers = num_reducers if num_reducers is not None else parallelism
         self.compression = compression
         self.sort_mode = sort_mode
         self.sort_keys = list(sort_keys or [])
@@ -635,21 +627,23 @@ class TwoStageOrchestrator:
         return max(1, len(splits))
 
     def _run_assignment_stage(self, splits: Sequence[Any], temp_root: Path) -> Dict[int, List[str]]:
-        executor_cls = _executor_class(self.executor)
         max_workers = self.assignment_workers
         num_reducers = self._effective_num_reducers(splits)
         logger.info(
-            "TwoStageOrchestrator assignment stage: splits=%d reducers=%d workers=%s executor=%s",
+            "TwoStageOrchestrator assignment stage: splits=%d reducers=%d workers=%s",
             len(splits),
             num_reducers,
             max_workers or "auto",
-            self.executor,
         )
 
         stage_start = perf_counter()
         self._merged_stats: Optional[AttributeStatsCollector] = None
         manifests: List[_ShardManifest] = []
-        with executor_cls(max_workers=max_workers) as executor:
+        with create_process_executor(
+            max_workers=max_workers,
+            logger=logger,
+            context="two-stage assignment",
+        ) as executor:
             futures = [
                 executor.submit(
                     _assignment_stage_worker,
@@ -706,7 +700,6 @@ class TwoStageOrchestrator:
             return
 
         Path(self.outdir).mkdir(parents=True, exist_ok=True)
-        executor_cls = _executor_class(self.executor)
         max_workers = self.write_workers
         config = _WriterPoolConfig(
             geom_col=self.geom_col,
@@ -721,14 +714,17 @@ class TwoStageOrchestrator:
         )
 
         logger.info(
-            "TwoStageOrchestrator reduce stage: reducers=%d workers=%s executor=%s",
+            "TwoStageOrchestrator reduce stage: reducers=%d workers=%s",
             len(intermediate_by_reducer),
             max_workers or "auto",
-            self.executor,
         )
         stage_start = perf_counter()
 
-        with executor_cls(max_workers=max_workers) as executor:
+        with create_process_executor(
+            max_workers=max_workers,
+            logger=logger,
+            context="two-stage reduce",
+        ) as executor:
             futures = {
                 executor.submit(_reduce_stage_worker, reducer_id, paths, config, str(temp_root)): reducer_id
                 for reducer_id, paths in intermediate_by_reducer.items()

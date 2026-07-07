@@ -554,7 +554,6 @@ class TestGeoJSONSource:
             sample_ratio=1.0,
             seed=42,
             geojson_workers=1,
-            geojson_executor="thread",
         )
 
         assert spatial_sample.total_seen == 2
@@ -587,7 +586,6 @@ class TestGeoJSONSource:
             sample_ratio=1.0,
             seed=42,
             geojson_workers=4,
-            geojson_executor="thread",
         )
 
         assert spatial_sample.total_seen == 24

@@ -1,0 +1,96 @@
+# Starlet configuration template
+#
+# Precedence:
+# 1. Command-line arguments
+# 2. Config file values
+# 3. Built-in defaults
+#
+# Command-line-only parameters such as input paths and output directories are
+# not listed here because they must still be provided per run.
+
+[global]
+# Parent directory for temporary Starlet files.
+temp_dir = "/tmp/starlet"
+
+# Shared worker count used across sampling, tiling, histograms, reducers, and MVT generation.
+parallelism = 8
+
+# Default logging level for CLI commands.
+log_level = "INFO"
+
+[tile]
+# Target partition size in bytes or as a string such as "256mb".
+partition_size = "128mb"
+
+# Row ordering inside each parquet tile: zorder, hilbert, columns, none.
+sort = "zorder"
+
+# Compression codec for parquet output.
+compression = "zstd"
+
+# Reservoir sample size used during partitioning.
+sample_cap = 10000
+
+# Bernoulli sample ratio used during partitioning.
+sample_ratio = 1.0
+
+# Target byte size for CSV source splits.
+csv_split_size = "32mb"
+
+# Maximum number of parallel tile file writes.
+max_parallel_files = 64
+
+# Histogram grid size per axis.
+grid_size = 4096
+
+# Histogram data type.
+dtype = "float64"
+
+# Bits per axis for spatial sorting keys.
+sfc_bits = 16
+
+# Tiling orchestrator: round or two-stage.
+orchestrator = "two-stage"
+
+[mvt]
+# Maximum zoom level for MVT generation.
+zoom = 7
+
+# Minimum feature count required for a tile to be generated.
+threshold = 100000
+
+# Maximum retained features per intermediate tile reservoir.
+feature_capacity = 10000
+
+# Vector tile extent.
+extent = 4096
+
+# Vector tile buffer in extent units.
+buffer = 256
+
+# Overlap buffer used by the partitioner as a fraction of tile size.
+partition_buffer = 0.0
+
+# Compression format used when exporting PMTiles.
+pmtiles_compression = "gzip"
+
+[build]
+# Maximum zoom level for the full build pipeline.
+zoom = 7
+
+# Minimum feature count required for MVT generation during build.
+threshold = 100000
+
+# Export a PMTiles archive after generating MVTs.
+pmtiles = false
+
+# Optional build-specific MVT compression override for PMTiles export.
+pmtiles_compression = "gzip"
+
+[serve]
+# Host and port used by `starlet serve`.
+host = "0.0.0.0"
+port = 8765
+
+# In-memory tile cache size for the server.
+cache_size = 256

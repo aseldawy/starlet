@@ -29,6 +29,10 @@ def test_get_dataset_metadata(sample_dataset_dir):
     assert metadata["exists"] is True
     assert metadata["parquet_tile_count"] >= 0
     assert metadata["has_stats"] is True
+    assert metadata["parquet_has_bbox"] is False
+    assert metadata["parquet_crs"] is None
+    assert metadata["mvt_tile_count"] == 0
+    assert metadata["histogram_resolution"] == 64
 
 
 def test_get_dataset_summary_derives_from_stats(sample_dataset_dir):

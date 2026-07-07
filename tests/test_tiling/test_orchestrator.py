@@ -224,9 +224,7 @@ class TestTwoStageOrchestrator:
             assigner=assigner,
             outdir=str(outdir),
             sort_mode=SortMode.NONE,
-            executor="thread",
-            assignment_workers=2,
-            write_workers=2,
+            parallelism=2,
         )
         orchestrator.run()
 
@@ -258,10 +256,7 @@ class TestTwoStageOrchestrator:
             assigner=assigner,
             outdir=str(temp_dir / "custom_tmp_tiles"),
             sort_mode=SortMode.NONE,
-            executor="thread",
-            assignment_workers=2,
-            write_workers=2,
-            num_reducers=2,
+            parallelism=2,
             temp_dir=str(temp_parent),
             keep_temp=True,
         )

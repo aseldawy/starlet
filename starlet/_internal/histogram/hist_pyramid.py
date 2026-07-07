@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -11,6 +12,7 @@ import numpy as np
 from shapely import from_wkb, get_coordinates
 from pyproj import Transformer
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.progress import iter_with_progress
 from starlet._internal.tiling.crs import WGS84_CRS, geoparquet_crs
 from starlet._internal.tiling.datasource import GeoParquetSource
@@ -31,8 +33,7 @@ class HistConfig:
     grid_size: int = 4096
     out_crs: str = "EPSG:3857"
     dtype: str = "float64"
-    max_parallel_tiles: int = 8
-    rg_parallel: int = 4
+    parallelism: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +112,19 @@ def _accumulate_vertices_hist(
 # PROCESS SPLIT GROUPS
 # ---------------------------------------------------------------------------
 
-def _split_groups(splits: Sequence, max_workers: int) -> List[List]:
-    """Divide splits into balanced, non-empty groups for worker processes."""
+def _effective_parallelism(max_workers: int | None, split_count: int) -> int:
+    if split_count <= 0:
+        return 1
+    if max_workers is None:
+        return max(1, min(split_count, os.cpu_count() or 1))
     if max_workers <= 0:
-        raise ValueError("hist_max_parallel must be positive")
+        raise ValueError("parallelism must be positive")
+    return min(int(max_workers), split_count)
 
-    worker_count = min(max_workers, len(splits))
+
+def _split_groups(splits: Sequence, max_workers: int | None) -> List[List]:
+    """Divide splits into balanced, non-empty groups for worker processes."""
+    worker_count = _effective_parallelism(max_workers, len(splits))
     base_size, remainder = divmod(len(splits), worker_count)
     groups: List[List] = []
     offset = 0
@@ -232,14 +240,12 @@ def build_histograms_for_dir(
     geom_col="geometry",
     grid_size=4096,
     dtype="float64",
-    hist_max_parallel=8,
-    hist_rg_parallel=4,
+    parallelism=8,
 ):
     cfg = HistConfig(
         grid_size=grid_size,
         dtype=dtype,
-        max_parallel_tiles=hist_max_parallel,
-        rg_parallel=hist_rg_parallel,
+        parallelism=parallelism,
     )
 
     source = GeoParquetSource(
@@ -256,14 +262,19 @@ def build_histograms_for_dir(
     outdir_p.mkdir(parents=True, exist_ok=True)
 
     tile_outputs = []
-    split_groups = _split_groups(splits, cfg.max_parallel_tiles)
+    worker_count = _effective_parallelism(cfg.parallelism, len(splits))
+    split_groups = _split_groups(splits, worker_count)
     logger.info(
         "Histogram computation: %d splits grouped into %d worker tasks",
         len(splits),
         len(split_groups),
     )
 
-    with ProcessPoolExecutor(max_workers=cfg.max_parallel_tiles) as ex:
+    with create_process_executor(
+        max_workers=worker_count,
+        logger=logger,
+        context="histogram construction",
+    ) as ex:
         futures = {
             ex.submit(_process_split_group, source.path, split_group, cfg, geom_col): split_group
             for split_group in split_groups

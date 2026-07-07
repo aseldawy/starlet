@@ -40,6 +40,7 @@ def tile(
     input: str,
     outdir: str,
     *,
+    parallelism: int | None = None,
     partition_size: int | None = None,
     sort: str = "zorder",
     compression: str = "zstd",
@@ -55,13 +56,10 @@ def tile(
     csv_wkt_col: str | None = None,
     csv_split_size: int = 32 * 1024 * 1024,
     src_crs: str = "EPSG:4326",
-    geojson_executor: str = "process",
     orchestrator: str = "two-stage",
-    two_stage_executor: str = "process",
-    two_stage_assignment_workers: int | None = None,
-    two_stage_write_workers: int | None = None,
-    two_stage_reducers: int | None = None,
     temp_dir: str | None = None,
+    grid_size: int = 4096,
+    histogram_dtype: str = "float64",
 ) -> TileResult:
     """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
 
@@ -72,6 +70,9 @@ def tile(
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.
+    parallelism : int | None
+        Shared worker count used for sampling, two-stage assignment, reducers,
+        and histogram construction.
     partition_size : int | None
         Target partition size in bytes. When omitted, defaults to 512 MiB for
         GeoJSON and 128 MiB for GeoParquet. The number of partitions is
@@ -107,23 +108,15 @@ def tile(
         Target byte length for each CSV source split.
     src_crs : str
         CRS hint for CSV inputs and other sources without embedded CRS.
-    geojson_executor : str
-        Executor used for GeoJSON spatial sampling: ``"process"`` for
-        production CPU parallelism or ``"thread"`` for small inputs / test
-        environments (avoids process-pool spawn overhead).
     orchestrator : str
         Tiling orchestrator to use: ``"round"`` or ``"two-stage"``.
-    two_stage_executor : str
-        Executor used by the two-stage orchestrator: ``"process"`` or ``"thread"``.
-    two_stage_assignment_workers : int | None
-        Number of workers for two-stage split assignment.
-    two_stage_write_workers : int | None
-        Number of workers for two-stage tile writes.
-    two_stage_reducers : int | None
-        Number of hash-shuffle reducers for the two-stage orchestrator.
     temp_dir : str | None
         Parent directory for two-stage temporary shard files. Defaults to
         ``./tmp`` under the current working directory.
+    grid_size : int
+        Histogram grid size per axis.
+    histogram_dtype : str
+        Histogram data type.
 
     Returns
     -------
@@ -194,7 +187,9 @@ def tile(
         csv_wkt_col=csv_wkt_col,
         csv_split_size=csv_split_size,
         src_crs=src_crs,
-        geojson_executor=geojson_executor,
+        geojson_workers=parallelism,
+        geoparquet_workers=parallelism,
+        source_workers=parallelism,
     )
     assigner = RSGroveAssigner.from_sample_and_mbr(
         sample_points=spatial_sample.sample_points,
@@ -228,10 +223,7 @@ def tile(
             compression=compression,
             sort_mode=sort_mode,
             sfc_bits=sfc_bits,
-            executor=two_stage_executor,
-            assignment_workers=two_stage_assignment_workers,
-            write_workers=two_stage_write_workers,
-            num_reducers=two_stage_reducers,
+            parallelism=parallelism,
             temp_dir=temp_dir,
             covering_bbox=covering_bbox,
         )
@@ -244,10 +236,9 @@ def tile(
         tiles_dir=tiles_dir,
         outdir=hist_dir,
         geom_col=geom_col,
-        grid_size=4096,
-        dtype="float64",
-        hist_max_parallel=8,
-        hist_rg_parallel=4,
+        grid_size=grid_size,
+        dtype=histogram_dtype,
+        parallelism=parallelism,
     )
 
     # Gather result metadata
@@ -276,8 +267,12 @@ def generate_mvt(
     zoom: int = 7,
     threshold: float = 0,
     outdir: str | None = None,
-    max_workers: int | None = None,
+    parallelism: int | None = None,
     temp_dir: str | None = None,
+    feature_capacity: int = 10_000,
+    extent: int = 4096,
+    buffer: int = 256,
+    partition_buffer: float = 0.0,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -295,6 +290,14 @@ def generate_mvt(
         Parent directory for temporary MVT map/reduce files. If omitted, uses
         the process-wide Starlet temp directory when configured, otherwise
         ``<tile_dir>/tmp``.
+    feature_capacity : int
+        Maximum retained features per intermediate tile reservoir.
+    extent : int
+        Vector tile extent.
+    buffer : int
+        Vector tile buffer in extent units.
+    partition_buffer : float
+        Overlap buffer used by the partitioner as a fraction of tile size.
 
     Returns
     -------
@@ -312,8 +315,12 @@ def generate_mvt(
         threshold=threshold,
         output_format="mvt",
         outdir=mvt_outdir,
-        workers=max_workers,
+        workers=parallelism,
         temp_dir=temp_dir,
+        feature_capacity=feature_capacity,
+        extent=extent,
+        buffer=buffer,
+        partition_buffer=partition_buffer,
     ).run()
 
     # Count generated tiles
@@ -336,11 +343,16 @@ def build(
     outdir: str,
     *,
     zoom: int = 7,
+    parallelism: int | None = None,
     partition_size: int | None = None,
     threshold: float = 100_000,
     pmtiles: bool = False,
     pmtiles_compression: str = "gzip",
     temp_dir: str | None = None,
+    feature_capacity: int = 10_000,
+    extent: int = 4096,
+    buffer: int = 256,
+    partition_buffer: float = 0.0,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
@@ -353,6 +365,8 @@ def build(
         Output dataset directory.
     zoom : int
         Maximum zoom level for MVT generation.
+    parallelism : int | None
+        Shared worker count used across tiling and MVT generation.
     partition_size : int | None
         Target partition size in bytes (forwarded to :func:`tile`). When
         omitted, a format-appropriate default is used.
@@ -367,10 +381,17 @@ def build(
     temp_dir : str | None
         Parent directory for temporary files used by all build steps. Explicit
         values override the process-wide Starlet temp directory.
+    feature_capacity : int
+        Maximum retained features per intermediate tile reservoir.
+    extent : int
+        Vector tile extent.
+    buffer : int
+        Vector tile buffer in extent units.
+    partition_buffer : float
+        Overlap buffer used by the partitioner as a fraction of tile size.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
-        (e.g. ``covering_bbox=False``, ``orchestrator="round"``,
-        ``geojson_executor="thread"``).
+        (e.g. ``covering_bbox=False``, ``orchestrator="round"``).
 
     Returns
     -------
@@ -388,6 +409,7 @@ def build(
     tile_result = tile(
         input=input,
         outdir=outdir,
+        parallelism=parallelism,
         partition_size=partition_size,
         temp_dir=temp_dir,
         **tile_kwargs,
@@ -397,6 +419,11 @@ def build(
         zoom=zoom,
         threshold=threshold,
         temp_dir=temp_dir,
+        parallelism=parallelism,
+        feature_capacity=feature_capacity,
+        extent=extent,
+        buffer=buffer,
+        partition_buffer=partition_buffer,
     )
 
     pmtiles_path = None

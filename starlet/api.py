@@ -49,6 +49,9 @@ def get_tile(
 def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
     """Return cheap metadata and availability information for a dataset."""
     root = Path(dataset_dir)
+    from starlet._types import Dataset
+
+    ds = Dataset(str(root)) if root.is_dir() else None
     stats = _load_dataset_stats(root)
     summary = get_dataset_summary(root)
     files = list(root.rglob("*")) if root.exists() and root.is_dir() else []
@@ -76,9 +79,13 @@ def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
         "size_bytes": sum(path.stat().st_size for path in regular_files),
         "file_count": len(regular_files),
         "parquet_tile_count": len(list((root / "parquet_tiles").glob("*.parquet"))),
+        "parquet_has_bbox": ds.parquet_has_bbox if ds is not None else False,
+        "parquet_crs": ds.parquet_crs if ds is not None else None,
         "bbox": _summary_bbox(summary) or _stats_bbox(stats),
         "zoom_levels": zoom_levels,
+        "mvt_tile_count": ds.mvt_tile_count if ds is not None else 0,
         "has_histograms": "histograms" not in missing,
+        "histogram_resolution": ds.histogram_resolution if ds is not None else None,
         "has_mvt": mvt_dir.is_dir(),
         "has_stats": stats is not None,
         "has_summary": summary is not None,
@@ -586,4 +593,3 @@ def _prefix_area(prefix: Any, row0: int, col0: int, row1: int, col1: int) -> flo
     left = prefix[row1, col0 - 1] if col0 > 0 else 0
     corner = prefix[row0 - 1, col0 - 1] if row0 > 0 and col0 > 0 else 0
     return float(total - above - left + corner)
-

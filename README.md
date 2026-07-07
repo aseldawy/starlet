@@ -26,7 +26,7 @@ Turn a GeoParquet or GeoJSON file into a running tile server in two commands:
 starlet build --input data.parquet --outdir datasets/mydata
 
 # 2. Serve it
-starlet serve --dir datasets --port 8765
+starlet serve --dir datasets
 ```
 
 Then open <http://localhost:8765> and pick your dataset to explore it on a map.
@@ -34,6 +34,27 @@ Then open <http://localhost:8765> and pick your dataset to explore it on a map.
 ## Commands
 
 Everything is available through the `starlet` CLI (`starlet --help`).
+
+## Configuration
+
+Starlet supports a TOML configuration file for settings you typically set once
+and reuse, such as temporary directories, parallelism, compression, tile
+thresholds, and server defaults.
+
+By default, Starlet looks for:
+
+1. `starlet.toml`
+2. `.starlet.toml`
+3. `pyproject.toml` under `[tool.starlet]`
+
+You can also pass a file explicitly:
+
+```bash
+starlet --config /path/to/starlet.toml build --input data.parquet --outdir datasets/mydata
+```
+
+Start from [starlet.toml.example](starlet.toml.example). Full details are in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
 ### `starlet build` — full pipeline (tile + MVT)
 
@@ -45,10 +66,11 @@ starlet build --input data.parquet --outdir datasets/mydata --zoom 8
 |------|---------|-------------|
 | `--input` | (required) | Path to a GeoParquet or GeoJSON file |
 | `--outdir` | (required) | Output dataset directory |
-| `--zoom` | 7 | Maximum MVT zoom level |
-| `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size, e.g. `256mb`, `1gb` |
-| `--threshold` | 100000 | Minimum feature count per MVT tile |
-| `--pmtiles` | off | Also export a single `.pmtiles` archive |
+| `--zoom` | config / 7 | Maximum MVT zoom level |
+| `--covering-bbox` | on | Write per-row bbox columns for faster on-demand serving |
+| `--pmtiles` | config / off | Also export a single `.pmtiles` archive |
+
+Most performance and output-tuning settings for `build` now come from config.
 
 ### `starlet tile` — partition a dataset only
 
@@ -60,39 +82,39 @@ starlet tile --input data.parquet --outdir datasets/mydata
 |------|---------|-------------|
 | `--input` | (required) | Path to a GeoParquet or GeoJSON file |
 | `--outdir` | (required) | Output dataset directory |
-| `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size; the number of tiles is derived from the input size |
-| `--sort` | zorder | Within-tile row order: `zorder`, `hilbert`, `columns`, `none` |
-| `--orchestrator` | two-stage | Tiling engine: `two-stage` (fast, map-reduce) or `round` |
-| `--geojson-executor` | process | `process` for large files, `thread` for small GeoJSON |
 | `--covering-bbox` | on | Write per-row bbox columns for faster on-demand serving |
 | `--geom-col` | geometry | Geometry column name (e.g. `wkb_geometry` for OGR exports) |
-| `--compression` | zstd | Parquet compression codec |
+| `--seed` | 42 | Random seed for partitioning |
+
+Partition sizing, compression, sort order, and histogram settings now come from
+config. Shared process parallelism comes from `[global].parallelism`.
 
 ### `starlet mvt` — generate vector tiles from a tiled dataset
 
 ```bash
-starlet mvt --dir datasets/mydata --zoom 7 --threshold 100000
+starlet mvt --dir datasets/mydata --zoom 7
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dir` | (required) | Dataset directory (contains `parquet_tiles/` and `histograms/`) |
-| `--zoom` | 7 | Maximum zoom level |
-| `--threshold` | 0 | Minimum feature count per tile |
+| `--zoom` | config / 7 | Maximum zoom level |
 | `--outdir` | `<dir>/mvt/` | MVT output directory |
+
+Threshold, feature reservoir size, extent, buffer, and partition overlap now
+come from config. Shared process parallelism comes from `[global].parallelism`.
 
 ### `starlet serve` — launch the tile server
 
 ```bash
-starlet serve --dir datasets --port 8765
+starlet serve --dir datasets
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dir` | (required) | Root directory containing dataset subdirectories |
-| `--host` | 0.0.0.0 | Host to bind |
-| `--port` | 8765 | Port to bind |
-| `--cache-size` | 256 | In-memory tile cache size |
+
+Host, port, and cache size now come from config.
 
 ### `starlet info` — inspect a dataset
 
@@ -115,9 +137,6 @@ Once `starlet serve` is running:
 
 ## Notes & tips
 
-- **Big GeoJSON?** The default `process` executor parallelizes reading. For
-  small files (<10 MB) add `--geojson-executor thread` to skip process-pool
-  startup overhead.
 - **Geometry column** not named `geometry` (common with OGR/`pyogrio`
   exports)? Pass `--geom-col wkb_geometry`.
 - **Serving tiles on the fly** (zooming past the pre-generated levels)? The

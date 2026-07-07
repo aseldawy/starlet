@@ -369,7 +369,7 @@ recursively reads `.parquet` and `.geoparquet` files in that directory.
 result = starlet.tile(
     input="data/places.geojson",
     outdir="datasets/places",
-    geojson_executor="process",  # or "thread"
+    parallelism=8,
 )
 ```
 
@@ -561,10 +561,10 @@ Common build kwargs:
 ```python
 {
     "zoom": 7,
+    "parallelism": 8,
     "partition_size": None,
     "threshold": 100_000,
     "covering_bbox": True,
-    "geojson_executor": "process",
     "orchestrator": "two-stage",
     "pmtiles": False,
 }

@@ -100,18 +100,18 @@ class TestHistConfig:
         assert config.grid_size == 4096
         assert config.out_crs == "EPSG:3857"
         assert config.dtype == "float64"
-        assert config.max_parallel_tiles > 0
+        assert config.parallelism > 0
 
     def test_custom_config(self):
         """Test custom configuration."""
         config = HistConfig(
             grid_size=2048,
             dtype="float32",
-            max_parallel_tiles=4
+            parallelism=4,
         )
         assert config.grid_size == 2048
         assert config.dtype == "float32"
-        assert config.max_parallel_tiles == 4
+        assert config.parallelism == 4
 
 
 class TestHistogramBuilding:
@@ -127,7 +127,7 @@ class TestHistogramBuilding:
             outdir=str(out_dir),
             geom_col="geometry",
             grid_size=64,  # Small for testing
-            hist_max_parallel=2
+            parallelism=2,
         )
 
         # Check output files exist

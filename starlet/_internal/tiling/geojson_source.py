@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 import io
 import json
@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.progress import iter_with_progress
 from starlet._internal.tiling.datasource import (
     DataSource,
@@ -264,22 +265,23 @@ class GeoJSONSource(DataSource):
         sample_cap: Optional[int],
         seed: int,
         workers: Optional[int],
-        executor: str,
     ) -> SpatialSample:
         source = cls(path)
         splits = source.create_splits()
         sample_caps = _split_sample_cap(sample_cap, len(splits))
 
-        executor_cls = _geojson_executor_class(executor)
         logger.info(
-            "Reading GeoJSON spatial sample from %s in %d partitions with %s %s workers",
+            "Reading GeoJSON spatial sample from %s in %d partitions with %s process workers",
             path,
             len(splits),
             workers or "auto",
-            executor,
         )
 
-        with executor_cls(max_workers=workers) as ex:
+        with create_process_executor(
+            max_workers=workers,
+            logger=logger,
+            context="GeoJSON spatial sampling",
+        ) as ex:
             futures = [
                 ex.submit(
                     _read_geojson_partition_spatial_sample,
@@ -310,7 +312,6 @@ def _read_geojson_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
     geojson_workers: Optional[int],
-    geojson_executor: str,
 ) -> SpatialSample:
     return GeoJSONSource.read_spatial_sample(
         path,
@@ -318,19 +319,6 @@ def _read_geojson_spatial_sample(
         sample_cap=sample_cap,
         seed=seed,
         workers=geojson_workers,
-        executor=geojson_executor,
-    )
-
-
-def _geojson_executor_class(kind: str):
-    normalized = kind.strip().lower()
-    if normalized in {"process", "processes", "multiprocessing"}:
-        return ProcessPoolExecutor
-    if normalized in {"thread", "threads", "threading"}:
-        return ThreadPoolExecutor
-    raise ValueError(
-        "geojson_executor must be 'process' or 'thread' "
-        f"(got {kind!r})"
     )
 
 

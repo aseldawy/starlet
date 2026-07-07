@@ -23,11 +23,9 @@ compression = "gzip"
 sample_cap = 123
 sample_ratio = 0.5
 csv_split_size = "64mb"
-max_parallel_files = 11
 grid_size = 1024
 dtype = "float32"
 sfc_bits = 20
-orchestrator = "two-stage"
 """.strip()
     )
 
@@ -66,7 +64,6 @@ orchestrator = "two-stage"
     assert captured["sample_ratio"] == 0.5
     assert captured["csv_split_size"] == 64 * 1024 * 1024
     assert captured["parallelism"] == 6
-    assert captured["max_parallel_files"] == 11
     assert captured["grid_size"] == 1024
     assert captured["histogram_dtype"] == "float32"
     assert captured["sfc_bits"] == 20

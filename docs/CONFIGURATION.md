@@ -64,7 +64,6 @@ log_level = "INFO"
 [tile]
 partition_size = "256mb"
 compression = "zstd"
-orchestrator = "two-stage"
 
 [mvt]
 zoom = 8

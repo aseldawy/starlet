@@ -21,11 +21,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sample_cap": 10_000,
         "sample_ratio": 1.0,
         "csv_split_size": "32mb",
-        "max_parallel_files": 64,
         "grid_size": 4096,
         "dtype": "float64",
         "sfc_bits": 16,
-        "orchestrator": "two-stage",
     },
     "mvt": {
         "zoom": 7,

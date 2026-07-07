@@ -37,9 +37,6 @@ sample_ratio = 1.0
 # Target byte size for CSV source splits.
 csv_split_size = "32mb"
 
-# Maximum number of parallel tile file writes.
-max_parallel_files = 64
-
 # Histogram grid size per axis.
 grid_size = 4096
 
@@ -48,9 +45,6 @@ dtype = "float64"
 
 # Bits per axis for spatial sorting keys.
 sfc_bits = 16
-
-# Tiling orchestrator: round or two-stage.
-orchestrator = "two-stage"
 
 [mvt]
 # Maximum zoom level for MVT generation.

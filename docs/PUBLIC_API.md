@@ -565,7 +565,6 @@ Common build kwargs:
     "partition_size": None,
     "threshold": 100_000,
     "covering_bbox": True,
-    "orchestrator": "two-stage",
     "pmtiles": False,
 }
 ```

@@ -416,8 +416,8 @@ def _assignment_stage_worker(
     batches_read = 0
     # Partial attribute statistics for this split. Collected here (where every
     # input row passes through) and merged across workers in the parent so the
-    # two-stage path produces stats/attributes.json just like the round
-    # orchestrator does. Each worker computes a partial MBR; merge combines them.
+    # The two-stage path produces stats/attributes.json. Each worker computes a
+    # partial MBR; merge combines them.
     stats_collector: Optional[AttributeStatsCollector] = None
 
     for batch_index, table in enumerate(source.iter_tables(split)):
@@ -568,7 +568,7 @@ class TwoStageOrchestrator:
         self.covering_bbox = bool(covering_bbox)
         # Collect attribute statistics during the assignment stage so the
         # two-stage path writes stats/attributes.json (used by the tile server's
-        # /stats endpoint and style suggestions), matching the round orchestrator.
+        # /stats endpoint and style suggestions).
         self.collect_stats = bool(collect_stats)
 
     def run(self) -> None:

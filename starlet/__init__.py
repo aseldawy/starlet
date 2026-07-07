@@ -49,14 +49,12 @@ def tile(
     seed: int = 42,
     geom_col: str = "geometry",
     sfc_bits: int = 16,
-    max_parallel_files: int = 64,
     covering_bbox: bool = True,
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
     csv_split_size: int = 32 * 1024 * 1024,
     src_crs: str = "EPSG:4326",
-    orchestrator: str = "two-stage",
     temp_dir: str | None = None,
     grid_size: int = 4096,
     histogram_dtype: str = "float64",
@@ -92,8 +90,6 @@ def tile(
         Name of the geometry column.
     sfc_bits : int
         Bits per axis for Z-order / Hilbert key.
-    max_parallel_files : int
-        Maximum concurrent tile files during write.
     covering_bbox : bool
         Read-time pruning support. If True, write four per-row bbox covering
         columns plus bounded, spatially-coherent row groups so the on-demand
@@ -108,8 +104,6 @@ def tile(
         Target byte length for each CSV source split.
     src_crs : str
         CRS hint for CSV inputs and other sources without embedded CRS.
-    orchestrator : str
-        Tiling orchestrator to use: ``"round"`` or ``"two-stage"``.
     temp_dir : str | None
         Parent directory for two-stage temporary shard files. Defaults to
         ``./tmp`` under the current working directory.
@@ -129,7 +123,6 @@ def tile(
     from starlet._internal.tiling.datasource import read_spatial_sample, source_for_path
     from starlet._internal.tiling.geojson_source import is_geojson_path
     from starlet._internal.tiling.assigner import RSGroveAssigner
-    from starlet._internal.tiling.orchestrator import RoundOrchestrator
     from starlet._internal.tiling.two_stage_orchestrator import TwoStageOrchestrator
     from starlet._internal.tiling.writer_pool import SortMode
     from starlet._internal.histogram.hist_pyramid import build_histograms_for_dir
@@ -201,34 +194,18 @@ def tile(
     tiles_dir = str(Path(outdir) / "parquet_tiles")
     hist_dir = str(Path(outdir) / "histograms")
 
-    orchestrator_name = orchestrator.strip().lower().replace("_", "-")
-    if orchestrator_name == "round":
-        tiling_orchestrator = RoundOrchestrator(
-            source=source,
-            assigner=assigner,
-            outdir=tiles_dir,
-            geom_col=geom_col,
-            max_parallel_files=max_parallel_files,
-            compression=compression,
-            sort_mode=sort_mode,
-            sfc_bits=sfc_bits,
-            covering_bbox=covering_bbox,
-        )
-    elif orchestrator_name in {"two-stage", "twostage"}:
-        tiling_orchestrator = TwoStageOrchestrator(
-            source=source,
-            assigner=assigner,
-            outdir=tiles_dir,
-            geom_col=geom_col,
-            compression=compression,
-            sort_mode=sort_mode,
-            sfc_bits=sfc_bits,
-            parallelism=parallelism,
-            temp_dir=temp_dir,
-            covering_bbox=covering_bbox,
-        )
-    else:
-        raise ValueError("orchestrator must be 'round' or 'two-stage'")
+    tiling_orchestrator = TwoStageOrchestrator(
+        source=source,
+        assigner=assigner,
+        outdir=tiles_dir,
+        geom_col=geom_col,
+        compression=compression,
+        sort_mode=sort_mode,
+        sfc_bits=sfc_bits,
+        parallelism=parallelism,
+        temp_dir=temp_dir,
+        covering_bbox=covering_bbox,
+    )
     tiling_orchestrator.run()
 
     logger.info("Tiling complete. Building histograms.")
@@ -391,7 +368,7 @@ def build(
         Overlap buffer used by the partitioner as a fraction of tile size.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
-        (e.g. ``covering_bbox=False``, ``orchestrator="round"``).
+        (e.g. ``covering_bbox=False``).
 
     Returns
     -------

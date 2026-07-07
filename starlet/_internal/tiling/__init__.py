@@ -6,7 +6,6 @@ from .vector_source import GDBSource, ShapefileSource, VectorLayerSplit
 from .partition_reader import GeoJSONPartitionReader
 from .assigner import TileAssignerFromCSV, RSGroveAssigner
 from .writer_pool import WriterPool, SortMode, SortKey
-from .orchestrator import RoundOrchestrator
 from .two_stage_orchestrator import TwoStageOrchestrator
 
 __all__ = [
@@ -15,5 +14,5 @@ __all__ = [
     "SpatialSample", "read_spatial_sample", "source_for_path",
     "TileAssignerFromCSV", "RSGroveAssigner",
     "WriterPool", "SortMode", "SortKey",
-    "RoundOrchestrator", "TwoStageOrchestrator",
+    "TwoStageOrchestrator",
 ]

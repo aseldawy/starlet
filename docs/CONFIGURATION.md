@@ -68,6 +68,7 @@ compression = "zstd"
 [mvt]
 zoom = 8
 threshold = 50000
+pmtiles = false
 
 [serve]
 host = "127.0.0.1"
@@ -101,8 +102,10 @@ The CLI now expects most persistent tuning values to come from config:
   partitioning, histogram, and compression defaults from config. Process-based
   parallelism always comes from `[global].parallelism`.
 - `starlet mvt` keeps dataset path and optional `--zoom` on the command line and
-  loads threshold, buffer, extent, and feature reservoir settings from config.
+  loads threshold, PMTiles export settings, buffer, extent, and feature
+  reservoir settings from config.
 - `starlet build` keeps source/output paths plus a few run-specific flags on the
-  command line and loads the rest from config.
+  command line and loads the rest from config, forwarding MVT-related settings
+  to the MVT stage.
 - `starlet serve` keeps the dataset root on the command line and loads host,
   port, and cache settings from config.

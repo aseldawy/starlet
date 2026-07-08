@@ -29,6 +29,7 @@ class MVTResult:
     outdir: str
     zoom_levels: List[int]
     tile_count: int
+    pmtiles_path: Optional[str] = None
 
 
 class Dataset:

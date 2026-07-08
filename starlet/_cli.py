@@ -125,8 +125,9 @@ def tile(
 @click.option("--dir", "tile_dir", required=True, help="Dataset directory with parquet_tiles/ and histograms/.")
 @click.option("--zoom", type=int, default=None, help="Maximum zoom level.")
 @click.option("--outdir", default=None, help="MVT output directory (default: <dir>/mvt/).")
+@click.option("--pmtiles/--no-pmtiles", default=None, help="Export generated tiles to a PMTiles archive.")
 @click.option("--log-level", default=None, help="Logging level.")
-def mvt(tile_dir, zoom, outdir, log_level):
+def mvt(tile_dir, zoom, outdir, pmtiles, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
     _setup_logging(_resolved_log_level("mvt", log_level))
     import starlet
@@ -135,6 +136,8 @@ def mvt(tile_dir, zoom, outdir, log_level):
         tile_dir=tile_dir,
         zoom=int(resolve_command_value("mvt", "zoom", zoom, default=7)),
         threshold=float(resolve_command_value("mvt", "threshold", None, default=100_000)),
+        pmtiles=bool(resolve_command_value("mvt", "pmtiles", pmtiles, default=False)),
+        pmtiles_compression=str(resolve_command_value("mvt", "pmtiles_compression", None, default="gzip")),
         outdir=outdir,
         temp_dir=resolve_command_value("mvt", "temp_dir", None, default=None),
         parallelism=command_parallelism("mvt"),
@@ -145,6 +148,8 @@ def mvt(tile_dir, zoom, outdir, log_level):
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
     click.echo(f"  Output: {result.outdir}")
     click.echo(f"  Zoom levels: {result.zoom_levels}")
+    if result.pmtiles_path:
+        click.echo(f"  PMTiles: {result.pmtiles_path}")
 
 
 @main.command()
@@ -183,7 +188,7 @@ def build(
         zoom=int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",), default=7)),
         partition_size=parse_size_value(resolve_command_value("build", "partition_size", None, fallback_sections=("tile",), default=None)),
         threshold=float(resolve_command_value("build", "threshold", None, fallback_sections=("mvt",), default=100_000)),
-        pmtiles=bool(resolve_command_value("build", "pmtiles", pmtiles, default=False)),
+        pmtiles=bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",), default=False)),
         pmtiles_compression=str(resolve_command_value("build", "pmtiles_compression", None, fallback_sections=("mvt",), default="gzip")),
         temp_dir=resolve_command_value("build", "temp_dir", None, default=None),
         parallelism=parallelism,

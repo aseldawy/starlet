@@ -80,6 +80,7 @@ parallelism = 4
 [mvt]
 zoom = 5
 threshold = 777
+pmtiles = true
 feature_capacity = 333
 extent = 2048
 buffer = 64
@@ -88,11 +89,13 @@ buffer = 64
 
     captured = {}
 
-    def fake_generate_mvt(*, tile_dir, zoom, threshold, outdir, parallelism, temp_dir, feature_capacity, extent, buffer):
+    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, extent, buffer):
         captured.update(
             tile_dir=tile_dir,
             zoom=zoom,
             threshold=threshold,
+            pmtiles=pmtiles,
+            pmtiles_compression=pmtiles_compression,
             outdir=outdir,
             parallelism=parallelism,
             temp_dir=temp_dir,
@@ -100,7 +103,7 @@ buffer = 64
             extent=extent,
             buffer=buffer,
         )
-        return SimpleNamespace(tile_count=1, outdir=outdir or "mvt", zoom_levels=[0, 1])
+        return SimpleNamespace(tile_count=1, outdir=outdir or "mvt", zoom_levels=[0, 1], pmtiles_path="dataset.pmtiles")
 
     monkeypatch.setattr("starlet.generate_mvt", fake_generate_mvt)
 
@@ -121,10 +124,53 @@ buffer = 64
     assert result.exit_code == 0
     assert captured["zoom"] == 9
     assert captured["threshold"] == 777.0
+    assert captured["pmtiles"] is True
+    assert captured["pmtiles_compression"] == "gzip"
     assert captured["parallelism"] == 4
     assert captured["feature_capacity"] == 333
     assert captured["extent"] == 2048
     assert captured["buffer"] == 64
+
+
+def test_build_command_prefers_mvt_pmtiles_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "starlet.toml"
+    config_path.write_text(
+        """
+[mvt]
+pmtiles = true
+pmtiles_compression = "brotli"
+""".strip()
+    )
+
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return (
+            SimpleNamespace(num_files=1, total_rows=2),
+            SimpleNamespace(tile_count=3, zoom_levels=[0], pmtiles_path="dataset.pmtiles"),
+            "dataset.pmtiles",
+        )
+
+    monkeypatch.setattr("starlet.build", fake_build)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "--config",
+            str(config_path),
+            "build",
+            "--input",
+            "input.geojson",
+            "--outdir",
+            "dataset",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["pmtiles"] is True
+    assert captured["pmtiles_compression"] == "brotli"
 
 
 def test_serve_command_uses_config_host_port_and_cache(tmp_path, monkeypatch):

@@ -28,14 +28,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mvt": {
         "zoom": 7,
         "threshold": 100_000,
+        "pmtiles": False,
         "feature_capacity": 10_000,
         "extent": 4096,
         "buffer": 256,
         "pmtiles_compression": "gzip",
     },
-    "build": {
-        "pmtiles": False,
-    },
+    "build": {},
     "serve": {
         "host": "0.0.0.0",
         "port": 8765,

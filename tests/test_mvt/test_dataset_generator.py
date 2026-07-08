@@ -1,6 +1,7 @@
 """Tests for the two-stage dataset MVT generator helpers."""
 
 import json
+from types import SimpleNamespace
 
 import mapbox_vector_tile
 import pyarrow as pa
@@ -147,3 +148,33 @@ def test_generate_mvt_forwards_temp_dir(monkeypatch, tmp_path):
     )
 
     assert captured["temp_dir"] == str(temp_dir)
+
+
+def test_generate_mvt_forwards_pmtiles_settings(monkeypatch, tmp_path):
+    import starlet
+
+    captured = {}
+
+    class FakeDatasetMVTGenerator:
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+
+        def run(self):
+            return SimpleNamespace(pmtiles_path=str(tmp_path / "dataset.pmtiles"))
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator.DatasetMVTGenerator",
+        FakeDatasetMVTGenerator,
+    )
+    outdir = tmp_path / "mvt"
+    outdir.mkdir()
+
+    starlet.generate_mvt(
+        str(tmp_path / "dataset"),
+        outdir=str(outdir),
+        pmtiles=True,
+        pmtiles_compression="brotli",
+    )
+
+    assert captured["output_format"] == "pmtiles"
+    assert captured["pmtiles_compression"] == "brotli"

@@ -100,6 +100,7 @@ starlet mvt --dir datasets/mydata --zoom 7
 | `--dir` | (required) | Dataset directory (contains `parquet_tiles/` and `histograms/`) |
 | `--zoom` | config / 7 | Maximum zoom level |
 | `--outdir` | `<dir>/mvt/` | MVT output directory |
+| `--pmtiles` | config / off | Also export a single `.pmtiles` archive |
 
 Threshold, feature reservoir size, extent, buffer, and partition overlap now
 come from config. Shared process parallelism comes from `[global].parallelism`.
@@ -143,8 +144,9 @@ Once `starlet serve` is running:
   default tiling output includes covering bbox columns so the server can prune
   row groups at read time. Use `--no-covering-bbox` only when optimizing for
   smaller Parquet files and batch generation speed.
-- **One-file distribution:** `starlet build --pmtiles` writes a single
-  `datasets/mydata.pmtiles` archive alongside the dataset.
+- **One-file distribution:** `starlet mvt --pmtiles` writes a single
+  `datasets/mydata.pmtiles` archive alongside the dataset. `starlet build`
+  forwards the same setting to its MVT stage.
 
 ## Deploying a server
 

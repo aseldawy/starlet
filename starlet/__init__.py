@@ -243,6 +243,8 @@ def generate_mvt(
     *,
     zoom: int = 7,
     threshold: float = 0,
+    pmtiles: bool = False,
+    pmtiles_compression: str = "gzip",
     outdir: str | None = None,
     parallelism: int | None = None,
     temp_dir: str | None = None,
@@ -260,6 +262,10 @@ def generate_mvt(
         Maximum zoom level.
     threshold : float
         Minimum feature count per tile.
+    pmtiles : bool
+        If True, also export the generated tiles to a PMTiles archive.
+    pmtiles_compression : str
+        Compression for PMTiles export: "gzip", "brotli", "zstd", "none".
     outdir : str | None
         MVT output directory. Defaults to ``<tile_dir>/mvt/``.
     temp_dir : str | None
@@ -281,17 +287,20 @@ def generate_mvt(
 
     if extent <= 0:
         raise ValueError("extent must be positive")
-    mvt_outdir = outdir or str(Path(tile_dir) / "mvt")
-    partition_buffer = float(buffer) / float(extent)
+    dataset_path = Path(tile_dir)
+    mvt_outdir = outdir or str(dataset_path / "mvt")
+    pmtiles_path = str(dataset_path.with_suffix(".pmtiles")) if pmtiles else None
 
     from starlet._internal.mvt.dataset_generator import DatasetMVTGenerator
 
-    DatasetMVTGenerator(
+    result = DatasetMVTGenerator(
         tile_dir,
         num_zoom_levels=zoom + 1,
         threshold=threshold,
-        output_format="mvt",
+        output_format="pmtiles" if pmtiles else "mvt",
         outdir=mvt_outdir,
+        pmtiles_path=pmtiles_path,
+        pmtiles_compression=pmtiles_compression,
         workers=parallelism,
         temp_dir=temp_dir,
         feature_capacity=feature_capacity,
@@ -307,10 +316,13 @@ def generate_mvt(
         if d.is_dir() and d.name.isdigit()
     ) if mvt_path.exists() else []
 
+    generated_pmtiles_path = getattr(result, "pmtiles_path", None)
+
     return MVTResult(
         outdir=mvt_outdir,
         zoom_levels=zoom_levels,
         tile_count=tile_count,
+        pmtiles_path=generated_pmtiles_path,
     )
 
 
@@ -398,21 +410,7 @@ def build(
         buffer=buffer,
     )
 
-    pmtiles_path = None
-    if pmtiles:
-        from starlet._internal.pmtiles.exporter import export_to_pmtiles
-
-        dataset_name = Path(outdir).name
-        pmtiles_path = str(Path(outdir).parent / f"{dataset_name}.pmtiles")
-
-        export_to_pmtiles(
-            mvt_dir=str(Path(outdir) / "mvt"),
-            output_path=pmtiles_path,
-            tile_type="mvt",
-            compression=pmtiles_compression,
-        )
-
-    return tile_result, mvt_result, pmtiles_path
+    return tile_result, mvt_result, mvt_result.pmtiles_path
 
 
 def export_pmtiles(

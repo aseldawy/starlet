@@ -53,6 +53,9 @@ zoom = 7
 # Minimum feature count required for a tile to be generated.
 threshold = 100000
 
+# Export a PMTiles archive after generating tiles.
+pmtiles = false
+
 # Maximum retained features per intermediate tile reservoir.
 feature_capacity = 10000
 
@@ -66,11 +69,8 @@ buffer = 256
 pmtiles_compression = "gzip"
 
 [build]
-# Build reuses MVT settings such as zoom, threshold, and PMTiles compression
-# from [mvt]. Only build-specific flags belong here.
-
-# Export a PMTiles archive after generating MVTs.
-pmtiles = false
+# Build reuses MVT settings such as zoom, threshold, and PMTiles export
+# options from [mvt]. Only build-specific flags belong here.
 
 [serve]
 # Host and port used by `starlet serve`.

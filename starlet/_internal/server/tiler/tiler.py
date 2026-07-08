@@ -1,39 +1,29 @@
 import logging
+import zlib
 from pathlib import Path
 from time import perf_counter
 
+import numpy as np
+import shapely
+
 from .tiler_bounds import TileBounds
 from .parquet_index import ParquetIndex
-from .mvt_encoder import MVTEncoder
+from .mvt_encoder import MVTEncoder, explode_collections
 from .tile_cache import TileCache
-from shapely.geometry import mapping
 
 logger = logging.getLogger(__name__)
 
-from shapely.geometry import (
-    Point,
-    LineString,
-    Polygon,
-    MultiPoint,
-    MultiLineString,
-    MultiPolygon,
-    GeometryCollection
-)
+# Display budget for on-the-fly tiles. A 256-512px tile cannot usefully show
+# more features than this; the batch pipeline caps tiles the same way
+# (assigner.MAX_GEOMS_PER_TILE) via priority sampling. Without a cap, a dense
+# z9+ tile can pull tens of thousands of geometries through clip/transform/
+# encode and take tens of seconds.
+MAX_OTF_FEATURES = 4096
 
-def explode_collections(geom):
-    if geom is None or geom.is_empty:
-        return []
+# Per-row bbox covering columns written by the tiling stage; used for read
+# pruning, never useful as display attributes.
+_INTERNAL_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
 
-    if isinstance(geom, GeometryCollection):
-        out = []
-        for g in geom.geoms:
-            out.extend(explode_collections(g))
-        return out
-
-    if isinstance(geom, (Polygon, MultiPolygon, LineString, MultiLineString, Point, MultiPoint)):
-        return [geom]
-
-    return []
 
 class VectorTiler:
     """On-demand MVT tile server with a three-tier lookup.
@@ -44,8 +34,13 @@ class VectorTiler:
       3. **Generate** — reads intersecting GeoParquet tiles, clips/transforms
          geometries, and encodes a fresh MVT on the fly
 
-    Generated tiles are persisted to disk and promoted into the memory cache
-    so that subsequent requests are served from cache.
+    On-the-fly generation is bounded: when a tile contains more than
+    ``MAX_OTF_FEATURES`` candidate geometries, a deterministic top-k sample
+    is taken using a per-geometry priority derived from the geometry bytes
+    (``crc32(wkb)``). Because the priority is intrinsic to the geometry, the
+    same feature wins or loses in every tile it touches — adjacent
+    on-the-fly tiles stay seam-consistent, the same guarantee the batch
+    pipeline gets from its shared-priority reservoir sampling.
     """
 
     def __init__(self, dataset_root: str, memory_cache_size: int = 256) -> None:
@@ -74,7 +69,8 @@ class VectorTiler:
             logger.debug("[TileGen] z=%d x=%d y=%d no intersecting files", z, x, y)
             return encoder.empty_tile()
 
-        features = []
+        geoms: list = []
+        attr_src: list = []  # (col_arrays, attr_cols, row_idx) — dicts built post-sample
 
         for pf in intersecting:
             try:
@@ -83,48 +79,54 @@ class VectorTiler:
                 logger.error("[TileGen] z=%d x=%d y=%d load failed %s: %s", z, x, y, pf, e)
                 continue
 
-            try:
-                clipped = encoder.clip_to_tile(gdf)
-            except Exception as e:
-                logger.error("[TileGen] z=%d x=%d y=%d clip failed %s: %s", z, x, y, pf, e)
+            if gdf.empty:
                 continue
 
-            if clipped.empty:
-                continue
-
-            for idx, row in clipped.iterrows():
-                geom = row.geometry
+            attr_cols = [
+                c for c in gdf.columns
+                if c != "geometry" and c not in _INTERNAL_COLS
+            ]
+            col_arrays = {c: gdf[c].to_numpy() for c in attr_cols}
+            for i, geom in enumerate(gdf.geometry.values):
                 if geom is None or geom.is_empty:
                     continue
+                geoms.append(geom)
+                attr_src.append((col_arrays, attr_cols, i))
 
-                # extract attributes (all non geometry columns)
-                attrs = {k: v for k, v in row.items() if k != "geometry" and v is not None}
+        if not geoms:
+            return encoder.empty_tile()
 
-                parts = explode_collections(geom)
-                if not parts:
-                    continue
+        total_candidates = len(geoms)
+        if total_candidates > MAX_OTF_FEATURES:
+            # Deterministic, geometry-intrinsic priority: crc32 of the WKB.
+            # Stable across processes/restarts and across neighbouring tiles.
+            wkbs = shapely.to_wkb(np.array(geoms, dtype=object))
+            prio = np.fromiter(
+                (zlib.crc32(w) for w in wkbs),
+                dtype=np.uint32,
+                count=total_candidates,
+            )
+            keep = np.argpartition(prio, total_candidates - MAX_OTF_FEATURES)[
+                total_candidates - MAX_OTF_FEATURES:
+            ]
+            geoms = [geoms[i] for i in keep]
+            attr_src = [attr_src[i] for i in keep]
+            logger.info(
+                "[TileGen] z=%d x=%d y=%d sampled %d of %d candidates (budget=%d)",
+                z, x, y, len(geoms), total_candidates, MAX_OTF_FEATURES,
+            )
 
-                for part in parts:
-                    if part.is_empty:
-                        continue
+        # Attribute dicts only for the features that survived sampling.
+        attrs_list = [
+            {c: ca[c][i] for c in cols if ca[c][i] is not None}
+            for (ca, cols, i) in attr_src
+        ]
 
-                    try:
-                        scaled = encoder.transform_geom(
-                            part,
-                            lambda xx, yy, zz=None:
-                                TileBounds.scale_to_tile_coords(xx, yy, bounds.bbox_3857)
-                        )
-                    except Exception as e:
-                        logger.error("[TileGen] z=%d x=%d y=%d transform failed: %s", z, x, y, e)
-                        continue
-
-                    if scaled.is_empty:
-                        continue
-
-                    features.append({
-                        "geometry": mapping(scaled),
-                        "properties": attrs
-                    })
+        try:
+            features = encoder.prepare_features(geoms, attrs_list)
+        except Exception as e:
+            logger.error("[TileGen] z=%d x=%d y=%d prepare failed: %s", z, x, y, e)
+            return encoder.empty_tile()
 
         if not features:
             return encoder.empty_tile()

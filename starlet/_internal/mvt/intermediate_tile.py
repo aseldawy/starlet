@@ -174,18 +174,56 @@ class IntermediateVectorTile:
         return out
 
     def merge(self, other: "IntermediateVectorTile") -> None:
-        """Merge another tile with the same z/x/y without simplifying."""
+        """Merge another tile with the same z/x/y using an exact count split."""
         # Verify that both tiles have the same location
         assert (self.z, self.x, self.y) == (other.z, other.x, other.y), "Cannot merge intermediate tiles with different tile IDs"
-        self._features_seen += other._features_seen
-        for feature in other._features:
-            if len(self._features) < self.feature_capacity:
-                self._features.append(feature)
-                self._coordinate_count += feature.coordinate_count
+        total_seen = self._features_seen + other._features_seen
+
+        if total_seen <= self.feature_capacity:
+            self._features.extend(other._features)
+            self._coordinate_count += other._coordinate_count
+            self._features_seen = total_seen
+            return
+
+        other_count = 0
+        remaining_seen = total_seen
+        remaining_other = other._features_seen
+        remaining_draws = self.feature_capacity
+        while remaining_draws > 0 and remaining_seen > 0 and remaining_other > 0:
+            if self.rng.randrange(remaining_seen) < remaining_other:
+                other_count += 1
+                remaining_other -= 1
+            remaining_seen -= 1
+            remaining_draws -= 1
+
+        self_count = self.feature_capacity - other_count
+        self_count = min(self_count, len(self._features))
+        other_count = min(other_count, len(other._features))
+        if self_count + other_count < self.feature_capacity:
+            deficit = self.feature_capacity - (self_count + other_count)
+            if len(self._features) - self_count >= len(other._features) - other_count:
+                self_count += min(deficit, len(self._features) - self_count)
             else:
-                slot = self.rng.randrange(self.feature_capacity)
-                self._coordinate_count += feature.coordinate_count - self._features[slot].coordinate_count
-                self._features[slot] = feature
+                other_count += min(deficit, len(other._features) - other_count)
+
+        def _sample_without_replacement(items: list[_TileFeature], count: int) -> list[_TileFeature]:
+            if count <= 0:
+                return []
+            if count >= len(items):
+                return list(items)
+            pool = list(items)
+            chosen: list[_TileFeature] = []
+            for _ in range(count):
+                index = self.rng.randrange(len(pool))
+                chosen.append(pool.pop(index))
+            return chosen
+
+        self_sample = _sample_without_replacement(self._features, self_count)
+        other_sample = _sample_without_replacement(other._features, other_count)
+
+        self._features = self_sample + other_sample
+        self._coordinate_count = sum(feature.coordinate_count for feature in self._features)
+        self._features_seen = total_seen
 
     def write_features(self, path) -> None:
         """Write retained features and features-seen count to disk."""

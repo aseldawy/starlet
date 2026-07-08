@@ -128,7 +128,7 @@ def test_feature_capacity_replaces_random_features_to_make_room():
 
 
 def test_merge_combines_same_tile_without_simplifying_again():
-    left = IntermediateVectorTile(0, 0, 0, feature_capacity=2, rng=_FixedRng(randrange_values=[0]))
+    left = IntermediateVectorTile(0, 0, 0, feature_capacity=2, rng=_FixedRng(randrange_values=[0, 0]))
     right = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
     left.add_feature(Point(-1000, 0), {"id": 1})
     right.add_feature(Point(0, 0), {"id": 2})

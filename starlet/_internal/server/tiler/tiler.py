@@ -2,6 +2,9 @@ import logging
 from pathlib import Path
 from time import perf_counter
 from typing import Any, MutableMapping
+import gzip
+
+from starlet._internal.pmtiles.paths import discover_pmtiles_path
 
 from .tile_cache import TileCache
 logger = logging.getLogger(__name__)
@@ -20,12 +23,12 @@ class VectorTiler:
 
     For each tile request the lookup order is:
       1. **Memory** — LRU cache (``TileCache``, default 256 entries)
-      2. **Disk** — pre-generated ``.mvt`` files under ``<dataset>/mvt/z/x/y.mvt``
-      3. **Generate** — reads intersecting GeoParquet tiles, clips/transforms
+      2. **PMTiles** — pre-generated ``<dataset>.pmtiles`` archive
+      3. **Disk** — pre-generated ``.mvt`` files under ``<dataset>/mvt/z/x/y.mvt``
+      4. **Generate** — reads intersecting GeoParquet tiles, clips/transforms
          geometries, and encodes a fresh MVT on the fly
 
-    Generated tiles are promoted into the memory cache but are not persisted
-    to disk.
+    Only on-the-fly generated tiles are promoted into the memory cache.
     """
 
     def __init__(
@@ -35,11 +38,30 @@ class VectorTiler:
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.mvt_dir = self.dataset_root / "mvt"
+        self.pmtiles_path = discover_pmtiles_path(self.dataset_root)
+        self._pmtiles_file = None
+        self._pmtiles_reader = None
+        self._pmtiles_header = None
 
         self.cache = TileCache(memory_cache_size)
 
     def tile_path(self, z: int, x: int, y: int) -> Path:
         return self.mvt_dir / str(z) / str(x) / f"{y}.mvt"
+
+    def _pmtiles_tile(self, z: int, x: int, y: int) -> bytes | None:
+        if self.pmtiles_path is None or not self.pmtiles_path.exists():
+            return None
+        if self._pmtiles_reader is None:
+            from pmtiles.reader import MmapSource, Reader
+
+            self._pmtiles_file = self.pmtiles_path.open("rb")
+            self._pmtiles_reader = Reader(MmapSource(self._pmtiles_file))
+            self._pmtiles_header = self._pmtiles_reader.header()
+
+        tile_bytes = self._pmtiles_reader.get(z, x, y)
+        if tile_bytes is None:
+            return None
+        return _decode_pmtiles_tile(tile_bytes, self._pmtiles_header)
 
     def get_tile(self, z: int, x: int, y: int, output: TileInfo | None = None) -> bytes:
         t0 = perf_counter()
@@ -56,6 +78,20 @@ class VectorTiler:
             )
             return cached
 
+        pmtiles_t0 = perf_counter()
+        pmtiles_data = self._pmtiles_tile(z, x, y)
+        if pmtiles_data is not None:
+            elapsed_ms = (perf_counter() - pmtiles_t0) * 1000
+            logger.debug("[Cache] HIT pmtiles z=%d x=%d y=%d elapsed=%.1fms", z, x, y, elapsed_ms)
+            _update_output(
+                output,
+                source="pmtiles",
+                generation="read_from_pmtiles",
+                path=str(self.pmtiles_path),
+                elapsed_ms=elapsed_ms,
+            )
+            return pmtiles_data
+
         path = self.tile_path(z, x, y)
 
         if path.exists():
@@ -63,7 +99,6 @@ class VectorTiler:
             data = path.read_bytes()
             elapsed_ms = (perf_counter() - t0) * 1000
             logger.debug("[Cache] HIT disk z=%d x=%d y=%d elapsed=%.1fms", z, x, y, elapsed_ms)
-            self.cache.put(key, data)
             _update_output(
                 output,
                 source="disk",
@@ -93,3 +128,17 @@ class VectorTiler:
         # e.g. with threshold=0 to materialise every non-empty tile).
         self.cache.put(key, tile_bytes)
         return tile_bytes
+
+def _decode_pmtiles_tile(tile_bytes: bytes, header: dict[str, Any] | None) -> bytes:
+    if not header:
+        return tile_bytes
+
+    from pmtiles.tile import Compression
+
+    compression = header.get("tile_compression", Compression.UNKNOWN)
+    if compression in {Compression.UNKNOWN, Compression.NONE}:
+        return tile_bytes
+    if compression == Compression.GZIP:
+        return gzip.decompress(tile_bytes)
+
+    raise ValueError(f"Unsupported PMTiles compression for server reads: {compression}")

@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
+from starlet._internal.pmtiles.paths import discover_pmtiles_path
+
 if TYPE_CHECKING:
     import geopandas as gpd
     from shapely.geometry.base import BaseGeometry
@@ -57,6 +59,7 @@ def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
     files = list(root.rglob("*")) if root.exists() and root.is_dir() else []
     regular_files = [path for path in files if path.is_file()]
     mvt_dir = root / "mvt"
+    pmtiles_path = discover_pmtiles_path(root)
     zoom_levels = sorted(
         int(child.name)
         for child in mvt_dir.iterdir()
@@ -87,6 +90,8 @@ def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
         "has_histograms": "histograms" not in missing,
         "histogram_resolution": ds.histogram_resolution if ds is not None else None,
         "has_mvt": mvt_dir.is_dir(),
+        "has_pmtiles": pmtiles_path.exists(),
+        "pmtiles_path": str(pmtiles_path) if pmtiles_path.exists() else None,
         "has_stats": stats is not None,
         "has_summary": summary is not None,
         "missing": missing,

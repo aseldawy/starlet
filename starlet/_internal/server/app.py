@@ -67,10 +67,38 @@ def create_app(
     def serve_tile(dataset, z, x, y):
         t0 = perf_counter()
         tiler = get_tiler(dataset)
-        data = tiler.get_tile(z, x, y)
-        elapsed_ms = (perf_counter() - t0) * 1000
-        logger.info("[TileRequest] dataset=%s z=%d x=%d y=%d bytes=%d elapsed=%.1fms",
-                    dataset, z, x, y, len(data), elapsed_ms)
+        tile_info: dict[str, object] = {}
+        data = tiler.get_tile(z, x, y, output=tile_info)
+        elapsed_s = perf_counter() - t0
+        source = tile_info.get("source", "unknown")
+        generation = tile_info.get("generation", "unknown")
+        backend_elapsed_ms = tile_info.get("elapsed_ms")
+        if isinstance(backend_elapsed_ms, (int, float)):
+            backend_elapsed_s = backend_elapsed_ms / 1000.0
+            logger.info(
+                "[TileRequest] dataset=%s z=%d x=%d y=%d bytes=%d served=%s generation=%s elapsed=%.3fs backend_elapsed=%.3fs",
+                dataset,
+                z,
+                x,
+                y,
+                len(data),
+                source,
+                generation,
+                elapsed_s,
+                backend_elapsed_s,
+            )
+        else:
+            logger.info(
+                "[TileRequest] dataset=%s z=%d x=%d y=%d bytes=%d served=%s generation=%s elapsed=%.3fs",
+                dataset,
+                z,
+                x,
+                y,
+                len(data),
+                source,
+                generation,
+                elapsed_s,
+            )
         return Response(data, mimetype="application/vnd.mapbox-vector-tile")
 
     @app.get("/api/datasets")

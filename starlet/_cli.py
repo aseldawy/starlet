@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import sys
 
 import click
@@ -44,6 +45,17 @@ def _setup_logging(log_level: str) -> None:
 
 def _resolved_log_level(command: str, explicit: str | None) -> str:
     return str(resolve_command_value(command, "log_level", explicit, default="INFO"))
+
+
+def _format_zoom_counts(result: object) -> str:
+    counts = getattr(result, "tile_counts_by_zoom", None)
+    if counts:
+        counts_list = list(counts)
+        return f"{counts_list} total={sum(counts_list)}"
+    zoom_levels = getattr(result, "zoom_levels", None)
+    if zoom_levels:
+        return str(list(zoom_levels))
+    return "(no MVTs)"
 
 
 @click.group()
@@ -146,8 +158,9 @@ def mvt(tile_dir, zoom, outdir, pmtiles, log_level):
         buffer=int(resolve_command_value("mvt", "buffer", None, default=256)),
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
-    click.echo(f"  Output: {result.outdir}")
-    click.echo(f"  Zoom levels: {result.zoom_levels}")
+    output_path = result.pmtiles_path if result.pmtiles_path and not Path(result.outdir).exists() else result.outdir
+    click.echo(f"  Output: {output_path}")
+    click.echo(f"  Zoom levels: {_format_zoom_counts(result)}")
     if result.pmtiles_path:
         click.echo(f"  PMTiles: {result.pmtiles_path}")
 
@@ -211,7 +224,7 @@ def build(
     )
     click.echo("Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
-    click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {mvt_result.zoom_levels}")
+    click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {_format_zoom_counts(mvt_result)}")
     if pmtiles_path:
         click.echo(f"  PMTiles: {pmtiles_path}")
 
@@ -241,7 +254,6 @@ def serve(data_dir, log_level):
 def info(data_dir):
     """Print dataset metadata summary."""
     import starlet
-    from pathlib import Path
 
     try:
         ds = starlet.Dataset(data_dir)
@@ -255,13 +267,17 @@ def info(data_dir):
     click.echo(f"  Parquet bbox:{'yes' if ds.parquet_has_bbox else 'no'}")
     click.echo(f"  Parquet CRS: {ds.parquet_crs or '(unknown)'}")
     click.echo(f"  BBox:        {ds.bbox}")
-    click.echo(f"  Zoom levels: {ds.zoom_levels or '(no MVTs)'}")
+    tile_counts = ds.tile_counts_by_zoom
+    if tile_counts:
+        click.echo(f"  Zoom levels: {tile_counts} total={sum(tile_counts)}")
+    else:
+        click.echo("  Zoom levels: (no MVTs)")
     click.echo(f"  Histograms:  {'yes' if ds.has_histograms else 'no'}")
     if ds.has_histograms:
         click.echo(f"  Hist res:    {ds.histogram_resolution or '(unknown)'}")
-    click.echo(f"  MVTs:        {'yes' if ds.has_mvt else 'no'}")
-    if ds.has_mvt:
-        click.echo(f"  MVT count:   {ds.mvt_tile_count}")
+    click.echo(f"  MVTs:        {'yes' if (ds.has_mvt or ds.has_pmtiles) else 'no'}")
+    if tile_counts:
+        click.echo(f"  MVT count:   {sum(tile_counts)}")
     click.echo(f"  Stats:       {'yes' if ds.has_stats else 'no'}")
 
     total_bytes = sum(f.stat().st_size for f in Path(data_dir).rglob("*") if f.is_file())

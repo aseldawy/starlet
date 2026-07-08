@@ -1,6 +1,7 @@
 import json
 import shutil
 import time
+import gzip
 
 import starlet
 from starlet.api import AsyncDatasetHandle
@@ -60,13 +61,11 @@ def test_estimate_range_count_full_extent(sample_dataset_dir, web_mercator_bound
 
 
 def test_get_tile_populates_cheap_output_for_disk_tile(temp_dir):
-    from starlet._internal.server.tiler.mvt_encoder import MVTEncoder
-
     dataset_dir = temp_dir / "tile_dataset"
     (dataset_dir / "parquet_tiles").mkdir(parents=True)
     tile_path = dataset_dir / "mvt" / "0" / "0" / "0.mvt"
     tile_path.parent.mkdir(parents=True)
-    expected = MVTEncoder.empty_tile()
+    expected = b"disk-tile"
     tile_path.write_bytes(expected)
 
     output = {}
@@ -79,6 +78,68 @@ def test_get_tile_populates_cheap_output_for_disk_tile(temp_dir):
     assert "record_count" not in output
     assert "feature_count" not in output
     assert output["elapsed_ms"] >= 0
+
+
+def test_get_tile_prefers_pmtiles_over_disk(temp_dir):
+    from pmtiles.writer import Writer
+    from pmtiles.tile import Compression, TileType, zxy_to_tileid
+
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+    tile_path = dataset_dir / "mvt" / "0" / "0" / "0.mvt"
+    tile_path.parent.mkdir(parents=True)
+    disk_bytes = b"disk-tile"
+    tile_path.write_bytes(disk_bytes)
+
+    pmtiles_bytes = b"pmtiles-tile"
+    pmtiles_path = dataset_dir / "tiles.pmtiles"
+    with open(pmtiles_path, "wb") as handle:
+        writer = Writer(handle)
+        writer.write_tile(zxy_to_tileid(0, 0, 0), gzip.compress(pmtiles_bytes))
+        writer.finalize(
+            {
+                "tile_compression": Compression.GZIP,
+                "tile_type": TileType.MVT,
+            },
+            {},
+        )
+
+    output = {}
+    data = starlet.get_tile(dataset_dir, 0, 0, 0, output=output)
+
+    assert data == pmtiles_bytes
+    assert output["source"] == "pmtiles"
+    assert output["generation"] == "read_from_pmtiles"
+    assert output["path"] == str(pmtiles_path)
+
+
+def test_vector_tiler_only_caches_generated_tiles(temp_dir, monkeypatch):
+    from starlet._internal.server.tiler.tiler import VectorTiler
+
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+    tile_path = dataset_dir / "mvt" / "0" / "0" / "0.mvt"
+    tile_path.parent.mkdir(parents=True)
+    disk_bytes = b"disk-tile"
+    tile_path.write_bytes(disk_bytes)
+
+    tiler = VectorTiler(str(dataset_dir), memory_cache_size=8)
+
+    assert tiler.get_tile(0, 0, 0) == disk_bytes
+    assert (0, 0, 0) not in tiler.cache.store
+
+    generated_bytes = b"generated-tile"
+
+    def fake_generate_single_mvt_tile(dataset_root, tile_coords):
+        return generated_bytes
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator.generate_single_mvt_tile",
+        fake_generate_single_mvt_tile,
+    )
+
+    assert tiler.get_tile(1, 0, 0) == generated_bytes
+    assert tiler.cache.store[(1, 0, 0)] == generated_bytes
 
 
 def test_query_dataset_uses_indexed_tile(temp_dir, sample_parquet_file):

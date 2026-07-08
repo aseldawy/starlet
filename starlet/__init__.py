@@ -289,7 +289,7 @@ def generate_mvt(
         raise ValueError("extent must be positive")
     dataset_path = Path(tile_dir)
     mvt_outdir = outdir or str(dataset_path / "mvt")
-    pmtiles_path = str(dataset_path.with_suffix(".pmtiles")) if pmtiles else None
+    pmtiles_path = str(dataset_path / "tiles.pmtiles") if pmtiles else None
 
     from starlet._internal.mvt.dataset_generator import DatasetMVTGenerator
 
@@ -308,19 +308,15 @@ def generate_mvt(
         buffer=buffer,
     ).run()
 
-    # Count generated tiles
-    mvt_path = Path(mvt_outdir)
-    tile_count = len(list(mvt_path.rglob("*.mvt")))
-    zoom_levels = sorted(
-        int(d.name) for d in mvt_path.iterdir()
-        if d.is_dir() and d.name.isdigit()
-    ) if mvt_path.exists() else []
-
     generated_pmtiles_path = getattr(result, "pmtiles_path", None)
+    tile_counts_by_zoom = list(getattr(result, "tile_counts_by_zoom", []))
+    tile_count = int(getattr(result, "tile_count", sum(tile_counts_by_zoom)))
+    zoom_levels = list(getattr(result, "zoom_levels", [z for z, count in enumerate(tile_counts_by_zoom) if count > 0]))
 
     return MVTResult(
         outdir=mvt_outdir,
         zoom_levels=zoom_levels,
+        tile_counts_by_zoom=tile_counts_by_zoom,
         tile_count=tile_count,
         pmtiles_path=generated_pmtiles_path,
     )
@@ -445,7 +441,7 @@ def export_pmtiles(
     >>> # After running build/generate_mvt
     >>> export_pmtiles(
     ...     mvt_dir="datasets/mydata/mvt",
-    ...     output_path="datasets/mydata.pmtiles"
+    ...     output_path="datasets/mydata/tiles.pmtiles"
     ... )
     """
     from starlet._internal.pmtiles.exporter import export_to_pmtiles

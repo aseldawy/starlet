@@ -113,16 +113,19 @@ class IntermediateVectorTile:
 
         self._features_seen += 1
 
+        if len(self._features) < self.feature_capacity:
+            # Have not yet filled the reservoir, so just append the new feature.
+            slot = len(self._features)
+        else:
+            # Reservoir sampling: randomly replace an existing feature with the new one.
+            slot = self.rng.randrange(self._features_seen) 
+            if slot >= self.feature_capacity:
+                # The new feature is not selected for retention, so skip it.
+                return False
+
         coordinate_count = shapely.count_coordinates(geometry)
         if coordinate_count == 0:
             return False
-
-        if len(self._features) < self.feature_capacity:
-            slot = len(self._features)
-        else:
-            if self.rng.randrange(self._features_seen) >= self.feature_capacity:
-                return False
-            slot = self.rng.randrange(self.feature_capacity)
 
         clean_properties = {
             key: value
@@ -138,8 +141,8 @@ class IntermediateVectorTile:
         if slot == len(self._features):
             self._features.append(feature)
         else:
-            replaced = self._features[slot]
-            self._coordinate_count -= replaced.coordinate_count
+            # Remove the feature in the slot to replace
+            self.coordinate_count -= self._features[slot].coordinate_count
             self._features[slot] = feature
         self._coordinate_count += coordinate_count
         return True
@@ -181,8 +184,7 @@ class IntermediateVectorTile:
     def merge(self, other: "IntermediateVectorTile") -> None:
         """Merge another tile with the same z/x/y without simplifying."""
         # Verify that both tiles have the same location
-        if (self.z, self.x, self.y) != (other.z, other.x, other.y):
-            raise ValueError("Cannot merge intermediate vector tiles with different tile IDs")
+        assert (self.z, self.x, self.y) == (other.z, other.x, other.y), "Cannot merge intermediate tiles with different tile IDs"
         self._features_seen += other._features_seen
         for feature in other._features:
             if len(self._features) < self.feature_capacity:
@@ -190,8 +192,7 @@ class IntermediateVectorTile:
                 self._coordinate_count += feature.coordinate_count
             else:
                 slot = self.rng.randrange(self.feature_capacity)
-                replaced = self._features[slot]
-                self._coordinate_count += feature.coordinate_count - replaced.coordinate_count
+                self._coordinate_count += feature.coordinate_count - self._features[slot].coordinate_count
                 self._features[slot] = feature
 
     def write_features(self, path) -> None:

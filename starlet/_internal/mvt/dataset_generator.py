@@ -10,6 +10,7 @@ import math
 import multiprocessing
 from pathlib import Path
 import random
+import shutil
 import tempfile
 from typing import Any, Iterable, Sequence
 
@@ -29,6 +30,7 @@ from starlet._internal.mvt.helpers import (
 )
 from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
+from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
 from starlet._internal.progress import iter_with_progress
 from starlet._internal.server.tiler.parquet_index import ParquetIndex
@@ -53,6 +55,7 @@ class DatasetMVTGenerationResult:
     outdir: str
     tile_count: int
     zoom_levels: list[int]
+    tile_counts_by_zoom: list[int]
     pmtiles_path: str | None = None
 
 
@@ -108,7 +111,7 @@ class DatasetMVTGenerator:
         self.threshold = float(threshold)
         self.output_format = output_format.strip().lower()
         self.outdir = Path(outdir) if outdir is not None else self.dataset_dir / "mvt"
-        self.pmtiles_path = Path(pmtiles_path) if pmtiles_path is not None else self.dataset_dir.with_suffix(".pmtiles")
+        self.pmtiles_path = Path(pmtiles_path) if pmtiles_path is not None else default_pmtiles_path(self.dataset_dir)
         self.pmtiles_compression = pmtiles_compression
         cpu_default = max(1, multiprocessing.cpu_count() - 1)
         self.workers = max(1, int(workers or cpu_default))
@@ -138,12 +141,16 @@ class DatasetMVTGenerator:
         source = GeoParquetSource(str(self.parquet_dir), geom_col=self.geom_col)
         map_groups = _create_map_groups(source, self.workers)
         if not map_groups:
-            return DatasetMVTGenerationResult(str(self.outdir), 0, [], None)
+            return DatasetMVTGenerationResult(str(self.outdir), 0, [], [], None)
 
         temp_parent = resolve_temp_dir(self.temp_dir, self.dataset_dir / "tmp")
         with tempfile.TemporaryDirectory(prefix="starlet_mvt_", dir=temp_parent) as temp_dir:
             map_results = self._run_map_stage(map_groups, source, Path(temp_dir))
             self._run_reduce_stage(map_results)
+
+        tile_counts_by_zoom = _discover_tile_counts_by_zoom(self.outdir)
+        zoom_levels = [z for z, count in enumerate(tile_counts_by_zoom) if count > 0]
+        tile_count = sum(tile_counts_by_zoom)
 
         pmtiles_path = None
         if self.output_format == "pmtiles":
@@ -154,13 +161,13 @@ class DatasetMVTGenerator:
                 tile_type="mvt",
                 compression=self.pmtiles_compression,
             )
-
-        zoom_levels = _discover_zoom_levels(self.outdir)
-        tile_count = len(list(self.outdir.rglob("*.mvt"))) if self.outdir.exists() else 0
+            if self.outdir.exists():
+                shutil.rmtree(self.outdir)
         return DatasetMVTGenerationResult(
             outdir=str(self.outdir),
             tile_count=tile_count,
             zoom_levels=zoom_levels,
+            tile_counts_by_zoom=tile_counts_by_zoom,
             pmtiles_path=pmtiles_path,
         )
 
@@ -532,3 +539,17 @@ def _discover_zoom_levels(outdir: Path) -> list[int]:
         if child.is_dir() and child.name.isdigit():
             levels.append(int(child.name))
     return sorted(levels)
+
+
+def _discover_tile_counts_by_zoom(outdir: Path) -> list[int]:
+    if not outdir.exists():
+        return []
+    counts: dict[int, int] = {}
+    for child in outdir.iterdir():
+        if not child.is_dir() or not child.name.isdigit():
+            continue
+        zoom = int(child.name)
+        counts[zoom] = len(list(child.rglob("*.mvt")))
+    if not counts:
+        return []
+    return [counts.get(z, 0) for z in range(max(counts) + 1)]

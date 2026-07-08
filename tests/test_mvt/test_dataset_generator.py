@@ -160,7 +160,12 @@ def test_generate_mvt_forwards_pmtiles_settings(monkeypatch, tmp_path):
             captured.update(kwargs)
 
         def run(self):
-            return SimpleNamespace(pmtiles_path=str(tmp_path / "dataset.pmtiles"))
+            return SimpleNamespace(
+                pmtiles_path=str(tmp_path / "dataset" / "tiles.pmtiles"),
+                tile_count=3,
+                tile_counts_by_zoom=[1, 2],
+                zoom_levels=[0, 1],
+            )
 
     monkeypatch.setattr(
         "starlet._internal.mvt.dataset_generator.DatasetMVTGenerator",
@@ -178,3 +183,56 @@ def test_generate_mvt_forwards_pmtiles_settings(monkeypatch, tmp_path):
 
     assert captured["output_format"] == "pmtiles"
     assert captured["pmtiles_compression"] == "brotli"
+
+
+def test_dataset_generator_removes_mvt_dir_after_pmtiles_export(monkeypatch, tmp_path):
+    from starlet._internal.mvt.dataset_generator import DatasetMVTGenerator, _MapStageResult
+
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    hist_dir = dataset_dir / "histograms"
+    parquet_dir.mkdir(parents=True)
+    hist_dir.mkdir(parents=True)
+    (hist_dir / "global_prefix.npy").write_bytes(b"fake")
+
+    generator = DatasetMVTGenerator(
+        str(dataset_dir),
+        num_zoom_levels=2,
+        threshold=0,
+        output_format="pmtiles",
+    )
+    tile_path = generator.outdir / "0" / "0"
+    tile_path.mkdir(parents=True)
+    (tile_path / "0.mvt").write_bytes(b"tile")
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator.GeoParquetSource",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator._create_map_groups",
+        lambda source, workers: [[object()]],
+    )
+    monkeypatch.setattr(
+        DatasetMVTGenerator,
+        "_run_map_stage",
+        lambda self, groups, source, temp_root: [_MapStageResult("tmp", [1])],
+    )
+    monkeypatch.setattr(
+        DatasetMVTGenerator,
+        "_run_reduce_stage",
+        lambda self, map_results: None,
+    )
+    exported = {}
+    monkeypatch.setattr(
+        "starlet._internal.mvt.dataset_generator.export_to_pmtiles",
+        lambda **kwargs: exported.update(kwargs),
+    )
+
+    result = generator.run()
+
+    assert result.tile_counts_by_zoom == [1]
+    assert result.tile_count == 1
+    assert result.pmtiles_path == str(dataset_dir / "tiles.pmtiles")
+    assert exported["output_path"] == str(dataset_dir / "tiles.pmtiles")
+    assert not generator.outdir.exists()

@@ -42,7 +42,7 @@ def export_to_pmtiles(
     --------
     >>> export_to_pmtiles(
     ...     mvt_dir="datasets/mydata/mvt",
-    ...     output_path="datasets/mydata.pmtiles"
+    ...     output_path="datasets/mydata/tiles.pmtiles"
     ... )
     """
     mvt_path = Path(mvt_dir)

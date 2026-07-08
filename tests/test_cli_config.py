@@ -103,7 +103,7 @@ buffer = 64
             extent=extent,
             buffer=buffer,
         )
-        return SimpleNamespace(tile_count=1, outdir=outdir or "mvt", zoom_levels=[0, 1], pmtiles_path="dataset.pmtiles")
+        return SimpleNamespace(tile_count=1, outdir=outdir or "mvt", zoom_levels=[0, 1], pmtiles_path="dataset/tiles.pmtiles")
 
     monkeypatch.setattr("starlet.generate_mvt", fake_generate_mvt)
 
@@ -148,8 +148,8 @@ pmtiles_compression = "brotli"
         captured.update(kwargs)
         return (
             SimpleNamespace(num_files=1, total_rows=2),
-            SimpleNamespace(tile_count=3, zoom_levels=[0], pmtiles_path="dataset.pmtiles"),
-            "dataset.pmtiles",
+            SimpleNamespace(tile_count=3, zoom_levels=[0], pmtiles_path="dataset/tiles.pmtiles"),
+            "dataset/tiles.pmtiles",
         )
 
     monkeypatch.setattr("starlet.build", fake_build)

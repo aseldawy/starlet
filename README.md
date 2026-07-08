@@ -145,7 +145,7 @@ Once `starlet serve` is running:
   row groups at read time. Use `--no-covering-bbox` only when optimizing for
   smaller Parquet files and batch generation speed.
 - **One-file distribution:** `starlet mvt --pmtiles` writes a single
-  `datasets/mydata.pmtiles` archive alongside the dataset. `starlet build`
+  `datasets/mydata/tiles.pmtiles` archive inside the dataset directory. `starlet build`
   forwards the same setting to its MVT stage.
 
 ## Deploying a server

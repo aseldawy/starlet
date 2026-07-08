@@ -1,6 +1,7 @@
 """Public result types and dataset introspection for starlet."""
 from __future__ import annotations
 
+import collections
 import json
 import dataclasses
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pyarrow.parquet as pq
 
+from starlet._internal.pmtiles.paths import discover_pmtiles_path
 from starlet._internal.server.tiler.parquet_index import BBOX_COLS
 from starlet._internal.tiling.crs import geoparquet_crs
 
@@ -28,6 +30,7 @@ class MVTResult:
     """Result returned by :func:`starlet.generate_mvt`."""
     outdir: str
     zoom_levels: List[int]
+    tile_counts_by_zoom: List[int]
     tile_count: int
     pmtiles_path: Optional[str] = None
 
@@ -79,24 +82,22 @@ class Dataset:
 
     @property
     def zoom_levels(self) -> List[int]:
-        mvt_dir = self._root / "mvt"
-        if not mvt_dir.exists():
+        counts = self.tile_counts_by_zoom
+        if not counts:
             return []
-        levels = []
-        for child in mvt_dir.iterdir():
-            if child.is_dir():
-                try:
-                    levels.append(int(child.name))
-                except ValueError:
-                    pass
-        return sorted(levels)
+        return [z for z, count in enumerate(counts) if count > 0]
+
+    @property
+    def tile_counts_by_zoom(self) -> List[int]:
+        counts = self._tile_counts_by_zoom_mapping()
+        if not counts:
+            return []
+        max_zoom = max(counts)
+        return [counts.get(z, 0) for z in range(max_zoom + 1)]
 
     @property
     def mvt_tile_count(self) -> int:
-        mvt_dir = self._root / "mvt"
-        if not mvt_dir.exists():
-            return 0
-        return len(list(mvt_dir.rglob("*.mvt")))
+        return sum(self.tile_counts_by_zoom)
 
     @property
     def has_histograms(self) -> bool:
@@ -105,6 +106,17 @@ class Dataset:
     @property
     def has_mvt(self) -> bool:
         return (self._root / "mvt").is_dir()
+
+    @property
+    def pmtiles_path(self) -> str | None:
+        path = discover_pmtiles_path(self._root)
+        if path.exists():
+            return str(path)
+        return None
+
+    @property
+    def has_pmtiles(self) -> bool:
+        return self.pmtiles_path is not None
 
     @property
     def has_stats(self) -> bool:
@@ -143,6 +155,48 @@ class Dataset:
                 except Exception:
                     pass
         return None
+
+    def _tile_counts_by_zoom_mapping(self) -> dict[int, int]:
+        mvt_counts = self._mvt_tile_counts()
+        if mvt_counts:
+            return mvt_counts
+        return self._pmtiles_tile_counts()
+
+    def _mvt_tile_counts(self) -> dict[int, int]:
+        mvt_dir = self._root / "mvt"
+        if not mvt_dir.exists():
+            return {}
+        counts: dict[int, int] = {}
+        for child in mvt_dir.iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                zoom = int(child.name)
+            except ValueError:
+                continue
+            counts[zoom] = len(list(child.rglob("*.mvt")))
+        return counts
+
+    def _pmtiles_tile_counts(self) -> dict[int, int]:
+        pmtiles_path = discover_pmtiles_path(self._root)
+        if not pmtiles_path.exists():
+            return {}
+        try:
+            from pmtiles.reader import MmapSource, Reader, all_tiles
+        except Exception:
+            return {}
+
+        counts: collections.Counter[int] = collections.Counter()
+        with open(pmtiles_path, "rb") as handle:
+            get_bytes = MmapSource(handle)
+            header = Reader(get_bytes).header()
+            min_zoom = int(header.get("min_zoom", 0))
+            max_zoom = int(header.get("max_zoom", min_zoom))
+            for z in range(min_zoom, max_zoom + 1):
+                counts.setdefault(z, 0)
+            for (z, _x, _y), _tile_bytes in all_tiles(get_bytes):
+                counts[z] += 1
+        return dict(counts)
 
     def _get_parquet_info(self) -> tuple[bool, str | None]:
         if self._parquet_info is not None:

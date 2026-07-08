@@ -9,27 +9,17 @@ coordinates only when encoding MVT bytes.
 from __future__ import annotations
 
 import json
-import math
 import random
+import struct
 from dataclasses import dataclass
-from typing import Any, Iterable
+from pathlib import Path
+from typing import Any
 
 import mapbox_vector_tile
-import numpy as np
 import pyarrow as pa
-from shapely import get_coordinates
 import shapely
 from shapely.affinity import affine_transform
-from shapely.geometry import (
-    GeometryCollection,
-    LineString,
-    MultiLineString,
-    MultiPoint,
-    MultiPolygon,
-    Point,
-    Polygon,
-    mapping,
-)
+from shapely.geometry import Point
 
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
 
@@ -37,6 +27,8 @@ from .helpers import EXTENT, explode_geom, mercator_tile_bounds
 
 
 DEFAULT_FEATURE_CAPACITY = 2_000
+_FEATURES_SEEN_HEADER = struct.Struct("<Q")
+_FEATURES_SEEN_PADDING = 0
 
 
 @dataclass(frozen=True)
@@ -142,7 +134,7 @@ class IntermediateVectorTile:
             self._features.append(feature)
         else:
             # Remove the feature in the slot to replace
-            self.coordinate_count -= self._features[slot].coordinate_count
+            self._coordinate_count -= self._features[slot].coordinate_count
             self._features[slot] = feature
         self._coordinate_count += coordinate_count
         return True
@@ -196,7 +188,7 @@ class IntermediateVectorTile:
                 self._features[slot] = feature
 
     def write_features(self, path) -> None:
-        """Write retained features to an Arrow IPC file."""
+        """Write retained features and features-seen count to disk."""
         table = pa.table(
             {
                 "geometry": pa.array(
@@ -212,14 +204,21 @@ class IntermediateVectorTile:
                 ),
             }
         )
+        payload_sink = pa.BufferOutputStream()
+        with pa.ipc.new_file(payload_sink, table.schema) as writer:
+            writer.write_table(table)
+        payload = payload_sink.getvalue().to_pybytes()
         with pa.OSFile(str(path), "wb") as sink:
-            with pa.ipc.new_file(sink, table.schema) as writer:
-                writer.write_table(table)
+            sink.write(_FEATURES_SEEN_HEADER.pack(self._features_seen))
+            sink.write(b"\x00" * _FEATURES_SEEN_PADDING)
+            sink.write(payload)
 
     def load_features(self, path) -> None:
-        """Load retained features from an Arrow IPC file without resampling."""
-        with pa.memory_map(str(path), "r") as source:
-            table = pa.ipc.open_file(source).read_all()
+        """Load retained features from disk without resampling."""
+        data = Path(path).read_bytes()
+        self._features_seen = _FEATURES_SEEN_HEADER.unpack(data[:_FEATURES_SEEN_HEADER.size])[0]
+        payload_offset = _FEATURES_SEEN_HEADER.size + _FEATURES_SEEN_PADDING
+        table = pa.ipc.open_file(pa.BufferReader(data[payload_offset:])).read_all()
 
         geometries = table["geometry"].to_pylist()
         properties = table["properties"].to_pylist()
@@ -236,7 +235,6 @@ class IntermediateVectorTile:
                 )
             )
             self._coordinate_count += coordinate_count
-            self._features_seen += 1
 
     def encode(self, layer_name: str = "layer0") -> bytes:
         """Encode the retained features as an MVT binary payload."""

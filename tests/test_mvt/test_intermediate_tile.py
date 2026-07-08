@@ -183,8 +183,9 @@ def test_encode_accepts_layer_name():
 
 def test_feature_arrow_roundtrip_populates_tile_state(tmp_path):
     path = tmp_path / "0-0-0.pyarrow"
-    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1, rng=_FixedRng(randrange_values=[1]))
     tile.add_feature(Point(0, 0), {"id": 1})
+    tile.add_feature(Point(1, 1), {"id": 2})
     tile.write_features(path)
 
     loaded = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
@@ -192,4 +193,5 @@ def test_feature_arrow_roundtrip_populates_tile_state(tmp_path):
 
     assert loaded.feature_count == 1
     assert loaded.coordinate_count == 1
+    assert loaded._features_seen == 2
     assert loaded._features[0].properties == {"id": 1}

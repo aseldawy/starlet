@@ -12,6 +12,21 @@ __all__ = [
     "build",
     "create_app",
     "export_pmtiles",
+    "list_datasets",
+    "get_tile",
+    "get_dataset_metadata",
+    "get_dataset_summary",
+    "estimate_range_count",
+    "query_dataset",
+    "query_dataset_count",
+    "query_dataset_size",
+    "get_sample_record",
+    "add_dataset",
+    "delete_dataset",
+    "add_dataset_async",
+    "AsyncDatasetHandle",
+    "set_temp_dir",
+    "get_temp_dir",
     "TileResult",
     "MVTResult",
     "Dataset",
@@ -25,6 +40,7 @@ def tile(
     input: str,
     outdir: str,
     *,
+    parallelism: int | None = None,
     partition_size: int | None = None,
     sort: str = "zorder",
     compression: str = "zstd",
@@ -33,15 +49,15 @@ def tile(
     seed: int = 42,
     geom_col: str = "geometry",
     sfc_bits: int = 16,
-    max_parallel_files: int = 64,
-    covering_bbox: bool = False,
-    geojson_executor: str = "process",
-    orchestrator: str = "two-stage",
-    two_stage_executor: str = "process",
-    two_stage_assignment_workers: int | None = None,
-    two_stage_write_workers: int | None = None,
-    two_stage_reducers: int | None = None,
+    covering_bbox: bool = True,
+    csv_x_col: str | None = None,
+    csv_y_col: str | None = None,
+    csv_wkt_col: str | None = None,
+    csv_split_size: int = 32 * 1024 * 1024,
+    src_crs: str = "EPSG:4326",
     temp_dir: str | None = None,
+    grid_size: int = 4096,
+    histogram_dtype: str = "float64",
 ) -> TileResult:
     """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
 
@@ -52,6 +68,9 @@ def tile(
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.
+    parallelism : int | None
+        Shared worker count used for sampling, two-stage assignment, reducers,
+        and histogram construction.
     partition_size : int | None
         Target partition size in bytes. When omitted, defaults to 512 MiB for
         GeoJSON and 128 MiB for GeoParquet. The number of partitions is
@@ -71,31 +90,27 @@ def tile(
         Name of the geometry column.
     sfc_bits : int
         Bits per axis for Z-order / Hilbert key.
-    max_parallel_files : int
-        Maximum concurrent tile files during write.
     covering_bbox : bool
-        Opt-in read-time pruning. If True, write four per-row bbox covering
+        Read-time pruning support. If True, write four per-row bbox covering
         columns plus bounded, spatially-coherent row groups so the on-demand
-        tile server can skip row groups/rows at read time. Off by default
-        (faster batch tiling, smaller files); enable when serving tiles
-        on the fly from these partitions.
-    geojson_executor : str
-        Executor used for GeoJSON spatial sampling: ``"process"`` for
-        production CPU parallelism or ``"thread"`` for small inputs / test
-        environments (avoids process-pool spawn overhead).
-    orchestrator : str
-        Tiling orchestrator to use: ``"round"`` or ``"two-stage"``.
-    two_stage_executor : str
-        Executor used by the two-stage orchestrator: ``"process"`` or ``"thread"``.
-    two_stage_assignment_workers : int | None
-        Number of workers for two-stage split assignment.
-    two_stage_write_workers : int | None
-        Number of workers for two-stage tile writes.
-    two_stage_reducers : int | None
-        Number of hash-shuffle reducers for the two-stage orchestrator.
+        tile server can skip row groups/rows at read time. Enabled by default;
+        disable when optimizing only for batch tiling speed and smaller files.
+    csv_x_col, csv_y_col : str | None
+        Column names containing x/y coordinates for CSV inputs. Provide both,
+        or provide ``csv_wkt_col`` instead.
+    csv_wkt_col : str | None
+        Column name containing WKT geometry for CSV inputs.
+    csv_split_size : int
+        Target byte length for each CSV source split.
+    src_crs : str
+        CRS hint for CSV inputs and other sources without embedded CRS.
     temp_dir : str | None
         Parent directory for two-stage temporary shard files. Defaults to
         ``./tmp`` under the current working directory.
+    grid_size : int
+        Histogram grid size per axis.
+    histogram_dtype : str
+        Histogram data type.
 
     Returns
     -------
@@ -105,13 +120,9 @@ def tile(
     import math
     from pathlib import Path
 
-    from starlet._internal.tiling.datasource import (
-        is_geojson_path,
-        read_spatial_sample,
-        source_for_path,
-    )
+    from starlet._internal.tiling.datasource import read_spatial_sample, source_for_path
+    from starlet._internal.tiling.geojson_source import is_geojson_path
     from starlet._internal.tiling.assigner import RSGroveAssigner
-    from starlet._internal.tiling.orchestrator import RoundOrchestrator
     from starlet._internal.tiling.two_stage_orchestrator import TwoStageOrchestrator
     from starlet._internal.tiling.writer_pool import SortMode
     from starlet._internal.histogram.hist_pyramid import build_histograms_for_dir
@@ -128,7 +139,16 @@ def tile(
     sort_mode = _sort_map.get(sort.strip().lower(), SortMode.ZORDER)
 
     # Build data source and choose a format-appropriate default size.
-    source = source_for_path(input)
+    source = source_for_path(
+        input,
+        geom_col=geom_col,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=csv_split_size,
+        src_crs=src_crs,
+    )
+    geom_col = getattr(source, "geom_col", geom_col)
     if partition_size is None:
         partition_size = (
             _GEOJSON_DEFAULT_PARTITION_SIZE
@@ -155,7 +175,14 @@ def tile(
         seed=seed,
         sample_ratio=sample_ratio,
         sample_cap=sample_cap,
-        geojson_executor=geojson_executor,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=csv_split_size,
+        src_crs=src_crs,
+        geojson_workers=parallelism,
+        geoparquet_workers=parallelism,
+        source_workers=parallelism,
     )
     assigner = RSGroveAssigner.from_sample_and_mbr(
         sample_points=spatial_sample.sample_points,
@@ -167,35 +194,18 @@ def tile(
     tiles_dir = str(Path(outdir) / "parquet_tiles")
     hist_dir = str(Path(outdir) / "histograms")
 
-    orchestrator_name = orchestrator.strip().lower().replace("_", "-")
-    if orchestrator_name == "round":
-        tiling_orchestrator = RoundOrchestrator(
-            source=source,
-            assigner=assigner,
-            outdir=tiles_dir,
-            max_parallel_files=max_parallel_files,
-            compression=compression,
-            sort_mode=sort_mode,
-            sfc_bits=sfc_bits,
-            covering_bbox=covering_bbox,
-        )
-    elif orchestrator_name in {"two-stage", "twostage"}:
-        tiling_orchestrator = TwoStageOrchestrator(
-            source=source,
-            assigner=assigner,
-            outdir=tiles_dir,
-            compression=compression,
-            sort_mode=sort_mode,
-            sfc_bits=sfc_bits,
-            executor=two_stage_executor,
-            assignment_workers=two_stage_assignment_workers,
-            write_workers=two_stage_write_workers,
-            num_reducers=two_stage_reducers,
-            temp_dir=temp_dir,
-            covering_bbox=covering_bbox,
-        )
-    else:
-        raise ValueError("orchestrator must be 'round' or 'two-stage'")
+    tiling_orchestrator = TwoStageOrchestrator(
+        source=source,
+        assigner=assigner,
+        outdir=tiles_dir,
+        geom_col=geom_col,
+        compression=compression,
+        sort_mode=sort_mode,
+        sfc_bits=sfc_bits,
+        parallelism=parallelism,
+        temp_dir=temp_dir,
+        covering_bbox=covering_bbox,
+    )
     tiling_orchestrator.run()
 
     logger.info("Tiling complete. Building histograms.")
@@ -203,10 +213,9 @@ def tile(
         tiles_dir=tiles_dir,
         outdir=hist_dir,
         geom_col=geom_col,
-        grid_size=4096,
-        dtype="float64",
-        hist_max_parallel=8,
-        hist_rg_parallel=4,
+        grid_size=grid_size,
+        dtype=histogram_dtype,
+        parallelism=parallelism,
     )
 
     # Gather result metadata
@@ -234,10 +243,14 @@ def generate_mvt(
     *,
     zoom: int = 7,
     threshold: float = 0,
+    pmtiles: bool = False,
+    pmtiles_compression: str = "gzip",
     outdir: str | None = None,
-    auto_zoom: bool = True,
-    occupancy_threshold: float = 0.01,
-    max_workers: int | None = None,
+    parallelism: int | None = None,
+    temp_dir: str | None = None,
+    feature_capacity: int = 10_000,
+    extent: int = 4096,
+    buffer: int = 256,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -249,55 +262,63 @@ def generate_mvt(
         Maximum zoom level.
     threshold : float
         Minimum feature count per tile.
+    pmtiles : bool
+        If True, also export the generated tiles to a PMTiles archive.
+    pmtiles_compression : str
+        Compression for PMTiles export: "gzip", "brotli", "zstd", "none".
     outdir : str | None
         MVT output directory. Defaults to ``<tile_dir>/mvt/``.
-    auto_zoom : bool
-        Automatically detect maximum useful zoom level from histogram density.
-        If True and data becomes sparse before ``zoom``, generation stops early.
-        Default True.
-    occupancy_threshold : float
-        Minimum tile occupancy (nonempty_tiles / total_tiles) for auto-zoom detection.
-        Default 0.01 (1% occupancy).
+    temp_dir : str | None
+        Parent directory for temporary MVT map/reduce files. If omitted, uses
+        the process-wide Starlet temp directory when configured, otherwise
+        ``<tile_dir>/tmp``.
+    feature_capacity : int
+        Maximum retained features per intermediate tile reservoir.
+    extent : int
+        Vector tile extent.
+    buffer : int
+        Vector tile buffer in extent units.
 
     Returns
     -------
     MVTResult
     """
     from pathlib import Path
-    from starlet._internal.mvt.generator import BucketMVTGenerator
 
-    parquet_dir = str(Path(tile_dir) / "parquet_tiles")
-    # Prefer the precomputed integral image written by the tiling stage; fall
-    # back to the raw histogram (recomputing the prefix sum) for older datasets.
-    hist_dir = Path(tile_dir) / "histograms"
-    prefix_path = hist_dir / "global_prefix.npy"
-    hist_path = str(prefix_path if prefix_path.exists() else hist_dir / "global.npy")
-    mvt_outdir = outdir or str(Path(tile_dir) / "mvt")
+    if extent <= 0:
+        raise ValueError("extent must be positive")
+    dataset_path = Path(tile_dir)
+    mvt_outdir = outdir or str(dataset_path / "mvt")
+    pmtiles_path = str(dataset_path / "tiles.pmtiles") if pmtiles else None
 
-    gen = BucketMVTGenerator(
-        parquet_dir=parquet_dir,
-        hist_path=hist_path,
-        outdir=mvt_outdir,
-        last_zoom=zoom,
+    from starlet._internal.mvt.mvt_generator import DatasetMVTGenerator
+
+    result = DatasetMVTGenerator(
+        tile_dir,
+        num_zoom_levels=zoom + 1,
         threshold=threshold,
-        auto_zoom=auto_zoom,
-        occupancy_threshold=occupancy_threshold,
-        max_workers=max_workers,
-    )
-    gen.run()
+        output_format="pmtiles" if pmtiles else "mvt",
+        outdir=mvt_outdir,
+        pmtiles_path=pmtiles_path,
+        pmtiles_compression=pmtiles_compression,
+        workers=parallelism,
+        temp_dir=temp_dir,
+        feature_capacity=feature_capacity,
+        extent=extent,
+        buffer=buffer,
+    ).run()
 
-    # Count generated tiles
-    mvt_path = Path(mvt_outdir)
-    tile_count = len(list(mvt_path.rglob("*.mvt")))
-    zoom_levels = sorted(
-        int(d.name) for d in mvt_path.iterdir()
-        if d.is_dir() and d.name.isdigit()
-    ) if mvt_path.exists() else []
+    generated_pmtiles_path = getattr(result, "pmtiles_path", None)
+    tile_counts_by_zoom = list(getattr(result, "tile_counts_by_zoom", []))
+    tile_count = int(getattr(result, "tile_count", sum(tile_counts_by_zoom)))
+    zoom_levels = list(getattr(result, "zoom_levels", [z for z, count in enumerate(tile_counts_by_zoom) if count > 0]))
 
     return MVTResult(
         outdir=mvt_outdir,
         zoom_levels=zoom_levels,
+        tile_counts_by_zoom=tile_counts_by_zoom,
         tile_count=tile_count,
+        pmtiles_path=generated_pmtiles_path,
     )
 
 
@@ -306,10 +327,15 @@ def build(
     outdir: str,
     *,
     zoom: int = 7,
+    parallelism: int | None = None,
     partition_size: int | None = None,
     threshold: float = 100_000,
     pmtiles: bool = False,
     pmtiles_compression: str = "gzip",
+    temp_dir: str | None = None,
+    feature_capacity: int = 10_000,
+    extent: int = 4096,
+    buffer: int = 256,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
@@ -322,6 +348,8 @@ def build(
         Output dataset directory.
     zoom : int
         Maximum zoom level for MVT generation.
+    parallelism : int | None
+        Shared worker count used across tiling and MVT generation.
     partition_size : int | None
         Target partition size in bytes (forwarded to :func:`tile`). When
         omitted, a format-appropriate default is used.
@@ -333,10 +361,18 @@ def build(
     pmtiles_compression : str
         Compression for PMTiles export: "gzip", "brotli", "zstd", "none".
         Default "gzip". Only used if pmtiles=True.
+    temp_dir : str | None
+        Parent directory for temporary files used by all build steps. Explicit
+        values override the process-wide Starlet temp directory.
+    feature_capacity : int
+        Maximum retained features per intermediate tile reservoir.
+    extent : int
+        Vector tile extent.
+    buffer : int
+        Vector tile buffer in extent units.
     **tile_kwargs
         Additional keyword arguments forwarded to :func:`tile`
-        (e.g. ``covering_bbox=True``, ``orchestrator="round"``,
-        ``geojson_executor="thread"``).
+        (e.g. ``covering_bbox=False``).
 
     Returns
     -------
@@ -346,26 +382,31 @@ def build(
     """
     from pathlib import Path
 
+    if "temp_dir" in tile_kwargs:
+        if temp_dir is not None:
+            raise ValueError("temp_dir was provided twice")
+        temp_dir = tile_kwargs.pop("temp_dir")
+
     tile_result = tile(
-        input=input, outdir=outdir, partition_size=partition_size, **tile_kwargs
+        input=input,
+        outdir=outdir,
+        parallelism=parallelism,
+        partition_size=partition_size,
+        temp_dir=temp_dir,
+        **tile_kwargs,
     )
-    mvt_result = generate_mvt(tile_dir=outdir, zoom=zoom, threshold=threshold)
+    mvt_result = generate_mvt(
+        tile_dir=outdir,
+        zoom=zoom,
+        threshold=threshold,
+        temp_dir=temp_dir,
+        parallelism=parallelism,
+        feature_capacity=feature_capacity,
+        extent=extent,
+        buffer=buffer,
+    )
 
-    pmtiles_path = None
-    if pmtiles:
-        from starlet._internal.pmtiles.exporter import export_to_pmtiles
-
-        dataset_name = Path(outdir).name
-        pmtiles_path = str(Path(outdir).parent / f"{dataset_name}.pmtiles")
-
-        export_to_pmtiles(
-            mvt_dir=str(Path(outdir) / "mvt"),
-            output_path=pmtiles_path,
-            tile_type="mvt",
-            compression=pmtiles_compression,
-        )
-
-    return tile_result, mvt_result, pmtiles_path
+    return tile_result, mvt_result, mvt_result.pmtiles_path
 
 
 def export_pmtiles(
@@ -400,14 +441,17 @@ def export_pmtiles(
     >>> # After running build/generate_mvt
     >>> export_pmtiles(
     ...     mvt_dir="datasets/mydata/mvt",
-    ...     output_path="datasets/mydata.pmtiles"
+    ...     output_path="datasets/mydata/tiles.pmtiles"
     ... )
     """
     from starlet._internal.pmtiles.exporter import export_to_pmtiles
     return export_to_pmtiles(mvt_dir, output_path, tile_type, compression)
 
 
-def create_app(data_dir: str, cache_size: int = 256):
+def create_app(
+    data_dir: str,
+    cache_size: int = 256,
+):
     """Create a Flask tile server application.
 
     Parameters
@@ -416,11 +460,42 @@ def create_app(data_dir: str, cache_size: int = 256):
         Root directory containing dataset subdirectories.
     cache_size : int
         Number of tiles in the in-memory LRU cache.
-
     Returns
     -------
     Flask
         Configured Flask application.
     """
     from starlet._internal.server.app import create_app as _create_app
-    return _create_app(data_dir=data_dir, cache_size=cache_size)
+    return _create_app(
+        data_dir=data_dir,
+        cache_size=cache_size,
+    )
+
+
+def set_temp_dir(path: str | None):
+    """Set the process-wide parent directory for Starlet temporary files."""
+    from starlet._internal.config import set_temp_dir as _set_temp_dir
+    return _set_temp_dir(path)
+
+
+def get_temp_dir():
+    """Return the configured process-wide Starlet temp directory, if any."""
+    from starlet._internal.config import get_temp_dir as _get_temp_dir
+    return _get_temp_dir()
+
+
+from starlet.api import (  # noqa: E402
+    AsyncDatasetHandle,
+    add_dataset,
+    add_dataset_async,
+    delete_dataset,
+    estimate_range_count,
+    get_dataset_metadata,
+    get_dataset_summary,
+    get_tile,
+    get_sample_record,
+    list_datasets,
+    query_dataset,
+    query_dataset_count,
+    query_dataset_size,
+)

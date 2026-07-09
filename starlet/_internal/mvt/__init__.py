@@ -1,3 +1,3 @@
-from .generator import BucketMVTGenerator
+from .mvt_generator import DatasetMVTGenerationResult, DatasetMVTGenerator
 
-__all__ = ["BucketMVTGenerator"]
+__all__ = ["DatasetMVTGenerator", "DatasetMVTGenerationResult"]

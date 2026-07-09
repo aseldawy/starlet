@@ -25,11 +25,15 @@ import json
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+import shapely.ops
+from pyproj import Transformer
+
+from starlet._internal.tiling.crs import WGS84_CRS, WEB_MERCATOR_CRS, geoparquet_crs
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,25 @@ BBox = Tuple[float, float, float, float]
 
 # Per-row bbox covering columns written by the tiling stage (see writer_pool).
 BBOX_COLS = ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax")
+INTERNAL_COLS = ("_tile_id", *BBOX_COLS)
+
+
+def _coerce_geometry(geometry):
+    from shapely.geometry import box, shape
+    from shapely.geometry.base import BaseGeometry
+
+    if isinstance(geometry, BaseGeometry):
+        return geometry
+    if isinstance(geometry, dict):
+        return shape(geometry)
+    if len(geometry) != 4:
+        raise ValueError("Rectangle geometry must be (minx, miny, maxx, maxy)")
+    return box(*[float(v) for v in geometry])
+
+
+def _bounds_tuple(bounds) -> BBox:
+    minx, miny, maxx, maxy = bounds
+    return (float(minx), float(miny), float(maxx), float(maxy))
 
 
 def parse_parquet_bbox(fname: str) -> Optional[BBox]:
@@ -90,15 +113,26 @@ class ParquetIndex:
         self._partition_cache_size = partition_cache_size
         # key -> (native GeoDataFrame, cached per-geometry bounds DataFrame)
         self._partition_cache: "OrderedDict[str, Tuple[gpd.GeoDataFrame, object]]" = OrderedDict()
-        # key -> (column_names, geometry_column, has_bbox_columns)
+        # key -> (column_names, geometry_column, has_bbox_columns, crs)
         self._schema_cache: dict = {}
+        self._transformer_cache: dict = {}
 
     # Kept for backward compatibility with callers that used the static helper.
     parse_parquet_bbox = staticmethod(parse_parquet_bbox)
 
     def find_intersecting_files(self, bbox_4326: BBox) -> List[Path]:
-        """Partitions whose filename bbox overlaps ``bbox_4326`` (WGS84)."""
-        return [pf for pf, pbbox in self._entries if bbox_intersects(pbbox, bbox_4326)]
+        """Partitions whose filename bbox overlaps ``bbox_4326``.
+
+        Partition filenames store bboxes in the partition's native CRS, so the
+        requested WGS84 tile bounds are transformed before comparison.
+        """
+        matches = []
+        for pf, pbbox in self._entries:
+            _, _, _, crs = self._schema_info(pf)
+            query_bbox = self._transform_bbox(bbox_4326, WGS84_CRS, crs)
+            if bbox_intersects(pbbox, query_bbox):
+                matches.append(pf)
+        return matches
 
     # ------------------------------------------------------------------ schema
 
@@ -121,9 +155,34 @@ class ParquetIndex:
                     geom_col = json.loads(raw).get("primary_column", geom_col)
                 except Exception:
                     pass
-        info = (names, geom_col, has_bbox)
+        crs = geoparquet_crs(schema, geom_col) or WGS84_CRS
+        info = (names, geom_col, has_bbox, crs)
         self._schema_cache[key] = info
         return info
+
+    def _transformer(self, src_crs, dst_crs):
+        key = (str(src_crs or WGS84_CRS), str(dst_crs or WGS84_CRS))
+        transformer = self._transformer_cache.get(key)
+        if transformer is None:
+            transformer = Transformer.from_crs(
+                src_crs or WGS84_CRS,
+                dst_crs or WGS84_CRS,
+                always_xy=True,
+            )
+            self._transformer_cache[key] = transformer
+        return transformer
+
+    def _transform_bbox(self, bbox: BBox, src_crs, dst_crs) -> BBox:
+        if str(src_crs or WGS84_CRS) == str(dst_crs or WGS84_CRS):
+            return bbox
+        transformer = self._transformer(src_crs, dst_crs)
+        return tuple(transformer.transform_bounds(*bbox, densify_pts=21))
+
+    def _transform_geometry(self, geom, src_crs, dst_crs):
+        if str(src_crs or WGS84_CRS) == str(dst_crs or WGS84_CRS):
+            return geom
+        transformer = self._transformer(src_crs, dst_crs)
+        return shapely.ops.transform(transformer.transform, geom)
 
     # ------------------------------------------------------------------ reads
 
@@ -133,10 +192,9 @@ class ParquetIndex:
         Returns ``(gdf, bounds_df)`` with a per-geometry envelope for spatial
         pre-filtering.  Used for legacy tiles; results are LRU-cached.
         """
+        _, geom_col, _, crs = self._schema_info(path)
         if self._partition_cache_size <= 0:
-            gdf = gpd.read_parquet(path)
-            if gdf.crs is None:
-                gdf = gdf.set_crs(4326)
+            gdf = self._read_wkb_table(path, geom_col, crs)
             return gdf, gdf.geometry.bounds
 
         key = str(path)
@@ -145,9 +203,7 @@ class ParquetIndex:
             self._partition_cache.move_to_end(key)
             return cached
 
-        gdf = gpd.read_parquet(path)
-        if gdf.crs is None:
-            gdf = gdf.set_crs(4326)
+        gdf = self._read_wkb_table(path, geom_col, crs)
         entry = (gdf, gdf.geometry.bounds)
         self._partition_cache[key] = entry
         self._partition_cache.move_to_end(key)
@@ -155,13 +211,44 @@ class ParquetIndex:
             self._partition_cache.popitem(last=False)
         return entry
 
-    def _pushdown_read(self, path: Path, geom_col: str, bbox_4326: BBox) -> gpd.GeoDataFrame:
-        """Read only rows whose bbox overlaps ``bbox_4326``, reprojected to 3857.
+    def _read_wkb_table(self, path: Path, geom_col: str, crs) -> gpd.GeoDataFrame:
+        table = pq.read_table(path)
+        return self._table_to_geodataframe(table, geom_col, crs)
+
+    def _table_to_geodataframe(
+        self,
+        table,
+        geom_col: str,
+        crs,
+        *,
+        target_crs=None,
+    ) -> gpd.GeoDataFrame:
+        drop = [c for c in INTERNAL_COLS if c in table.column_names]
+        if drop:
+            table = table.drop(drop)
+        df = table.to_pandas()
+        if geom_col not in df.columns:
+            return gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=target_crs or crs))
+        geom = gpd.GeoSeries.from_wkb(df[geom_col].to_numpy(), crs=crs)
+        gdf = gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geom, crs=crs)
+        if str(target_crs or crs) == str(crs):
+            return gdf
+        return gdf.to_crs(target_crs)
+
+    def _pushdown_read(
+        self,
+        path: Path,
+        geom_col: str,
+        bbox_native: BBox,
+        crs,
+        target_crs=WEB_MERCATOR_CRS,
+    ) -> gpd.GeoDataFrame:
+        """Read only rows whose bbox overlaps ``bbox_native``, reprojected if requested.
 
         Uses pyarrow predicate pushdown on the ``_bbox_*`` columns; row groups
         whose statistics miss the tile are skipped entirely.
         """
-        minx, miny, maxx, maxy = bbox_4326
+        minx, miny, maxx, maxy = bbox_native
         flt = (
             (pc.field("_bbox_xmax") >= minx)
             & (pc.field("_bbox_xmin") <= maxx)
@@ -169,18 +256,16 @@ class ParquetIndex:
             & (pc.field("_bbox_ymin") <= maxy)
         )
         table = pq.read_table(path, filters=flt)
-        drop = [c for c in BBOX_COLS if c in table.column_names]
-        if drop:
-            table = table.drop(drop)
-        df = table.to_pandas()
-        if geom_col not in df.columns or len(df) == 0:
-            return gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=4326))
-        geom = gpd.GeoSeries.from_wkb(df[geom_col].to_numpy(), crs=4326)
-        gdf = gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geom, crs=4326)
-        return gdf.to_crs(3857)
+        return self._table_to_geodataframe(table, geom_col, crs, target_crs=target_crs)
 
-    def load_and_reproject(self, path: Path, bbox_4326: Optional[BBox] = None) -> gpd.GeoDataFrame:
-        """Load a partition in EPSG:3857, pruned to ``bbox_4326`` when given.
+    def load_partition(
+        self,
+        path: Path,
+        bbox_4326: Optional[BBox] = None,
+        *,
+        target_crs=WEB_MERCATOR_CRS,
+    ) -> gpd.GeoDataFrame:
+        """Load a partition in ``target_crs``, pruned to ``bbox_4326`` when given.
 
         When the tile carries ``_bbox_*`` columns this uses pyarrow row-group +
         row pushdown (cost ~ geometries in the tile).  Otherwise it falls back
@@ -189,16 +274,20 @@ class ParquetIndex:
         """
         if bbox_4326 is not None:
             try:
-                _, geom_col, has_bbox = self._schema_info(path)
+                _, geom_col, has_bbox, crs = self._schema_info(path)
+                bbox_native = self._transform_bbox(bbox_4326, WGS84_CRS, crs)
             except Exception:
                 has_bbox = False
                 geom_col = "geometry"
+                crs = WGS84_CRS
+                bbox_native = bbox_4326
             if has_bbox:
-                return self._pushdown_read(path, geom_col, bbox_4326)
+                return self._pushdown_read(path, geom_col, bbox_native, crs, target_crs=target_crs)
 
         gdf, bounds = self._read_native(path)
         if bbox_4326 is not None and len(gdf):
-            minx, miny, maxx, maxy = bbox_4326
+            bbox_native = self._transform_bbox(bbox_4326, WGS84_CRS, gdf.crs or WGS84_CRS)
+            minx, miny, maxx, maxy = bbox_native
             mask = ~(
                 (bounds["maxx"] < minx)
                 | (bounds["minx"] > maxx)
@@ -209,6 +298,48 @@ class ParquetIndex:
         drop = [c for c in BBOX_COLS if c in gdf.columns]
         if drop:
             gdf = gdf.drop(columns=drop)
-        if len(gdf) and gdf.crs is not None and gdf.crs.to_epsg() != 3857:
-            gdf = gdf.to_crs(3857)
+        if len(gdf) and gdf.crs is not None and str(target_crs or gdf.crs) != str(gdf.crs):
+            gdf = gdf.to_crs(target_crs)
         return gdf
+
+    def load_and_reproject(self, path: Path, bbox_4326: Optional[BBox] = None) -> gpd.GeoDataFrame:
+        """Backward-compatible wrapper around :meth:`load_partition`."""
+        return self.load_partition(path, bbox_4326, target_crs=WEB_MERCATOR_CRS)
+
+    def iter_query_batches(
+        self,
+        geometry: Sequence[float] | dict[str, Any] | Any,
+        *,
+        geometry_crs: str = WGS84_CRS,
+        target_crs: str = WGS84_CRS,
+        batch_size: int | None = None,
+    ) -> Iterator[gpd.GeoDataFrame]:
+        """Yield batches of records whose geometries intersect ``geometry``."""
+        query_geom = _coerce_geometry(geometry)
+        query_geom_4326 = self._transform_geometry(query_geom, geometry_crs, WGS84_CRS)
+        query_geom_target = self._transform_geometry(query_geom_4326, WGS84_CRS, target_crs)
+        query_bounds_4326 = _bounds_tuple(query_geom_4326.bounds)
+
+        for path in self.find_intersecting_files(query_bounds_4326):
+            gdf = self.load_partition(path, query_bounds_4326, target_crs=target_crs)
+            if gdf.empty:
+                continue
+            bounds = gdf.geometry.bounds
+            minx, miny, maxx, maxy = query_geom_target.bounds
+            bbox_mask = ~(
+                (bounds["maxx"] < minx)
+                | (bounds["minx"] > maxx)
+                | (bounds["maxy"] < miny)
+                | (bounds["miny"] > maxy)
+            )
+            candidates = gdf.loc[bbox_mask]
+            if candidates.empty:
+                continue
+            matches = candidates.loc[candidates.geometry.intersects(query_geom_target)]
+            if matches.empty:
+                continue
+            if batch_size is None or batch_size <= 0 or len(matches) <= batch_size:
+                yield matches
+                continue
+            for offset in range(0, len(matches), batch_size):
+                yield matches.iloc[offset:offset + batch_size]

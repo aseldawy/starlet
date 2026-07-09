@@ -8,12 +8,17 @@ Tests cover:
 - Schema validation
 """
 import json
+import logging
+import struct
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import geopandas as gpd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyproj import Transformer
 from shapely.geometry import Point
 from shapely import wkb
 
@@ -22,10 +27,32 @@ from starlet._internal.tiling.datasource import (
     GeoJSONSplit,
     GeoParquetSource,
     GeoParquetSplit,
+    CSVSource,
+    GDBSource,
+    ShapefileSource,
+    _zip_gdb_member_dirs,
     read_spatial_sample,
-    _iter_geojson_xy,
+    source_for_path,
 )
+from starlet._internal.tiling.geojson_source import iter_geojson_xy
+from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
+
+
+def _linestring_wkb(coords):
+    data = bytearray(struct.pack("<BI", 1, 2))
+    data.extend(struct.pack("<I", len(coords)))
+    for x, y in coords:
+        data.extend(struct.pack("<dd", x, y))
+    return bytes(data)
+
+
+def _multicurve_wkb(lines):
+    data = bytearray(struct.pack("<BI", 1, 11))
+    data.extend(struct.pack("<I", len(lines)))
+    for coords in lines:
+        data.extend(_linestring_wkb(coords))
+    return bytes(data)
 
 
 class TestGeoParquetSource:
@@ -81,6 +108,81 @@ class TestGeoParquetSource:
         for table in source.iter_tables():
             assert table.column_names == ["geometry"]
             break
+
+    def test_detects_geoparquet_primary_geometry_column(self, temp_dir):
+        parquet_path = temp_dir / "shape_geom.parquet"
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "SHAPE",
+            "columns": {"SHAPE": {"encoding": "WKB", "crs": "EPSG:4326"}},
+        }
+        table = pa.table({
+            "id": [1],
+            "SHAPE": [wkb.dumps(Point(1, 2))],
+        }).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path), geometry_only=True)
+        result = next(source.iter_tables())
+
+        assert source.geom_col == "SHAPE"
+        assert result.column_names == ["SHAPE"]
+        assert wkb.loads(result["SHAPE"][0].as_py()).equals(Point(1, 2))
+
+    def test_geoparquet_spatial_sample_uses_detected_geometry_column(self, temp_dir):
+        parquet_path = temp_dir / "shape_sample.parquet"
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "SHAPE",
+            "columns": {"SHAPE": {"encoding": "WKB", "crs": "EPSG:4326"}},
+        }
+        table = pa.table({
+            "id": [1],
+            "SHAPE": [wkb.dumps(Point(1, 2))],
+        }).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path), geometry_only=True)
+        sample = _read_geoparquet_split_spatial_sample(
+            str(parquet_path),
+            source.create_splits()[0],
+            source.geom_col,
+            sample_ratio=1.0,
+            sample_cap=None,
+            seed=42,
+        )
+
+        assert sample.total_seen == 1
+        assert sample.mbr.getMinCoord(0) == pytest.approx(1)
+        assert sample.mbr.getMinCoord(1) == pytest.approx(2)
+
+    def test_geoparquet_source_preserves_native_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        table = pa.table({
+            "geometry": [wkb.dumps(Point(x, y))],
+            "id": [1],
+        })
+        geo = {
+            "version": "1.1.0",
+            "primary_column": "geometry",
+            "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:3857"}},
+        }
+        table = table.replace_schema_metadata({
+            b"geo": json.dumps(geo).encode("utf-8"),
+        })
+        parquet_path = temp_dir / "mercator.parquet"
+        pq.write_table(table, str(parquet_path))
+
+        source = GeoParquetSource(str(parquet_path))
+        result = next(source.iter_tables())
+        point = wkb.loads(result["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(result.schema.metadata[b"geo"].decode("utf-8"))
+        assert geo["columns"]["geometry"]["crs"] == "EPSG:3857"
 
     def test_multiple_row_groups(self, temp_dir, sample_polygons):
         """Test reading Parquet file with multiple row groups."""
@@ -322,6 +424,34 @@ class TestGeoJSONSource:
             '{"b":"2"}',
         ]
 
+    def test_geojson_null_first_batch_promotes_later_string_column(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"OLD_BLD_ID": None},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"OLD_BLD_ID": "B123"},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "null_then_string.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        source.schema()
+        tables = list(source.iter_tables())
+
+        assert pa.types.is_large_string(tables[-1].schema.field("OLD_BLD_ID").type)
+        assert tables[-1]["OLD_BLD_ID"].to_pylist() == ["B123"]
+
     def test_geojson_splits_read_independently_from_threads(self, temp_dir):
         """Test GeoJSON byte splits can be read independently by threads."""
         geojson = {
@@ -424,7 +554,6 @@ class TestGeoJSONSource:
             sample_ratio=1.0,
             seed=42,
             geojson_workers=1,
-            geojson_executor="thread",
         )
 
         assert spatial_sample.total_seen == 2
@@ -457,7 +586,6 @@ class TestGeoJSONSource:
             sample_ratio=1.0,
             seed=42,
             geojson_workers=4,
-            geojson_executor="thread",
         )
 
         assert spatial_sample.total_seen == 24
@@ -520,7 +648,7 @@ class TestGeoJSONSource:
             },
         }
 
-        assert list(_iter_geojson_xy(json.dumps(feature))) == [
+        assert list(iter_geojson_xy(json.dumps(feature))) == [
             (1.0, 2.0),
             (3.0, 4.0),
             (5.0, 6.0),
@@ -528,6 +656,236 @@ class TestGeoJSONSource:
             (9.0, 10.0),
             (7.0, 8.0),
         ]
+
+
+class TestCSVSource:
+    def test_xy_columns_are_converted_to_geometry(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["id", "x", "y", "geometry"]
+        assert tables[0]["id"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_byte_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text(
+            "id,x,y,name\n"
+            "1,0,1,alpha\n"
+            "2,2,3,beta\n"
+            "3,4,5,gamma\n"
+            "4,6,7,delta\n"
+        )
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        splits = source.create_splits(num_splits=5)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert ids == [1, 2, 3, 4]
+
+    def test_create_splits_does_not_open_csv(self, temp_dir, monkeypatch):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+
+        def fail_open(*args, **kwargs):
+            raise AssertionError("create_splits should not read CSV contents")
+
+        monkeypatch.setattr("builtins.open", fail_open)
+
+        splits = source.create_splits(num_splits=2)
+
+        assert splits
+        assert splits[0].offset == 0
+
+    def test_wkt_column_can_be_geometry_only(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,wkt\n1,POINT (0 1)\n2,POINT (2 3)\n")
+
+        source = CSVSource(str(csv_path), wkt_col="wkt", geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_source_for_path_detects_csv(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_col="x", csv_y_col="y")
+
+        assert isinstance(source, CSVSource)
+        assert next(source.iter_tables()).column_names[-1] == "geom"
+
+    def test_read_spatial_sample_uses_csv_geometry_columns(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_col="x",
+            csv_y_col="y",
+            source_workers=1,
+        )
+
+        assert sample.total_seen == 2
+        assert sample.total_sampled == 2
+        assert sample.sample_points.shape == (2, 2)
+
+    def test_csv_source_preserves_native_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        csv_path = temp_dir / "mercator_points.csv"
+        csv_path.write_text(f"id,x,y\n1,{x},{y}\n")
+
+        source = CSVSource(
+            str(csv_path),
+            x_col="x",
+            y_col="y",
+            src_crs="EPSG:3857",
+        )
+        table = next(source.iter_tables())
+        point = wkb.loads(table["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(table.schema.metadata[b"geo"].decode("utf-8"))
+        assert geo["columns"]["geometry"]["crs"] == "EPSG:3857"
+
+
+class TestShapefileSource:
+    def test_reads_shapefile_and_geometry_only_projection(self, temp_dir):
+        shp_path = temp_dir / "points.shp"
+        gdf = gpd.GeoDataFrame(
+            {"id": [1, 2], "name": ["a", "b"]},
+            geometry=[Point(0, 1), Point(2, 3)],
+            crs="EPSG:4326",
+        )
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = ShapefileSource(str(shp_path), geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_source_for_path_detects_shapefile(self, temp_dir):
+        shp_path = temp_dir / "points.shp"
+        gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[Point(0, 1)], crs="EPSG:4326")
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = source_for_path(str(shp_path))
+
+        assert isinstance(source, ShapefileSource)
+
+    def test_preserves_shapefile_source_crs(self, temp_dir):
+        lon, lat = -118.25, 34.05
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        x, y = transformer.transform(lon, lat)
+        shp_path = temp_dir / "mercator_points.shp"
+        gdf = gpd.GeoDataFrame(
+            {"id": [1]},
+            geometry=[Point(x, y)],
+            crs="EPSG:3857",
+        )
+        gdf.to_file(shp_path, engine="pyogrio")
+
+        source = ShapefileSource(str(shp_path), geometry_only=True)
+        table = next(source.iter_tables())
+        point = wkb.loads(table["geometry"][0].as_py())
+
+        assert point.x == pytest.approx(x)
+        assert point.y == pytest.approx(y)
+        geo = json.loads(table.schema.metadata[b"geo"].decode("utf-8"))
+        assert "3857" in str(geo["columns"]["geometry"]["crs"])
+
+    def test_linearizes_nonlinear_geometry_on_read_error(self, temp_dir, monkeypatch, caplog):
+        import pyogrio
+
+        shp_path = temp_dir / "curves.shp"
+        shp_path.touch()
+
+        def read_arrow_with_actual_multicurve(*args, **kwargs):
+            return (
+                {"geometry_name": "SHAPE", "fid_column": "OBJECTID"},
+                pa.table(
+                    {
+                        "OBJECTID": [123],
+                        "SHAPE": [_multicurve_wkb([[(0.0, 0.0), (1.0, 1.0)]])],
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["curves", "CurvePolygon"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "CurvePolygon",
+            },
+        )
+        monkeypatch.setattr(pyogrio, "read_arrow", read_arrow_with_actual_multicurve)
+
+        source = ShapefileSource(str(shp_path))
+
+        with caplog.at_level(logging.WARNING, logger="starlet._internal.tiling.vector_source"):
+            tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        geom = wkb.loads(tables[0]["geometry"][0].as_py())
+        assert geom.geom_type == "MultiLineString"
+        assert list(geom.geoms[0].coords) == [(0.0, 0.0), (1.0, 1.0)]
+        assert "curves.shp" in caplog.text
+        assert "layer='curves'" in caplog.text
+        assert "geometry_type=CurvePolygon" in caplog.text
+        assert "linearized_records=1" in caplog.text
+        assert "skip_features=0" in caplog.text
+
+
+class TestGDBSource:
+    def test_detects_gdb_directory_inside_zip(self, temp_dir):
+        zip_path = temp_dir / "Export.gdb.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        assert _zip_gdb_member_dirs(zip_path) == ["CAMS-Export.gdb"]
+
+    def test_source_for_path_detects_zipped_gdb(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        zip_path = temp_dir / "Export.gdb.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path.endswith("CAMS-Export.gdb")
 
 
 class TestDataSourceIntegration:

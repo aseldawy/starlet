@@ -2,9 +2,18 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import sys
 
 import click
+
+from starlet._internal.config import (
+    command_parallelism,
+    load_config,
+    parse_size_value,
+    resolve_command_value,
+    set_loaded_config,
+)
 
 
 def _setup_logging(log_level: str) -> None:
@@ -14,83 +23,111 @@ def _setup_logging(log_level: str) -> None:
     )
 
 
-_SIZE_SUFFIXES = {
-    "kb": 1024,
-    "mb": 1024 ** 2,
-    "gb": 1024 ** 3,
-    "tb": 1024 ** 4,
-}
+def _resolved_log_level(command: str, explicit: str | None) -> str:
+    return str(resolve_command_value(command, "log_level", explicit, default="INFO"))
 
 
-def _parse_size(raw: str) -> int:
-    s = raw.strip().lower()
-    if s.isdigit():
-        return int(s)
-    for suffix, mul in _SIZE_SUFFIXES.items():
-        if s.endswith(suffix):
-            num = s[: -len(suffix)].strip()
-            return int(float(num) * mul)
-    raise click.BadParameter(f"Invalid size: {raw}")
+def _format_zoom_counts(result: object) -> str:
+    counts = getattr(result, "tile_counts_by_zoom", None)
+    if counts:
+        counts_list = list(counts)
+        return f"{counts_list} total={sum(counts_list)}"
+    zoom_levels = getattr(result, "zoom_levels", None)
+    if zoom_levels:
+        return str(list(zoom_levels))
+    return "(no MVTs)"
 
 
 @click.group()
+@click.option(
+    "--config",
+    "config_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Path to a Starlet TOML config file.",
+)
+@click.pass_context
 @click.version_option(package_name="starlet")
-def main():
+def main(ctx: click.Context, config_path: str | None):
     """starlet — spatial tiling, MVT generation, and tile serving."""
+    config = load_config(config_path)
+    set_loaded_config(config, config_path)
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config_path
 
 
 @main.command()
-@click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
+@click.option("--input", "input_path", required=True, help="Path to a supported geospatial source.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
-@click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
-@click.option("--sort", default="zorder", show_default=True, type=click.Choice(["zorder", "hilbert", "columns", "none"]), help="Row sort order within each tile.")
-@click.option("--compression", default="zstd", show_default=True, help="Parquet compression codec.")
-@click.option("--sample-cap", type=int, default=10000, show_default=True, help="Reservoir sampling cap for centroids.")
-@click.option("--sample-ratio", type=float, default=1.0, show_default=True, help="Bernoulli sampling ratio (0 < r <= 1).")
+@click.option("--parallelism", type=int, default=None, help="Shared worker count used across tiling steps.")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary tiling files.")
+@click.option("--partition-size", default=None, help="Target partition size for tiling (e.g. 128mb).")
+@click.option("--sort", default=None, help="Row sort order within each tile.")
+@click.option("--compression", default=None, help="Parquet compression codec.")
+@click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
+@click.option("--sample-ratio", type=float, default=None, help="Bernoulli sampling ratio for centroids.")
+@click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
+@click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
+@click.option("--dtype", "histogram_dtype", default=None, help="Histogram data type.")
+@click.option("--sfc-bits", type=int, default=None, help="Bits per axis for Z-order / Hilbert key.")
 @click.option("--seed", type=int, default=42, show_default=True, help="Random seed for partitioner.")
 @click.option("--geom-col", default="geometry", show_default=True, help="Geometry column name.")
-@click.option("--sfc-bits", type=int, default=16, show_default=True, help="Bits per axis for Z-order key.")
-@click.option("--max-parallel-files", type=int, default=64, show_default=True, help="Max concurrent tile writes.")
-@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
-              help="Opt-in: write per-row bbox covering columns + bounded row groups for "
-                   "fast on-demand serving. Off by default (faster batch tiling, smaller files).")
-@click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
-@click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
-@click.option("--two-stage-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for the two-stage orchestrator.")
-@click.option("--two-stage-assignment-workers", type=int, default=None, help="Assignment workers for the two-stage orchestrator.")
-@click.option("--two-stage-write-workers", type=int, default=None, help="Write workers for the two-stage orchestrator.")
-@click.option("--two-stage-reducers", type=int, default=None, help="Hash-shuffle reducers for the two-stage orchestrator.")
-@click.option("--temp-dir", default=None, help="Parent directory for two-stage temporary shard files (default: ./tmp).")
-@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def tile(input_path, outdir, partition_size, sort, compression,
-         sample_cap, sample_ratio, seed, geom_col, sfc_bits, max_parallel_files,
-         covering_bbox, geojson_executor, orchestrator, two_stage_executor,
-         two_stage_assignment_workers, two_stage_write_workers, two_stage_reducers,
-         temp_dir, log_level):
+@click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
+@click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
+@click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
+@click.option("--covering-bbox/--no-covering-bbox", default=True, show_default=True,
+              help="Write per-row bbox covering columns + bounded row groups for "
+                   "fast on-demand serving. Use --no-covering-bbox to disable.")
+@click.option("--log-level", default=None, help="Logging level.")
+def tile(
+    input_path,
+    outdir,
+    parallelism,
+    temp_dir,
+    partition_size,
+    sort,
+    compression,
+    sample_cap,
+    sample_ratio,
+    csv_split_size,
+    grid_size,
+    histogram_dtype,
+    sfc_bits,
+    seed,
+    geom_col,
+    csv_x_col,
+    csv_y_col,
+    csv_wkt_col,
+    src_crs,
+    covering_bbox,
+    log_level,
+):
     """Partition a geospatial dataset into spatially-tiled Parquet files."""
-    _setup_logging(log_level)
+    _setup_logging(_resolved_log_level("tile", log_level))
     import starlet
 
     result = starlet.tile(
         input=input_path,
         outdir=outdir,
-        partition_size=_parse_size(partition_size) if partition_size else None,
-        sort=sort,
-        compression=compression,
-        sample_cap=sample_cap,
-        sample_ratio=sample_ratio,
+        parallelism=command_parallelism("tile", explicit=parallelism),
+        partition_size=parse_size_value(resolve_command_value("tile", "partition_size", partition_size, default=None)),
+        sort=str(resolve_command_value("tile", "sort", sort, default="zorder")),
+        compression=str(resolve_command_value("tile", "compression", compression, default="zstd")),
+        sample_cap=resolve_command_value("tile", "sample_cap", sample_cap, default=10_000),
+        sample_ratio=float(resolve_command_value("tile", "sample_ratio", sample_ratio, default=1.0)),
         seed=seed,
         geom_col=geom_col,
-        sfc_bits=sfc_bits,
-        max_parallel_files=max_parallel_files,
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size, default="32mb")),
+        src_crs=src_crs,
+        sfc_bits=int(resolve_command_value("tile", "sfc_bits", sfc_bits, default=16)),
         covering_bbox=covering_bbox,
-        geojson_executor=geojson_executor,
-        orchestrator=orchestrator,
-        two_stage_executor=two_stage_executor,
-        two_stage_assignment_workers=two_stage_assignment_workers,
-        two_stage_write_workers=two_stage_write_workers,
-        two_stage_reducers=two_stage_reducers,
-        temp_dir=temp_dir,
+        temp_dir=resolve_command_value("tile", "temp_dir", temp_dir, default=None),
+        grid_size=int(resolve_command_value("tile", "grid_size", grid_size, default=4096)),
+        histogram_dtype=str(resolve_command_value("tile", "dtype", histogram_dtype, default="float64")),
     )
     click.echo(f"Tiling complete: {result.num_files} tiles, {result.total_rows} rows")
     click.echo(f"  Output: {result.outdir}")
@@ -99,76 +136,157 @@ def tile(input_path, outdir, partition_size, sort, compression,
 
 @main.command()
 @click.option("--dir", "tile_dir", required=True, help="Dataset directory with parquet_tiles/ and histograms/.")
-@click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
-@click.option("--threshold", type=float, default=0, show_default=True, help="Minimum feature count per tile.")
+@click.option("--zoom", type=int, default=None, help="Maximum zoom level.")
 @click.option("--outdir", default=None, help="MVT output directory (default: <dir>/mvt/).")
-@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def mvt(tile_dir, zoom, threshold, outdir, log_level):
+@click.option("--threshold", type=float, default=None, help="Minimum feature threshold.")
+@click.option("--parallelism", type=int, default=None, help="Shared worker count used for MVT generation.")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary MVT files.")
+@click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
+@click.option("--extent", type=int, default=None, help="Vector tile extent.")
+@click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
+@click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
+@click.option("--pmtiles/--no-pmtiles", default=None, help="Export generated tiles to a PMTiles archive.")
+@click.option("--log-level", default=None, help="Logging level.")
+def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capacity, extent, buffer, pmtiles_compression, pmtiles, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
-    _setup_logging(log_level)
+    _setup_logging(_resolved_log_level("mvt", log_level))
     import starlet
 
     result = starlet.generate_mvt(
         tile_dir=tile_dir,
-        zoom=zoom,
-        threshold=threshold,
+        zoom=int(resolve_command_value("mvt", "zoom", zoom, default=7)),
+        threshold=float(resolve_command_value("mvt", "threshold", threshold, default=100_000)),
+        pmtiles=bool(resolve_command_value("mvt", "pmtiles", pmtiles, default=False)),
+        pmtiles_compression=str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression, default="gzip")),
         outdir=outdir,
+        temp_dir=resolve_command_value("mvt", "temp_dir", temp_dir, default=None),
+        parallelism=command_parallelism("mvt", explicit=parallelism),
+        feature_capacity=int(resolve_command_value("mvt", "feature_capacity", feature_capacity, default=10_000)),
+        extent=int(resolve_command_value("mvt", "extent", extent, default=4096)),
+        buffer=int(resolve_command_value("mvt", "buffer", buffer, default=256)),
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
-    click.echo(f"  Output: {result.outdir}")
-    click.echo(f"  Zoom levels: {result.zoom_levels}")
+    output_path = result.pmtiles_path if result.pmtiles_path and not Path(result.outdir).exists() else result.outdir
+    click.echo(f"  Output: {output_path}")
+    click.echo(f"  Zoom levels: {_format_zoom_counts(result)}")
+    if result.pmtiles_path:
+        click.echo(f"  PMTiles: {result.pmtiles_path}")
 
 
 @main.command()
-@click.option("--input", "input_path", required=True, help="Path to GeoParquet or GeoJSON file.")
+@click.option("--input", "input_path", required=True, help="Path to a supported geospatial source.")
 @click.option("--outdir", required=True, help="Output dataset directory.")
-@click.option("--zoom", type=int, default=7, show_default=True, help="Maximum zoom level.")
-@click.option("--partition-size", default=None, metavar="SIZE", help="Desired partition size (default: 512mb for GeoJSON, 128mb for GeoParquet).")
-@click.option("--threshold", type=float, default=100000, show_default=True, help="Minimum feature count per MVT tile.")
-@click.option("--covering-bbox/--no-covering-bbox", default=False, show_default=True,
-              help="Opt-in: write per-row bbox covering columns for fast on-demand serving.")
-@click.option("--geojson-executor", default="process", show_default=True, type=click.Choice(["process", "thread"]), help="Executor for GeoJSON spatial sampling (use 'thread' for small inputs).")
-@click.option("--orchestrator", default="two-stage", show_default=True, type=click.Choice(["round", "two-stage"]), help="Tiling orchestrator implementation.")
-@click.option("--pmtiles", is_flag=True, help="Export MVT tiles to PMTiles archive after generation.")
-@click.option("--pmtiles-compression", default="gzip", show_default=True, type=click.Choice(["gzip", "brotli", "zstd", "none"]), help="PMTiles compression format.")
-@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
-def build(input_path, outdir, zoom, partition_size, threshold, covering_bbox,
-          geojson_executor, orchestrator, pmtiles, pmtiles_compression, log_level):
+@click.option("--zoom", type=int, default=None, help="Maximum zoom level.")
+@click.option("--parallelism", type=int, default=None, help="Shared worker count used across build steps.")
+@click.option("--temp-dir", default=None, help="Parent directory for temporary build files.")
+@click.option("--partition-size", default=None, help="Target partition size for tiling (e.g. 128mb).")
+@click.option("--sort", default=None, help="Row sort order within each tile.")
+@click.option("--compression", default=None, help="Parquet compression codec.")
+@click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
+@click.option("--sample-ratio", type=float, default=None, help="Bernoulli sampling ratio for centroids.")
+@click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
+@click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
+@click.option("--dtype", "histogram_dtype", default=None, help="Histogram data type.")
+@click.option("--sfc-bits", type=int, default=None, help="Bits per axis for Z-order / Hilbert key.")
+@click.option("--threshold", type=float, default=None, help="Minimum feature threshold.")
+@click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
+@click.option("--extent", type=int, default=None, help="Vector tile extent.")
+@click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
+@click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
+@click.option("--covering-bbox/--no-covering-bbox", default=True, show_default=True,
+              help="Write per-row bbox covering columns for fast on-demand serving. "
+                   "Use --no-covering-bbox to disable.")
+@click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
+@click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
+@click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
+@click.option("--pmtiles/--no-pmtiles", default=None, help="Export MVT tiles to a PMTiles archive after generation.")
+@click.option("--log-level", default=None, help="Logging level.")
+def build(
+    input_path,
+    outdir,
+    zoom,
+    parallelism,
+    temp_dir,
+    partition_size,
+    sort,
+    compression,
+    sample_cap,
+    sample_ratio,
+    csv_split_size,
+    grid_size,
+    histogram_dtype,
+    sfc_bits,
+    threshold,
+    feature_capacity,
+    extent,
+    buffer,
+    pmtiles_compression,
+    covering_bbox,
+    csv_x_col,
+    csv_y_col,
+    csv_wkt_col,
+    src_crs,
+    pmtiles,
+    log_level,
+):
     """Run the full pipeline: tile then generate MVTs."""
-    _setup_logging(log_level)
+    _setup_logging(_resolved_log_level("build", log_level))
     import starlet
 
+    parallelism = command_parallelism("build", explicit=parallelism, fallback_sections=("tile", "mvt"))
     tile_result, mvt_result, pmtiles_path = starlet.build(
         input=input_path,
         outdir=outdir,
-        zoom=zoom,
-        partition_size=_parse_size(partition_size) if partition_size else None,
-        threshold=threshold,
+        zoom=int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",), default=7)),
+        partition_size=parse_size_value(resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",), default=None)),
+        threshold=float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",), default=100_000)),
+        pmtiles=bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",), default=False)),
+        pmtiles_compression=str(resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",), default="gzip")),
+        temp_dir=resolve_command_value("build", "temp_dir", temp_dir, default=None),
+        parallelism=parallelism,
+        feature_capacity=int(resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",), default=10_000)),
+        extent=int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",), default=4096)),
+        buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",), default=256)),
+        sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",), default="zorder")),
+        compression=str(resolve_command_value("build", "compression", compression, fallback_sections=("tile",), default="zstd")),
+        sample_cap=resolve_command_value("build", "sample_cap", sample_cap, fallback_sections=("tile",), default=10_000),
+        sample_ratio=float(resolve_command_value("build", "sample_ratio", sample_ratio, fallback_sections=("tile",), default=1.0)),
+        csv_x_col=csv_x_col,
+        csv_y_col=csv_y_col,
+        csv_wkt_col=csv_wkt_col,
+        csv_split_size=parse_size_value(resolve_command_value("build", "csv_split_size", csv_split_size, fallback_sections=("tile",), default="32mb")),
+        src_crs=src_crs,
+        sfc_bits=int(resolve_command_value("build", "sfc_bits", sfc_bits, fallback_sections=("tile",), default=16)),
         covering_bbox=covering_bbox,
-        geojson_executor=geojson_executor,
-        orchestrator=orchestrator,
-        pmtiles=pmtiles,
-        pmtiles_compression=pmtiles_compression,
+        grid_size=int(resolve_command_value("build", "grid_size", grid_size, fallback_sections=("tile",), default=4096)),
+        histogram_dtype=str(resolve_command_value("build", "dtype", histogram_dtype, fallback_sections=("tile",), default="float64")),
     )
-    click.echo(f"Build complete:")
+    click.echo("Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
-    click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {mvt_result.zoom_levels}")
+    click.echo(f"  MVTs: {mvt_result.tile_count} tiles across zoom levels {_format_zoom_counts(mvt_result)}")
     if pmtiles_path:
         click.echo(f"  PMTiles: {pmtiles_path}")
 
 
 @main.command()
 @click.option("--dir", "data_dir", required=True, help="Root directory containing dataset subdirectories.")
-@click.option("--host", default="0.0.0.0", show_default=True, help="Host to bind.")
-@click.option("--port", type=int, default=8765, show_default=True, help="Port to bind.")
-@click.option("--cache-size", type=int, default=256, show_default=True, help="In-memory tile cache size.")
-@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
+@click.option("--host", default=None, help="Server host.")
+@click.option("--port", type=int, default=None, help="Server port.")
+@click.option("--cache-size", type=int, default=None, help="Number of tiles to keep in the in-memory cache.")
+@click.option("--log-level", default=None, help="Logging level.")
 def serve(data_dir, host, port, cache_size, log_level):
     """Launch the tile server."""
-    _setup_logging(log_level)
+    _setup_logging(_resolved_log_level("serve", log_level))
     import starlet
 
-    app = starlet.create_app(data_dir=data_dir, cache_size=cache_size)
+    host = str(resolve_command_value("serve", "host", host, default="0.0.0.0"))
+    port = int(resolve_command_value("serve", "port", port, default=8765))
+    cache_size = int(resolve_command_value("serve", "cache_size", cache_size, default=256))
+    app = starlet.create_app(
+        data_dir=data_dir,
+        cache_size=cache_size,
+    )
     click.echo(f"Starting starlet server on {host}:{port}")
     click.echo(f"  Data root: {data_dir}")
     app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
@@ -179,7 +297,6 @@ def serve(data_dir, host, port, cache_size, log_level):
 def info(data_dir):
     """Print dataset metadata summary."""
     import starlet
-    from pathlib import Path
 
     try:
         ds = starlet.Dataset(data_dir)
@@ -190,13 +307,22 @@ def info(data_dir):
     click.echo(f"Dataset: {Path(data_dir).name}")
     click.echo(f"  Path:        {ds.path}")
     click.echo(f"  Tiles:       {ds.num_tiles}")
+    click.echo(f"  Parquet bbox:{'yes' if ds.parquet_has_bbox else 'no'}")
+    click.echo(f"  Parquet CRS: {ds.parquet_crs or '(unknown)'}")
     click.echo(f"  BBox:        {ds.bbox}")
-    click.echo(f"  Zoom levels: {ds.zoom_levels or '(no MVTs)'}")
+    tile_counts = ds.tile_counts_by_zoom
+    if tile_counts:
+        click.echo(f"  Zoom levels: {tile_counts} total={sum(tile_counts)}")
+    else:
+        click.echo("  Zoom levels: (no MVTs)")
     click.echo(f"  Histograms:  {'yes' if ds.has_histograms else 'no'}")
-    click.echo(f"  MVTs:        {'yes' if ds.has_mvt else 'no'}")
+    if ds.has_histograms:
+        click.echo(f"  Hist res:    {ds.histogram_resolution or '(unknown)'}")
+    click.echo(f"  MVTs:        {'yes' if (ds.has_mvt or ds.has_pmtiles) else 'no'}")
+    if tile_counts:
+        click.echo(f"  MVT count:   {sum(tile_counts)}")
     click.echo(f"  Stats:       {'yes' if ds.has_stats else 'no'}")
 
-    # Show total size
     total_bytes = sum(f.stat().st_size for f in Path(data_dir).rglob("*") if f.is_file())
     if total_bytes < 1024 ** 2:
         size_str = f"{total_bytes / 1024:.1f} KB"

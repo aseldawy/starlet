@@ -8,6 +8,7 @@ Tests cover:
 - GeometrySketch (MBR, type distribution, vertex counts)
 """
 import math
+from datetime import date, datetime
 import pytest
 import numpy as np
 from shapely.geometry import Point, LineString, Polygon, MultiPoint
@@ -18,6 +19,7 @@ from starlet._internal.stats.sketches import (
     NumericSketch,
     CategoricalSketch,
     TextSketch,
+    TemporalSketch,
     GeometrySketch,
     TOP_K,
 )
@@ -238,6 +240,40 @@ class TestTextSketch:
         result = sketch.finalize()
         # Should estimate ~3 distinct values
         assert 2 <= result['approx_distinct'] <= 5
+
+
+class TestTemporalSketch:
+    """Test temporal attribute statistics."""
+
+    def test_datetime_statistics(self):
+        sketch = TemporalSketch()
+        values = [
+            datetime(2024, 1, 2, 3, 4, 5),
+            None,
+            datetime(2024, 1, 1, 0, 0, 0),
+            datetime(2024, 1, 3, 0, 0, 0),
+        ]
+        sketch.update(values)
+
+        result = sketch.finalize()
+
+        assert result["non_null_count"] == 3
+        assert result["min"] == "2024-01-01T00:00:00"
+        assert result["max"] == "2024-01-03T00:00:00"
+        assert 2 <= result["approx_distinct"] <= 5
+
+    def test_date_merge(self):
+        first = TemporalSketch()
+        first.update([date(2024, 1, 2), date(2024, 1, 4)])
+        second = TemporalSketch()
+        second.update([date(2024, 1, 1)])
+
+        first.merge(second)
+        result = first.finalize()
+
+        assert result["non_null_count"] == 3
+        assert result["min"] == "2024-01-01"
+        assert result["max"] == "2024-01-04"
 
 
 class TestGeometrySketch:

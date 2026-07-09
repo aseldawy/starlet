@@ -35,6 +35,19 @@ Then open <http://localhost:8765> and pick your dataset to explore it on a map.
 
 Everything is available through the `starlet` CLI (`starlet --help`).
 
+## Configuration
+
+Starlet supports a TOML configuration file for settings you typically set once and reuse.
+Make a copy of the file [starlet.toml.example](starlet.toml.example) and named it `starlet.toml`.
+Full details are in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+The configurations in that file will be loaded by default when Starlet runs.
+You can also pass a file explicitly:
+
+```bash
+starlet --config /path/to/starlet.toml build --input data.parquet --outdir datasets/mydata
+```
+
+## Starlet CLI tools
 ### `starlet build` — full pipeline (tile + MVT)
 
 ```bash
@@ -49,6 +62,7 @@ starlet build --input data.parquet --outdir datasets/mydata --zoom 8
 | `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size, e.g. `256mb`, `1gb` |
 | `--threshold` | 100000 | Minimum feature count per MVT tile |
 | `--pmtiles` | off | Also export a single `.pmtiles` archive |
+| `--covering-bbox` | on | Write per-row bbox columns for faster on-demand serving |
 
 ### `starlet tile` — partition a dataset only
 
@@ -62,11 +76,10 @@ starlet tile --input data.parquet --outdir datasets/mydata
 | `--outdir` | (required) | Output dataset directory |
 | `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size; the number of tiles is derived from the input size |
 | `--sort` | zorder | Within-tile row order: `zorder`, `hilbert`, `columns`, `none` |
-| `--orchestrator` | two-stage | Tiling engine: `two-stage` (fast, map-reduce) or `round` |
-| `--geojson-executor` | process | `process` for large files, `thread` for small GeoJSON |
-| `--covering-bbox` | off | Write per-row bbox columns for faster on-demand serving |
+| `--covering-bbox` | on | Write per-row bbox columns for faster on-demand serving |
 | `--geom-col` | geometry | Geometry column name (e.g. `wkb_geometry` for OGR exports) |
 | `--compression` | zstd | Parquet compression codec |
+| `--seed` | 42 | Random seed for partitioning |
 
 ### `starlet mvt` — generate vector tiles from a tiled dataset
 
@@ -80,6 +93,7 @@ starlet mvt --dir datasets/mydata --zoom 7 --threshold 100000
 | `--zoom` | 7 | Maximum zoom level |
 | `--threshold` | 0 | Minimum feature count per tile |
 | `--outdir` | `<dir>/mvt/` | MVT output directory |
+| `--pmtiles` | config / off | Combinen all tiles in a single `.pmtiles` archive |
 
 ### `starlet serve` — launch the tile server
 
@@ -115,15 +129,15 @@ Once `starlet serve` is running:
 
 ## Notes & tips
 
-- **Big GeoJSON?** The default `process` executor parallelizes reading. For
-  small files (<10 MB) add `--geojson-executor thread` to skip process-pool
-  startup overhead.
 - **Geometry column** not named `geometry` (common with OGR/`pyogrio`
   exports)? Pass `--geom-col wkb_geometry`.
-- **Serving tiles on the fly** (zooming past the pre-generated levels)? Build
-  with `--covering-bbox` so the server can prune row groups at read time.
-- **One-file distribution:** `starlet build --pmtiles` writes a single
-  `datasets/mydata.pmtiles` archive alongside the dataset.
+- **Serving tiles on the fly** (zooming past the pre-generated levels)? The
+  default tiling output includes covering bbox columns so the server can prune
+  row groups at read time. Use `--no-covering-bbox` only when optimizing for
+  smaller Parquet files and batch generation speed.
+- **One-file distribution:** `starlet mvt --pmtiles` writes a single
+  `datasets/mydata/tiles.pmtiles` archive inside the dataset directory. `starlet build`
+  forwards the same setting to its MVT stage.
 
 ## Deploying a server
 

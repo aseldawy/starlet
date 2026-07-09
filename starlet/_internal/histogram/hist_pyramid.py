@@ -2,19 +2,18 @@ from __future__ import annotations
 
 import json
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from shapely import from_wkb
-from shapely.geometry import (
-    Point, LineString, LinearRing, Polygon,
-    MultiPoint, MultiLineString, MultiPolygon, GeometryCollection
-)
+from shapely import from_wkb, get_coordinates
 from pyproj import Transformer
 
+from starlet._internal.executor import create_process_executor
+from starlet._internal.tiling.crs import WGS84_CRS, geoparquet_crs
 from starlet._internal.tiling.datasource import GeoParquetSource
 
 logger = logging.getLogger(__name__)
@@ -33,41 +32,25 @@ class HistConfig:
     grid_size: int = 4096
     out_crs: str = "EPSG:3857"
     dtype: str = "float64"
-    max_parallel_tiles: int = 8
-    rg_parallel: int = 4
+    parallelism: int = 8
 
 
 # ---------------------------------------------------------------------------
 # GEOMETRY HELPERS
 # ---------------------------------------------------------------------------
 
-def _geometry_vertices_iter(g):
+def _geometry_vertices_array(g) -> np.ndarray:
     if g is None or g.is_empty:
-        return
+        return np.empty((0, 2), dtype=np.float64)
+    coords = get_coordinates(g)
+    if coords.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray(coords[:, :2], dtype=np.float64)
 
-    if isinstance(g, Point):
-        yield (g.x, g.y)
 
-    elif isinstance(g, (LineString, LinearRing)):
-        for x, y in g.coords:
-            yield (x, y)
-
-    elif isinstance(g, Polygon):
-        for x, y in g.exterior.coords:
-            yield (x, y)
-        for ring in g.interiors:
-            for x, y in ring.coords:
-                yield (x, y)
-
-    elif isinstance(g, (MultiPoint, MultiLineString, MultiPolygon, GeometryCollection)):
-        for sub in g.geoms:
-            yield from _geometry_vertices_iter(sub)
-
-    else:
-        coords = getattr(g, "coords", None)
-        if coords is not None:
-            for x, y in coords:
-                yield (x, y)
+def _geometry_vertices_iter(g):
+    for x, y in _geometry_vertices_array(g):
+        yield (float(x), float(y))
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +64,7 @@ def _accumulate_vertices_hist(
     bbox_out,
     transformer,
 ):
-    """Transform each vertex and increment its histogram cell in place."""
+    """Transform vertices in batches and increment histogram cells in place."""
     geoms = from_wkb(table[geom_col].to_numpy(zero_copy_only=False))
 
     minx, miny, maxx, maxy = bbox_out
@@ -89,29 +72,58 @@ def _accumulate_vertices_hist(
     inv_h = 1.0 / (maxy - miny)
     grid_size = histogram.shape[0]
 
-    for g in geoms:
-        if g is None or g.is_empty:
-            continue
+    coords = get_coordinates(geoms)
+    if coords.size == 0:
+        return
 
-        for x, y in _geometry_vertices_iter(g):
-            transformed_x, transformed_y = transformer.transform(x, y)
-            ix = int((transformed_x - minx) * inv_w * grid_size)
-            iy = int((transformed_y - miny) * inv_h * grid_size)
-            ix = min(max(ix, 0), grid_size - 1)
-            iy = min(max(iy, 0), grid_size - 1)
-            histogram[grid_size - 1 - iy, ix] += 1
+    coords = np.asarray(coords[:, :2], dtype=np.float64)
+    xs = coords[:, 0]
+    ys = coords[:, 1]
+    transformed_x, transformed_y = transformer.transform(xs, ys)
+    transformed_x = np.asarray(transformed_x, dtype=np.float64)
+    transformed_y = np.asarray(transformed_y, dtype=np.float64)
+    if transformed_x.ndim == 0:
+        transformed_x = np.full_like(xs, float(transformed_x))
+    if transformed_y.ndim == 0:
+        transformed_y = np.full_like(ys, float(transformed_y))
+
+    finite = np.isfinite(transformed_x) & np.isfinite(transformed_y)
+    skipped = int(finite.size - np.count_nonzero(finite))
+    if skipped:
+        logger.debug(
+            "Skipping %d histogram vertices with non-finite transformed coordinates",
+            skipped,
+        )
+
+    if not np.any(finite):
+        return
+
+    transformed_x = transformed_x[finite]
+    transformed_y = transformed_y[finite]
+    ix = ((transformed_x - minx) * inv_w * grid_size).astype(np.int64)
+    iy = ((transformed_y - miny) * inv_h * grid_size).astype(np.int64)
+    ix = np.clip(ix, 0, grid_size - 1)
+    iy = np.clip(iy, 0, grid_size - 1)
+    np.add.at(histogram, (grid_size - 1 - iy, ix), 1)
 
 
 # ---------------------------------------------------------------------------
 # PROCESS SPLIT GROUPS
 # ---------------------------------------------------------------------------
 
-def _split_groups(splits: Sequence, max_workers: int) -> List[List]:
-    """Divide splits into balanced, non-empty groups for worker processes."""
+def _effective_parallelism(max_workers: int | None, split_count: int) -> int:
+    if split_count <= 0:
+        return 1
+    if max_workers is None:
+        return max(1, min(split_count, os.cpu_count() or 1))
     if max_workers <= 0:
-        raise ValueError("hist_max_parallel must be positive")
+        raise ValueError("parallelism must be positive")
+    return min(int(max_workers), split_count)
 
-    worker_count = min(max_workers, len(splits))
+
+def _split_groups(splits: Sequence, max_workers: int | None) -> List[List]:
+    """Divide splits into balanced, non-empty groups for worker processes."""
+    worker_count = _effective_parallelism(max_workers, len(splits))
     base_size, remainder = divmod(len(splits), worker_count)
     groups: List[List] = []
     offset = 0
@@ -137,12 +149,17 @@ def _process_split_group(
         geom_col=geom_col,
     )
     dtype = np.dtype(cfg.dtype)
-    transformer = Transformer.from_crs("EPSG:4326", cfg.out_crs, always_xy=True)
     bbox = GLOBAL_BBOX
     base = np.zeros((cfg.grid_size, cfg.grid_size), dtype=dtype)
+    transformers = {}
 
     for split in splits:
         for table in source.iter_tables(split):
+            source_crs = geoparquet_crs(table.schema, geom_col) or WGS84_CRS
+            transformer = transformers.get(str(source_crs))
+            if transformer is None:
+                transformer = Transformer.from_crs(source_crs, cfg.out_crs, always_xy=True)
+                transformers[str(source_crs)] = transformer
             _accumulate_vertices_hist(
                 table.combine_chunks(),
                 base,
@@ -222,14 +239,12 @@ def build_histograms_for_dir(
     geom_col="geometry",
     grid_size=4096,
     dtype="float64",
-    hist_max_parallel=8,
-    hist_rg_parallel=4,
+    parallelism=8,
 ):
     cfg = HistConfig(
         grid_size=grid_size,
         dtype=dtype,
-        max_parallel_tiles=hist_max_parallel,
-        rg_parallel=hist_rg_parallel,
+        parallelism=parallelism,
     )
 
     source = GeoParquetSource(
@@ -246,14 +261,19 @@ def build_histograms_for_dir(
     outdir_p.mkdir(parents=True, exist_ok=True)
 
     tile_outputs = []
-    split_groups = _split_groups(splits, cfg.max_parallel_tiles)
+    worker_count = _effective_parallelism(cfg.parallelism, len(splits))
+    split_groups = _split_groups(splits, worker_count)
     logger.info(
         "Histogram computation: %d splits grouped into %d worker tasks",
         len(splits),
         len(split_groups),
     )
 
-    with ProcessPoolExecutor(max_workers=cfg.max_parallel_tiles) as ex:
+    with create_process_executor(
+        max_workers=worker_count,
+        logger=logger,
+        context="histogram construction",
+    ) as ex:
         futures = {
             ex.submit(_process_split_group, source.path, split_group, cfg, geom_col): split_group
             for split_group in split_groups

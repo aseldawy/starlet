@@ -5,6 +5,7 @@ assignment workers and merges them in the parent process. These tests verify
 that merging partial collectors yields the same result as a single pass.
 """
 import random
+from datetime import datetime, timedelta
 
 import pyarrow as pa
 from shapely import wkb
@@ -23,6 +24,10 @@ def _make_table(n, seed):
         "num": [random.randint(0, 500) for _ in range(n)],
         "cat": [random.choice(["a", "b", "c", "d"]) for _ in range(n)],
         "name": [random.choice(["alpha", "beta", "gamma"]) for _ in range(n)],
+        "observed_at": [
+            datetime(2024, 1, 1) + timedelta(hours=random.randint(0, 100))
+            for _ in range(n)
+        ],
     })
 
 
@@ -55,6 +60,9 @@ def test_merge_matches_single_pass():
     assert merged["num"]["approx_distinct"] == expected["num"]["approx_distinct"]
     assert merged["cat"]["non_null_count"] == expected["cat"]["non_null_count"]
     assert merged["cat"]["approx_distinct"] == expected["cat"]["approx_distinct"]
+    assert merged["observed_at"]["non_null_count"] == expected["observed_at"]["non_null_count"]
+    assert merged["observed_at"]["min"] == expected["observed_at"]["min"]
+    assert merged["observed_at"]["max"] == expected["observed_at"]["max"]
     assert merged["geometry"]["mbr"] == expected["geometry"]["mbr"]
     assert merged["geometry"]["total_points"] == expected["geometry"]["total_points"]
 
@@ -67,6 +75,48 @@ def test_merge_into_empty_adopts_other():
     empty.merge(other)
     merged = _by_name(empty.finalize())
     assert merged["num"]["non_null_count"] == 100
+
+
+def test_collector_promotes_null_placeholder_to_text_sketch():
+    null_table = pa.table({
+        "geometry": [wkb.dumps(Point(0, 0))],
+        "OLD_BLD_ID": pa.array([None], type=pa.null()),
+    })
+    text_table = pa.table({
+        "geometry": [wkb.dumps(Point(1, 1))],
+        "OLD_BLD_ID": pa.array(["B123"], type=pa.large_string()),
+    })
+
+    collector = AttributeStatsCollector(null_table.schema)
+    collector.consume_table(null_table)
+    collector.consume_table(text_table)
+
+    stats = _by_name(collector.finalize())["OLD_BLD_ID"]
+    assert stats["non_null_count"] == 1
+    assert stats["min_length"] == 4
+    assert stats["max_length"] == 4
+
+
+def test_merge_adopts_non_empty_text_sketch_over_empty_null_placeholder():
+    null_table = pa.table({
+        "geometry": [wkb.dumps(Point(0, 0))],
+        "OLD_BLD_ID": pa.array([None], type=pa.null()),
+    })
+    text_table = pa.table({
+        "geometry": [wkb.dumps(Point(1, 1))],
+        "OLD_BLD_ID": pa.array(["B123"], type=pa.large_string()),
+    })
+
+    left = AttributeStatsCollector(null_table.schema)
+    left.consume_table(null_table)
+    right = AttributeStatsCollector(text_table.schema)
+    right.consume_table(text_table)
+    left.merge(right)
+
+    stats = _by_name(left.finalize())["OLD_BLD_ID"]
+    assert stats["non_null_count"] == 1
+    assert stats["min_length"] == 4
+    assert stats["max_length"] == 4
 
 
 def test_merge_three_partials():

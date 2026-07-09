@@ -57,17 +57,30 @@ def create_app(
 
     def get_tiler(dataset: str) -> VectorTiler:
         if dataset not in tiler_cache:
-            tiler_cache[dataset] = VectorTiler(str(data_root / dataset), memory_cache_size=cache_size)
+            tiler_cache[dataset] = VectorTiler(
+                str(data_root / dataset),
+                memory_cache_size=cache_size,
+            )
         return tiler_cache[dataset]
 
     @app.get("/<dataset>/<int:z>/<int:x>/<int:y>.mvt")
     def serve_tile(dataset, z, x, y):
         t0 = perf_counter()
         tiler = get_tiler(dataset)
-        data = tiler.get_tile(z, x, y)
-        elapsed_ms = (perf_counter() - t0) * 1000
-        logger.info("[TileRequest] dataset=%s z=%d x=%d y=%d bytes=%d elapsed=%.1fms",
-                    dataset, z, x, y, len(data), elapsed_ms)
+        tile_info: dict[str, object] = {}
+        data = tiler.get_tile(z, x, y, output=tile_info)
+        elapsed_s = perf_counter() - t0
+        generation = tile_info.get("generation", "unknown")
+        logger.info(
+            "[TileRequest] %s/%d/%d/%d bytes=%d method=%s time=%.3fs",
+            dataset,
+            z,
+            x,
+            y,
+            len(data),
+            generation,
+            elapsed_s,
+        )
         return Response(data, mimetype="application/vnd.mapbox-vector-tile")
 
     @app.get("/api/datasets")

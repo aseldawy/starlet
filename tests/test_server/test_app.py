@@ -43,6 +43,25 @@ class TestApplicationFactory:
         app = create_app(str(temp_dir), cache_size=512)
         assert app is not None
 
+    def test_create_app_with_new_on_the_fly_implementation(self, temp_dir):
+        """Test app creation with the new on-demand tile generator."""
+        app = create_app(
+            str(temp_dir),
+            cache_size=128,
+            on_the_fly_implementation="new",
+            log_level="ERROR",
+        )
+        assert app is not None
+
+    def test_create_app_rejects_invalid_on_the_fly_implementation(self, temp_dir):
+        """Test app rejects unknown on-demand tile generators."""
+        with pytest.raises(ValueError):
+            create_app(
+                str(temp_dir),
+                on_the_fly_implementation="unknown",
+                log_level="ERROR",
+            )
+
     def test_cors_enabled(self, app):
         """Test that CORS is enabled for all routes."""
         # CORS extension should be registered

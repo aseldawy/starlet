@@ -13,6 +13,8 @@ import re
 from flask import Flask, Response, render_template, send_from_directory, request
 from flask_cors import CORS
 
+from starlet._internal.config import config_value, ensure_config_loaded
+
 from .tiler.tiler import VectorTiler
 from .download_service import DatasetFeatureService
 
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def create_app(
     data_dir: str,
-    cache_size: int = 256,
+    cache_size: int | None = None,
     log_level: Optional[str] = None,
 ) -> Flask:
     """Create and configure a Flask tile server application.
@@ -30,8 +32,9 @@ def create_app(
     ----------
     data_dir : str
         Root directory containing dataset subdirectories.
-    cache_size : int
-        Number of tiles to keep in the in-memory LRU cache.
+    cache_size : int, optional
+        Number of tiles to keep in the in-memory LRU cache. When omitted,
+        Starlet uses ``serve.cache_size`` from config, or the built-in default.
     log_level : str, optional
         Logging level (e.g. "INFO", "DEBUG"). Defaults to ``LOG_LEVEL`` env
         var or ``"INFO"``.
@@ -41,7 +44,14 @@ def create_app(
     Flask
         Configured Flask application ready to be served.
     """
-    level = log_level or os.environ.get("LOG_LEVEL", "INFO")
+    resolved_cache_size = cache_size
+    if resolved_cache_size is None:
+        resolved_cache_size = int(config_value("serve", "cache_size", 256) or 256)
+    level = (
+        log_level
+        or os.environ.get("LOG_LEVEL")
+        or str(config_value("global", "log_level", "INFO") or "INFO")
+    )
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -59,7 +69,7 @@ def create_app(
         if dataset not in tiler_cache:
             tiler_cache[dataset] = VectorTiler(
                 str(data_root / dataset),
-                memory_cache_size=cache_size,
+                memory_cache_size=resolved_cache_size,
             )
         return tiler_cache[dataset]
 

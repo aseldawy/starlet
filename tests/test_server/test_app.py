@@ -43,6 +43,51 @@ class TestApplicationFactory:
         app = create_app(str(temp_dir), cache_size=512)
         assert app is not None
 
+    def test_create_app_auto_loads_config_once(self, tmp_path, monkeypatch):
+        """Test app factory discovers starlet.toml once for library consumers."""
+        from starlet._internal.config import _reset_loaded_config_for_tests
+        from starlet._internal.server import app as server_app
+
+        _reset_loaded_config_for_tests()
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "starlet.toml").write_text(
+            """
+[serve]
+cache_size = 7
+""".strip()
+        )
+        data_dir = tmp_path / "datasets"
+        (data_dir / "sample").mkdir(parents=True)
+        cache_sizes = []
+
+        class FakeTiler:
+            def __init__(self, dataset_dir, memory_cache_size):
+                cache_sizes.append(memory_cache_size)
+
+            def get_tile(self, z, x, y, output=None):
+                return b"tile"
+
+        monkeypatch.setattr(server_app, "VectorTiler", FakeTiler)
+
+        try:
+            first_app = create_app(str(data_dir), log_level="ERROR")
+            first_response = first_app.test_client().get("/sample/0/0/0.mvt")
+            assert first_response.status_code == 200
+
+            (tmp_path / "starlet.toml").write_text(
+                """
+[serve]
+cache_size = 11
+""".strip()
+            )
+            second_app = create_app(str(data_dir), log_level="ERROR")
+            second_response = second_app.test_client().get("/sample/0/0/0.mvt")
+            assert second_response.status_code == 200
+
+            assert cache_sizes == [7, 7]
+        finally:
+            _reset_loaded_config_for_tests()
+
     def test_create_app_with_new_on_the_fly_implementation(self, temp_dir):
         """Test app creation with the new on-demand tile generator."""
         app = create_app(

@@ -2,6 +2,7 @@ import json
 import shutil
 import time
 import gzip
+import importlib
 
 import starlet
 from starlet.api import AsyncDatasetHandle
@@ -22,6 +23,76 @@ def test_process_wide_temp_dir_can_be_configured(temp_dir):
         assert custom_temp.is_dir()
     finally:
         starlet.set_temp_dir(str(previous) if previous is not None else None)
+
+
+def test_import_auto_loads_config_once(tmp_path, monkeypatch):
+    from starlet._internal.config import (
+        _reset_loaded_config_for_tests,
+        get_loaded_config_path,
+        get_temp_dir,
+    )
+
+    _reset_loaded_config_for_tests()
+    monkeypatch.chdir(tmp_path)
+    temp_root = tmp_path / "configured_tmp"
+    (tmp_path / "starlet.toml").write_text(
+        f"""
+[global]
+temp_dir = "{temp_root}"
+""".strip()
+    )
+
+    try:
+        importlib.reload(starlet)
+
+        assert get_loaded_config_path() == tmp_path / "starlet.toml"
+        assert get_temp_dir() == temp_root
+    finally:
+        _reset_loaded_config_for_tests()
+
+
+def test_build_forwards_configured_pmtiles_options(monkeypatch):
+    from types import SimpleNamespace
+
+    from starlet._internal.config import _reset_loaded_config_for_tests, set_loaded_config
+
+    _reset_loaded_config_for_tests()
+    set_loaded_config(
+        {
+            "global": {},
+            "tile": {},
+            "mvt": {
+                "zoom": 4,
+                "threshold": 3,
+                "pmtiles": True,
+                "pmtiles_compression": "brotli",
+            },
+            "build": {},
+            "serve": {},
+        }
+    )
+    captured = {}
+
+    def fake_tile(**kwargs):
+        return SimpleNamespace(outdir=kwargs["outdir"])
+
+    def fake_generate_mvt(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(pmtiles_path="dataset/tiles.pmtiles")
+
+    monkeypatch.setattr(starlet, "tile", fake_tile)
+    monkeypatch.setattr(starlet, "generate_mvt", fake_generate_mvt)
+
+    try:
+        _, _, pmtiles_path = starlet.build("input.geojson", "dataset")
+
+        assert captured["zoom"] == 4
+        assert captured["threshold"] == 3.0
+        assert captured["pmtiles"] is True
+        assert captured["pmtiles_compression"] == "brotli"
+        assert pmtiles_path == "dataset/tiles.pmtiles"
+    finally:
+        _reset_loaded_config_for_tests()
 
 
 def test_get_dataset_metadata(sample_dataset_dir):

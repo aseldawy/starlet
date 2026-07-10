@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import tempfile
+import threading
 import tomllib
 from typing import Any
 
@@ -44,6 +45,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _loaded_config: dict[str, Any] = deepcopy(DEFAULT_CONFIG)
 _loaded_config_path: Path | None = None
+_loaded_config_initialized = False
+_loaded_config_lock = threading.Lock()
 _temp_dir: Path | None = None
 
 
@@ -111,10 +114,22 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
 
 def set_loaded_config(config: dict[str, Any], path: str | Path | None = None) -> None:
     """Install process-wide Starlet configuration for the current session."""
-    global _loaded_config, _loaded_config_path
+    global _loaded_config, _loaded_config_path, _loaded_config_initialized
     _loaded_config = deepcopy(config)
     _loaded_config_path = Path(path) if path is not None else None
+    _loaded_config_initialized = True
     set_temp_dir(config_value("global", "temp_dir"))
+
+
+def ensure_config_loaded(path: str | Path | None = None) -> None:
+    """Load process-wide config once, if it has not already been installed."""
+    if _loaded_config_initialized:
+        return
+    with _loaded_config_lock:
+        if _loaded_config_initialized:
+            return
+        resolved_path = _resolve_config_path(path)
+        set_loaded_config(load_config(resolved_path), resolved_path)
 
 
 def get_loaded_config() -> dict[str, Any]:
@@ -125,6 +140,15 @@ def get_loaded_config() -> dict[str, Any]:
 def get_loaded_config_path() -> Path | None:
     """Return the path of the loaded config file, if any."""
     return _loaded_config_path
+
+
+def _reset_loaded_config_for_tests() -> None:
+    """Reset process-wide config state for isolated tests."""
+    global _loaded_config, _loaded_config_path, _loaded_config_initialized
+    _loaded_config = deepcopy(DEFAULT_CONFIG)
+    _loaded_config_path = None
+    _loaded_config_initialized = False
+    set_temp_dir(None)
 
 
 def config_value(section: str, key: str, fallback: Any = None) -> Any:

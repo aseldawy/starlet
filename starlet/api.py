@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
-from starlet._internal.config import config_value
+from starlet._internal.config import config_value, ensure_config_loaded
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
 
 if TYPE_CHECKING:

@@ -4,7 +4,15 @@ from __future__ import annotations
 from importlib.metadata import version
 __version__ = version("starlet")
 
+from starlet._internal.config import (
+    command_parallelism,
+    ensure_config_loaded,
+    parse_size_value,
+    resolve_command_value,
+)
 from starlet._types import TileResult, MVTResult, Dataset
+
+ensure_config_loaded()
 
 __all__ = [
     "tile",
@@ -42,22 +50,22 @@ def tile(
     *,
     parallelism: int | None = None,
     partition_size: int | None = None,
-    sort: str = "zorder",
-    compression: str = "zstd",
-    sample_cap: int | None = 10_000,
-    sample_ratio: float = 1.0,
-    seed: int = 42,
-    geom_col: str = "geometry",
-    sfc_bits: int = 16,
-    covering_bbox: bool = True,
+    sort: str | None = None,
+    compression: str | None = None,
+    sample_cap: int | None = None,
+    sample_ratio: float | None = None,
+    seed: int | None = None,
+    geom_col: str | None = None,
+    sfc_bits: int | None = None,
+    covering_bbox: bool | None = None,
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
-    csv_split_size: int = 32 * 1024 * 1024,
-    src_crs: str = "EPSG:4326",
+    csv_split_size: int | str | None = None,
+    src_crs: str | None = None,
     temp_dir: str | None = None,
-    grid_size: int = 4096,
-    histogram_dtype: str = "float64",
+    grid_size: int | None = None,
+    histogram_dtype: str | None = None,
 ) -> TileResult:
     """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
 
@@ -128,6 +136,21 @@ def tile(
     from starlet._internal.histogram.hist_pyramid import build_histograms_for_dir
 
     logger = logging.getLogger("starlet.tile")
+    parallelism = command_parallelism("tile", explicit=parallelism)
+    partition_size = parse_size_value(resolve_command_value("tile", "partition_size", partition_size, default=None))
+    sort = str(resolve_command_value("tile", "sort", sort, default="zorder"))
+    compression = str(resolve_command_value("tile", "compression", compression, default="zstd"))
+    sample_cap = resolve_command_value("tile", "sample_cap", sample_cap, default=10_000)
+    sample_ratio = float(resolve_command_value("tile", "sample_ratio", sample_ratio, default=1.0))
+    seed = int(seed if seed is not None else 42)
+    geom_col = str(geom_col or "geometry")
+    sfc_bits = int(resolve_command_value("tile", "sfc_bits", sfc_bits, default=16))
+    covering_bbox = bool(True if covering_bbox is None else covering_bbox)
+    csv_split_size = parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size, default="32mb"))
+    src_crs = str(src_crs or "EPSG:4326")
+    temp_dir = resolve_command_value("tile", "temp_dir", temp_dir, default=None)
+    grid_size = int(resolve_command_value("tile", "grid_size", grid_size, default=4096))
+    histogram_dtype = str(resolve_command_value("tile", "dtype", histogram_dtype, default="float64"))
 
     # Parse sort mode
     _sort_map = {
@@ -241,16 +264,16 @@ def tile(
 def generate_mvt(
     tile_dir: str,
     *,
-    zoom: int = 7,
-    threshold: float = 0,
-    pmtiles: bool = False,
-    pmtiles_compression: str = "gzip",
+    zoom: int | None = None,
+    threshold: float | None = None,
+    pmtiles: bool | None = None,
+    pmtiles_compression: str | None = None,
     outdir: str | None = None,
     parallelism: int | None = None,
     temp_dir: str | None = None,
-    feature_capacity: int = 10_000,
-    extent: int = 4096,
-    buffer: int = 256,
+    feature_capacity: int | None = None,
+    extent: int | None = None,
+    buffer: int | None = None,
 ) -> MVTResult:
     """Generate Mapbox Vector Tiles from a tiled dataset.
 
@@ -284,6 +307,16 @@ def generate_mvt(
     MVTResult
     """
     from pathlib import Path
+
+    zoom = int(resolve_command_value("mvt", "zoom", zoom, default=7))
+    threshold = float(resolve_command_value("mvt", "threshold", threshold, default=100_000))
+    pmtiles = bool(resolve_command_value("mvt", "pmtiles", pmtiles, default=False))
+    pmtiles_compression = str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression, default="gzip"))
+    parallelism = command_parallelism("mvt", explicit=parallelism)
+    temp_dir = resolve_command_value("mvt", "temp_dir", temp_dir, default=None)
+    feature_capacity = int(resolve_command_value("mvt", "feature_capacity", feature_capacity, default=10_000))
+    extent = int(resolve_command_value("mvt", "extent", extent, default=4096))
+    buffer = int(resolve_command_value("mvt", "buffer", buffer, default=256))
 
     if extent <= 0:
         raise ValueError("extent must be positive")
@@ -326,16 +359,16 @@ def build(
     input: str,
     outdir: str,
     *,
-    zoom: int = 7,
+    zoom: int | None = None,
     parallelism: int | None = None,
     partition_size: int | None = None,
-    threshold: float = 100_000,
-    pmtiles: bool = False,
-    pmtiles_compression: str = "gzip",
+    threshold: float | None = None,
+    pmtiles: bool | None = None,
+    pmtiles_compression: str | None = None,
     temp_dir: str | None = None,
-    feature_capacity: int = 10_000,
-    extent: int = 4096,
-    buffer: int = 256,
+    feature_capacity: int | None = None,
+    extent: int | None = None,
+    buffer: int | None = None,
     **tile_kwargs,
 ) -> tuple[TileResult, MVTResult, str | None]:
     """Run the full pipeline: tile then generate MVTs.
@@ -380,12 +413,83 @@ def build(
         Returns (tile_result, mvt_result, pmtiles_path).
         pmtiles_path is None if pmtiles=False.
     """
-    from pathlib import Path
-
     if "temp_dir" in tile_kwargs:
         if temp_dir is not None:
             raise ValueError("temp_dir was provided twice")
         temp_dir = tile_kwargs.pop("temp_dir")
+
+    parallelism = command_parallelism("build", explicit=parallelism, fallback_sections=("tile", "mvt"))
+    partition_size = parse_size_value(
+        resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",), default=None)
+    )
+    zoom = int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",), default=7))
+    threshold = float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",), default=100_000))
+    pmtiles = bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",), default=False))
+    pmtiles_compression = str(
+        resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",), default="gzip")
+    )
+    temp_dir = resolve_command_value("build", "temp_dir", temp_dir, default=None)
+    feature_capacity = int(
+        resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",), default=10_000)
+    )
+    extent = int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",), default=4096))
+    buffer = int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",), default=256))
+    tile_kwargs.setdefault(
+        "sort",
+        str(resolve_command_value("build", "sort", tile_kwargs.get("sort"), fallback_sections=("tile",), default="zorder")),
+    )
+    tile_kwargs.setdefault(
+        "compression",
+        str(
+            resolve_command_value(
+                "build",
+                "compression",
+                tile_kwargs.get("compression"),
+                fallback_sections=("tile",),
+                default="zstd",
+            )
+        ),
+    )
+    tile_kwargs.setdefault(
+        "sample_cap",
+        resolve_command_value("build", "sample_cap", tile_kwargs.get("sample_cap"), fallback_sections=("tile",), default=10_000),
+    )
+    tile_kwargs.setdefault(
+        "sample_ratio",
+        float(
+            resolve_command_value(
+                "build",
+                "sample_ratio",
+                tile_kwargs.get("sample_ratio"),
+                fallback_sections=("tile",),
+                default=1.0,
+            )
+        ),
+    )
+    tile_kwargs.setdefault(
+        "csv_split_size",
+        parse_size_value(
+            resolve_command_value(
+                "build",
+                "csv_split_size",
+                tile_kwargs.get("csv_split_size"),
+                fallback_sections=("tile",),
+                default="32mb",
+            )
+        ),
+    )
+    tile_kwargs.setdefault(
+        "sfc_bits",
+        int(resolve_command_value("build", "sfc_bits", tile_kwargs.get("sfc_bits"), fallback_sections=("tile",), default=16)),
+    )
+    tile_kwargs.setdefault(
+        "grid_size",
+        int(resolve_command_value("build", "grid_size", tile_kwargs.get("grid_size"), fallback_sections=("tile",), default=4096)),
+    )
+    tile_kwargs.setdefault(
+        "histogram_dtype",
+        str(resolve_command_value("build", "dtype", tile_kwargs.get("histogram_dtype"), fallback_sections=("tile",), default="float64")),
+    )
 
     tile_result = tile(
         input=input,
@@ -399,6 +503,8 @@ def build(
         tile_dir=outdir,
         zoom=zoom,
         threshold=threshold,
+        pmtiles=pmtiles,
+        pmtiles_compression=pmtiles_compression,
         temp_dir=temp_dir,
         parallelism=parallelism,
         feature_capacity=feature_capacity,
@@ -412,8 +518,8 @@ def build(
 def export_pmtiles(
     mvt_dir: str,
     output_path: str,
-    tile_type: str = "mvt",
-    compression: str = "gzip",
+    tile_type: str | None = None,
+    compression: str | None = None,
 ) -> str:
     """Export MVT tiles to PMTiles archive format.
 
@@ -445,12 +551,15 @@ def export_pmtiles(
     ... )
     """
     from starlet._internal.pmtiles.exporter import export_to_pmtiles
+
+    tile_type = tile_type or "mvt"
+    compression = compression or str(resolve_command_value("mvt", "pmtiles_compression", None, default="gzip"))
     return export_to_pmtiles(mvt_dir, output_path, tile_type, compression)
 
 
 def create_app(
     data_dir: str,
-    cache_size: int = 256,
+    cache_size: int | None = None,
 ):
     """Create a Flask tile server application.
 
@@ -458,8 +567,9 @@ def create_app(
     ----------
     data_dir : str
         Root directory containing dataset subdirectories.
-    cache_size : int
-        Number of tiles in the in-memory LRU cache.
+    cache_size : int, optional
+        Number of tiles in the in-memory LRU cache. When omitted, Starlet uses
+        the configured ``serve.cache_size`` value, or the built-in default.
     Returns
     -------
     Flask

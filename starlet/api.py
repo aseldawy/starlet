@@ -216,7 +216,6 @@ def query_dataset_count(
             dataset_dir,
             geometry,
             geometry_crs=geometry_crs,
-            geom_col=geom_col,
             batch_size=batch_size,
         )
     )

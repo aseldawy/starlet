@@ -10,6 +10,7 @@ bounding boxes.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import multiprocessing
 import os
@@ -254,15 +255,27 @@ def _finalize_one_tile(
 
     combined = _with_updated_geo_metadata(combined, bbox, config.geom_col)
 
-    # Encode bbox in filename for ParquetIndex spatial lookups
-    minx, miny, maxx, maxy = bbox
+    def encode_coord(val: float, *, is_min: bool) -> str:
+        """Encode one coordinate at microdegree precision.
 
-    def encode_coord(val):
-        int_part = int(val)
-        dec_part = abs(int((val - int_part) * 1000000))
-        return f"{int_part}_{dec_part}"
+        We round outward so the filename bbox encloses the tile contents instead
+        of shrinking inward and accidentally excluding rows during pruning.
+        """
+        scaled = val * 1_000_000
+        scaled_int = math.floor(scaled) if is_min else math.ceil(scaled)
+        sign = "-" if scaled_int < 0 else ""
+        scaled_abs = abs(int(scaled_int))
+        int_part, dec_part = divmod(scaled_abs, 1_000_000)
+        return f"{sign}{int_part}_{dec_part:06d}"
 
-    bbox_str = "_".join([encode_coord(c) for c in bbox])
+    bbox_str = "_".join(
+        [
+            encode_coord(bbox[0], is_min=True),
+            encode_coord(bbox[1], is_min=True),
+            encode_coord(bbox[2], is_min=False),
+            encode_coord(bbox[3], is_min=False),
+        ]
+    )
     filename = f"tile_{tile_id:06d}__{bbox_str}.parquet"
     out_path = os.path.join(config.outdir, filename)
     write_args = dict(config.pq_args)

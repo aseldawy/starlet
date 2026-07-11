@@ -173,11 +173,10 @@ class RSGroveAssigner:
         # Pre-compute centroids and sort by x for plane sweep.
         partition_ids: List[int] = [-1] * t.num_rows
         for i, g in enumerate(geoms):
+            if g is None or g.is_empty:
+                continue
             cx, cy = g.centroid.x, g.centroid.y
             partition_ids[i] = self._part.overlapPartition([cx, cy])
-
-        if any(pid == -1 for pid in partition_ids):
-            raise ValueError("Failed to assign partitions for all rows")
 
         out = pa.table({"partition_id": pa.array(partition_ids, type=pa.int32())})
         end_time = perf_counter()

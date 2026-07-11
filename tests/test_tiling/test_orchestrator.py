@@ -6,6 +6,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import pyarrow.parquet as pq
+from shapely.geometry import Point
+from shapely import wkb
 
 import starlet._internal.tiling.two_stage_orchestrator as two_stage_module
 from starlet._internal.tiling import (
@@ -18,6 +20,41 @@ from starlet._internal.tiling.RSGrove import EnvelopeNDLite
 
 class TestTwoStageOrchestrator:
     """Test the two-stage split assignment/write orchestrator."""
+
+    def test_rsgrove_assigner_skips_null_geometries(self):
+        mbr = EnvelopeNDLite(
+            np.array([0.0, 0.0], dtype=np.float64),
+            np.array([10.0, 10.0], dtype=np.float64),
+        )
+        assigner = RSGroveAssigner.from_sample_and_mbr(
+            sample_points=np.array([[1.0, 5.0], [1.0, 5.0]], dtype=np.float64),
+            mbr=mbr,
+            num_partitions=2,
+        )
+        table = pa.table(
+            {
+                "geometry": [None, wkb.dumps(Point(1.0, 1.0))],
+                "id": [1, 2],
+            }
+        )
+
+        partition_table = assigner.partition_by_tile(table)
+
+        assert partition_table["partition_id"].to_pylist()[0] == -1
+        assert partition_table["partition_id"].to_pylist()[1] >= 0
+
+    def test_group_table_by_reducer_drops_unassigned_rows(self):
+        table = pa.table(
+            {
+                "value": ["drop", "keep"],
+                "_tile_id": [-1, 3],
+            }
+        )
+
+        grouped = two_stage_module._group_table_by_reducer(table, num_reducers=2)
+
+        assert sorted(grouped) == [1]
+        assert grouped[1]["value"].to_pylist() == ["keep"]
 
     def test_merge_fan_in_retries_on_open_file_limit(self, monkeypatch, temp_dir):
         input_paths = [str(temp_dir / f"input_{index:02d}.parquet") for index in range(9)]

@@ -80,6 +80,8 @@ def _group_table_by_reducer(table: pa.Table, num_reducers: int) -> Dict[int, pa.
     pid_values = table[_TILE_COL].to_pylist()
     buckets: Dict[int, List[int]] = defaultdict(list)
     for row_index, partition_id in enumerate(pid_values):
+        if int(partition_id) < 0:
+            continue
         reducer_id = int(partition_id) % num_reducers
         buckets[reducer_id].append(row_index)
 

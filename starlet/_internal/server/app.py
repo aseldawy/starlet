@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 def create_app(
     data_dir: str,
     cache_size: int | None = None,
+    extent: int | None = None,
+    buffer: int | None = None,
+    on_the_fly_implementation: str | None = None,
     log_level: Optional[str] = None,
 ) -> Flask:
     """Create and configure a Flask tile server application.
@@ -35,6 +38,10 @@ def create_app(
     cache_size : int, optional
         Number of tiles to keep in the in-memory LRU cache. When omitted,
         Starlet uses ``serve.cache_size`` from config, or the built-in default.
+    extent : int, optional
+        Vector tile extent used for on-demand MVT generation.
+    buffer : int, optional
+        Vector tile buffer in extent units used for on-demand generation.
     log_level : str, optional
         Logging level (e.g. "INFO", "DEBUG"). Defaults to ``LOG_LEVEL`` env
         var or ``"INFO"``.
@@ -44,13 +51,23 @@ def create_app(
     Flask
         Configured Flask application ready to be served.
     """
+    ensure_config_loaded()
+    if on_the_fly_implementation not in {None, "new"}:
+        raise ValueError("on_the_fly_implementation must be 'new'")
+
     resolved_cache_size = cache_size
     if resolved_cache_size is None:
-        resolved_cache_size = int(config_value("serve", "cache_size", 256) or 256)
+        resolved_cache_size = int(config_value("serve", "cache_size"))
+    resolved_extent = extent
+    if resolved_extent is None:
+        resolved_extent = int(config_value("mvt", "extent"))
+    resolved_buffer = buffer
+    if resolved_buffer is None:
+        resolved_buffer = int(config_value("mvt", "buffer"))
     level = (
         log_level
         or os.environ.get("LOG_LEVEL")
-        or str(config_value("global", "log_level", "INFO") or "INFO")
+        or str(config_value("global", "log_level"))
     )
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -70,6 +87,8 @@ def create_app(
             tiler_cache[dataset] = VectorTiler(
                 str(data_root / dataset),
                 memory_cache_size=resolved_cache_size,
+                extent=resolved_extent,
+                buffer=resolved_buffer,
             )
         return tiler_cache[dataset]
 
@@ -78,7 +97,14 @@ def create_app(
         t0 = perf_counter()
         tiler = get_tiler(dataset)
         tile_info: dict[str, object] = {}
-        data = tiler.get_tile(z, x, y, output=tile_info)
+        try:
+            data = tiler.get_tile(z, x, y, output=tile_info)
+        except FileNotFoundError as e:
+            logger.warning("[TileRequest] %s/%d/%d/%d not found: %s", dataset, z, x, y, e)
+            return {"error": str(e)}, 404
+        except Exception as e:
+            logger.exception("[TileRequest] %s/%d/%d/%d failed", dataset, z, x, y)
+            return {"error": f"Internal error: {str(e)}"}, 500
         elapsed_s = perf_counter() - t0
         generation = tile_info.get("generation", "unknown")
         logger.info(

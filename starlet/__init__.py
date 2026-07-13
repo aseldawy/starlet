@@ -137,20 +137,20 @@ def tile(
 
     logger = logging.getLogger("starlet.tile")
     parallelism = command_parallelism("tile", explicit=parallelism)
-    partition_size = parse_size_value(resolve_command_value("tile", "partition_size", partition_size, default=None))
-    sort = str(resolve_command_value("tile", "sort", sort, default="zorder"))
-    compression = str(resolve_command_value("tile", "compression", compression, default="zstd"))
-    sample_cap = resolve_command_value("tile", "sample_cap", sample_cap, default=10_000)
-    sample_ratio = float(resolve_command_value("tile", "sample_ratio", sample_ratio, default=1.0))
+    partition_size = parse_size_value(resolve_command_value("tile", "partition_size", partition_size))
+    sort = str(resolve_command_value("tile", "sort", sort))
+    compression = str(resolve_command_value("tile", "compression", compression))
+    sample_cap = resolve_command_value("tile", "sample_cap", sample_cap)
+    sample_ratio = float(resolve_command_value("tile", "sample_ratio", sample_ratio))
     seed = int(seed if seed is not None else 42)
     geom_col = str(geom_col or "geometry")
-    sfc_bits = int(resolve_command_value("tile", "sfc_bits", sfc_bits, default=16))
+    sfc_bits = int(resolve_command_value("tile", "sfc_bits", sfc_bits))
     covering_bbox = bool(True if covering_bbox is None else covering_bbox)
-    csv_split_size = parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size, default="32mb"))
+    csv_split_size = parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size))
     src_crs = str(src_crs or "EPSG:4326")
-    temp_dir = resolve_command_value("tile", "temp_dir", temp_dir, default=None)
-    grid_size = int(resolve_command_value("tile", "grid_size", grid_size, default=4096))
-    histogram_dtype = str(resolve_command_value("tile", "dtype", histogram_dtype, default="float64"))
+    temp_dir = resolve_command_value("tile", "temp_dir", temp_dir)
+    grid_size = int(resolve_command_value("tile", "grid_size", grid_size))
+    histogram_dtype = str(resolve_command_value("tile", "dtype", histogram_dtype))
 
     # Parse sort mode
     _sort_map = {
@@ -308,15 +308,15 @@ def generate_mvt(
     """
     from pathlib import Path
 
-    zoom = int(resolve_command_value("mvt", "zoom", zoom, default=7))
-    threshold = float(resolve_command_value("mvt", "threshold", threshold, default=100_000))
-    pmtiles = bool(resolve_command_value("mvt", "pmtiles", pmtiles, default=False))
-    pmtiles_compression = str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression, default="gzip"))
+    zoom = int(resolve_command_value("mvt", "zoom", zoom))
+    threshold = float(resolve_command_value("mvt", "threshold", threshold))
+    pmtiles = bool(resolve_command_value("mvt", "pmtiles", pmtiles))
+    pmtiles_compression = str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression))
     parallelism = command_parallelism("mvt", explicit=parallelism)
-    temp_dir = resolve_command_value("mvt", "temp_dir", temp_dir, default=None)
-    feature_capacity = int(resolve_command_value("mvt", "feature_capacity", feature_capacity, default=10_000))
-    extent = int(resolve_command_value("mvt", "extent", extent, default=4096))
-    buffer = int(resolve_command_value("mvt", "buffer", buffer, default=256))
+    temp_dir = resolve_command_value("mvt", "temp_dir", temp_dir)
+    feature_capacity = int(resolve_command_value("mvt", "feature_capacity", feature_capacity))
+    extent = int(resolve_command_value("mvt", "extent", extent))
+    buffer = int(resolve_command_value("mvt", "buffer", buffer))
 
     if extent <= 0:
         raise ValueError("extent must be positive")
@@ -420,23 +420,23 @@ def build(
 
     parallelism = command_parallelism("build", explicit=parallelism, fallback_sections=("tile", "mvt"))
     partition_size = parse_size_value(
-        resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",), default=None)
+        resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",))
     )
-    zoom = int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",), default=7))
-    threshold = float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",), default=100_000))
-    pmtiles = bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",), default=False))
+    zoom = int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",)))
+    threshold = float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",)))
+    pmtiles = bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",)))
     pmtiles_compression = str(
-        resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",), default="gzip")
+        resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",))
     )
-    temp_dir = resolve_command_value("build", "temp_dir", temp_dir, default=None)
+    temp_dir = resolve_command_value("build", "temp_dir", temp_dir)
     feature_capacity = int(
-        resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",), default=10_000)
+        resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))
     )
-    extent = int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",), default=4096))
-    buffer = int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",), default=256))
+    extent = int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",)))
+    buffer = int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",)))
     tile_kwargs.setdefault(
         "sort",
-        str(resolve_command_value("build", "sort", tile_kwargs.get("sort"), fallback_sections=("tile",), default="zorder")),
+        str(resolve_command_value("build", "sort", tile_kwargs.get("sort"), fallback_sections=("tile",))),
     )
     tile_kwargs.setdefault(
         "compression",
@@ -446,13 +446,12 @@ def build(
                 "compression",
                 tile_kwargs.get("compression"),
                 fallback_sections=("tile",),
-                default="zstd",
             )
         ),
     )
     tile_kwargs.setdefault(
         "sample_cap",
-        resolve_command_value("build", "sample_cap", tile_kwargs.get("sample_cap"), fallback_sections=("tile",), default=10_000),
+        resolve_command_value("build", "sample_cap", tile_kwargs.get("sample_cap"), fallback_sections=("tile",)),
     )
     tile_kwargs.setdefault(
         "sample_ratio",
@@ -462,7 +461,6 @@ def build(
                 "sample_ratio",
                 tile_kwargs.get("sample_ratio"),
                 fallback_sections=("tile",),
-                default=1.0,
             )
         ),
     )
@@ -474,21 +472,20 @@ def build(
                 "csv_split_size",
                 tile_kwargs.get("csv_split_size"),
                 fallback_sections=("tile",),
-                default="32mb",
             )
         ),
     )
     tile_kwargs.setdefault(
         "sfc_bits",
-        int(resolve_command_value("build", "sfc_bits", tile_kwargs.get("sfc_bits"), fallback_sections=("tile",), default=16)),
+        int(resolve_command_value("build", "sfc_bits", tile_kwargs.get("sfc_bits"), fallback_sections=("tile",))),
     )
     tile_kwargs.setdefault(
         "grid_size",
-        int(resolve_command_value("build", "grid_size", tile_kwargs.get("grid_size"), fallback_sections=("tile",), default=4096)),
+        int(resolve_command_value("build", "grid_size", tile_kwargs.get("grid_size"), fallback_sections=("tile",))),
     )
     tile_kwargs.setdefault(
         "histogram_dtype",
-        str(resolve_command_value("build", "dtype", tile_kwargs.get("histogram_dtype"), fallback_sections=("tile",), default="float64")),
+        str(resolve_command_value("build", "dtype", tile_kwargs.get("histogram_dtype"), fallback_sections=("tile",))),
     )
 
     tile_result = tile(
@@ -553,13 +550,15 @@ def export_pmtiles(
     from starlet._internal.pmtiles.exporter import export_to_pmtiles
 
     tile_type = tile_type or "mvt"
-    compression = compression or str(resolve_command_value("mvt", "pmtiles_compression", None, default="gzip"))
+    compression = compression or str(resolve_command_value("mvt", "pmtiles_compression", None))
     return export_to_pmtiles(mvt_dir, output_path, tile_type, compression)
 
 
 def create_app(
     data_dir: str,
     cache_size: int | None = None,
+    extent: int | None = None,
+    buffer: int | None = None,
 ):
     """Create a Flask tile server application.
 
@@ -579,6 +578,8 @@ def create_app(
     return _create_app(
         data_dir=data_dir,
         cache_size=cache_size,
+        extent=extent,
+        buffer=buffer,
     )
 
 

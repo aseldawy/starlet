@@ -54,15 +54,23 @@ class TestApplicationFactory:
             """
 [serve]
 cache_size = 7
+
+[mvt]
+extent = 512
+buffer = 8
 """.strip()
         )
         data_dir = tmp_path / "datasets"
         (data_dir / "sample").mkdir(parents=True)
         cache_sizes = []
+        extents = []
+        buffers = []
 
         class FakeTiler:
-            def __init__(self, dataset_dir, memory_cache_size):
+            def __init__(self, dataset_dir, memory_cache_size, extent, buffer):
                 cache_sizes.append(memory_cache_size)
+                extents.append(extent)
+                buffers.append(buffer)
 
             def get_tile(self, z, x, y, output=None):
                 return b"tile"
@@ -85,6 +93,8 @@ cache_size = 11
             assert second_response.status_code == 200
 
             assert cache_sizes == [7, 7]
+            assert extents == [512, 512]
+            assert buffers == [8, 8]
         finally:
             _reset_loaded_config_for_tests()
 

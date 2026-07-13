@@ -35,16 +35,25 @@ class VectorTiler:
     def __init__(
         self,
         dataset_root: str,
-        memory_cache_size: int = 256,
+        memory_cache_size: int | None = None,
+        extent: int | None = None,
+        buffer: int | None = None,
+        feature_capacity: int | None = None,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.mvt_dir = self.dataset_root / "mvt"
         self.pmtiles_path = discover_pmtiles_path(self.dataset_root)
+        self.extent = int(extent if extent is not None else config_value("mvt", "extent"))
+        self.buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
+        self.feature_capacity = int(
+            feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
+        )
         self._pmtiles_file = None
         self._pmtiles_reader = None
         self._pmtiles_header = None
 
-        self.cache = TileCache(memory_cache_size)
+        cache_size = memory_cache_size if memory_cache_size is not None else config_value("serve", "cache_size")
+        self.cache = TileCache(int(cache_size))
 
     def tile_path(self, z: int, x: int, y: int) -> Path:
         return self.mvt_dir / str(z) / str(x) / f"{y}.mvt"
@@ -85,7 +94,8 @@ class VectorTiler:
             logger.debug("[Cache] HIT pmtiles z=%d x=%d y=%d elapsed=%.1fms", z, x, y, elapsed_ms)
             _update_output(
                 output,
-                generation="pmtile",
+                source="pmtiles",
+                generation="read_from_pmtiles",
                 path=str(self.pmtiles_path),
                 elapsed_ms=elapsed_ms,
             )
@@ -100,7 +110,8 @@ class VectorTiler:
             logger.debug("[Cache] HIT disk z=%d x=%d y=%d elapsed=%.1fms", z, x, y, elapsed_ms)
             _update_output(
                 output,
-                generation="mvt",
+                source="disk",
+                generation="read_from_disk",
                 path=str(path),
                 elapsed_ms=elapsed_ms,
             )
@@ -110,16 +121,20 @@ class VectorTiler:
         from starlet._internal.mvt.mvt_generator import generate_single_mvt_tile
 
         t0 = perf_counter()
-        feature_capacity = int(config_value("mvt", "feature_capacity", 10_000) or 10_000)
         tile_bytes = generate_single_mvt_tile(
             str(self.dataset_root),
             (z, x, y),
-            feature_capacity=feature_capacity,
+            feature_capacity=self.feature_capacity,
+            extent=self.extent,
+            buffer=self.buffer,
         )
         _update_output(
             output,
+            source="generated",
             generation="generated",
-            feature_capacity=feature_capacity,
+            feature_capacity=self.feature_capacity,
+            extent=self.extent,
+            buffer=self.buffer,
             elapsed_ms=(perf_counter() - t0) * 1000,
         )
 

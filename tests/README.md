@@ -132,20 +132,9 @@ Tests for MVT helper functions:
 
 Tests for tile assignment with priority sampling:
 
-- **TestNonemptyTileDetection**: Histogram-based nonempty tile detection
-- **TestAutoZoomDetection**: Auto-detection of maximum useful zoom level (IMPORTANT)
-- **TestGeometryAssignment**: Priority-based geometry assignment
-- **TestBucketOutput**: Output format validation
-- **TestEdgeCases**: Boundary geometries, empty geometries
-
-#### `test_renderer.py`
-
-Tests for MVT tile rendering:
-
-- **TestTileRenderer**: Tile rendering and MVT encoding
-- **TestGeometryTransformation**: Coordinate transformation to tile space
-- **TestErrorHandling**: Invalid geometry handling
-- **TestEdgeCases**: Edge cases (zoom 0, high zoom, directory creation)
+- **test_pyramid_partitioner.py**: Pyramid tile assignment and histogram filtering
+- **test_intermediate_tile.py**: Intermediate tile sampling, merge, clipping, and encoding
+- **test_dataset_generator.py**: Dataset-to-MVT generation helpers and on-demand tile generation
 
 #### `test_generator.py`
 

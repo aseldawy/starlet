@@ -22,7 +22,7 @@ import shapely
 from shapely import from_wkb
 
 from starlet._internal.histogram.loader import HistogramLoader
-from starlet._internal.config import resolve_temp_dir
+from starlet._internal.config import config_value, resolve_temp_dir
 from starlet._internal.mvt.helpers import (
     WORLD_MAXX,
     WORLD_MAXY,
@@ -99,9 +99,9 @@ class DatasetMVTGenerator:
         pmtiles_path: str | None = None,
         pmtiles_compression: str = "gzip",
         workers: int | None = None,
-        feature_capacity: int = 10_000,
-        extent: int = 4096,
-        buffer: int = 256,
+        feature_capacity: int | None = None,
+        extent: int | None = None,
+        buffer: int | None = None,
         geom_col: str = "geometry",
         seed: int = 42,
         temp_dir: str | None = None,
@@ -117,9 +117,11 @@ class DatasetMVTGenerator:
         self.pmtiles_compression = pmtiles_compression
         cpu_default = max(1, multiprocessing.cpu_count() - 1)
         self.workers = max(1, int(workers or cpu_default))
-        self.feature_capacity = int(feature_capacity)
-        self.extent = int(extent)
-        self.buffer = int(buffer)
+        self.feature_capacity = int(
+            feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
+        )
+        self.extent = int(extent if extent is not None else config_value("mvt", "extent"))
+        self.buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
         self.partition_buffer = float(self.buffer) / float(self.extent)
         self.geom_col = geom_col
         self.seed = int(seed)
@@ -372,12 +374,17 @@ def generate_single_mvt_tile(
     dataset_path: str,
     tile_id: tuple[int, int, int],
     *,
-    feature_capacity: int = 10_000,
-    extent: int = 4096,
-    buffer: int = 256,
+    feature_capacity: int | None = None,
+    extent: int | None = None,
+    buffer: int | None = None,
     layer_name: str = "layer0",
 ) -> bytes:
     """Generate one MVT tile directly from an indexed Starlet dataset."""
+    feature_capacity = int(
+        feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
+    )
+    extent = int(extent if extent is not None else config_value("mvt", "extent"))
+    buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
     dataset_dir = Path(dataset_path)
     parquet_dir = dataset_dir / "parquet_tiles"
     if not parquet_dir.is_dir():

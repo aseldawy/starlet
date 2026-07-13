@@ -83,7 +83,7 @@ def check_starlet_imports():
     modules_to_check = [
         "starlet._internal.tiling.RSGrove",
         "starlet._internal.mvt.helpers",
-        "starlet._internal.mvt.assigner",
+        "starlet._internal.mvt.mvt_generator",
         "starlet._internal.stats.sketches",
     ]
 

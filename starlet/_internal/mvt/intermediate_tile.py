@@ -162,7 +162,8 @@ class IntermediateVectorTile:
     def merge(self, other: "IntermediateVectorTile") -> None:
         """Merge another tile with the same z/x/y using an exact count split."""
         # Verify that both tiles have the same location
-        assert (self.z, self.x, self.y) == (other.z, other.x, other.y), "Cannot merge intermediate tiles with different tile IDs"
+        if (self.z, self.x, self.y) != (other.z, other.x, other.y):
+            raise ValueError("Cannot merge intermediate tiles with different tile IDs")
         total_seen = self._features_seen + other._features_seen
 
         if total_seen <= self.feature_capacity:
@@ -260,7 +261,10 @@ class IntermediateVectorTile:
             "features": self._mvt_features(),
             "extent": self.extent,
         }
-        result =  mapbox_vector_tile.encode([layer])
+        result = mapbox_vector_tile.encode(
+            [layer],
+            default_options={"extents": self.extent},
+        )
         return result
 
     def _mvt_features(self) -> list[dict[str, Any]]:

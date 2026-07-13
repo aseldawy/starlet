@@ -21,7 +21,7 @@ PHI_MAX = 2 * math.atan(math.exp(math.pi)) - math.pi / 2
 LIM = 6378137.0 * math.log(math.tan(math.pi / 4 + PHI_MAX / 2))
 GLOBAL_BBOX: BBox = (-LIM, -LIM, LIM, LIM)
 
-_TILER_CACHE: dict[tuple[str, int], Any] = {}
+_TILER_CACHE: dict[tuple[str, int, int, int, int], Any] = {}
 _TILER_CACHE_LOCK = threading.Lock()
 _INTERNAL_QUERY_COLUMNS = frozenset((
     "_tile_id",
@@ -33,21 +33,42 @@ _INTERNAL_QUERY_COLUMNS = frozenset((
 
 
 def _configured_tiler_cache_size() -> int:
-    value = config_value("serve", "cache_size", 256)
-    return int(value if value is not None else 256)
+    ensure_config_loaded()
+    return int(config_value("serve", "cache_size"))
+
+
+def _configured_tiler_extent() -> int:
+    return int(config_value("mvt", "extent"))
+
+
+def _configured_tiler_buffer() -> int:
+    return int(config_value("mvt", "buffer"))
+
+
+def _configured_tiler_feature_capacity() -> int:
+    return int(config_value("mvt", "feature_capacity"))
 
 
 def _get_cached_vector_tiler(dataset_dir: str | Path) -> Any:
     from starlet._internal.server.tiler.tiler import VectorTiler
 
-    dataset_path = str(Path(dataset_dir).resolve())
+    dataset_path = str(Path(dataset_dir).absolute())
     cache_size = _configured_tiler_cache_size()
-    key = (dataset_path, cache_size)
+    extent = _configured_tiler_extent()
+    buffer = _configured_tiler_buffer()
+    feature_capacity = _configured_tiler_feature_capacity()
+    key = (dataset_path, cache_size, extent, buffer, feature_capacity)
 
     with _TILER_CACHE_LOCK:
         tiler = _TILER_CACHE.get(key)
         if tiler is None:
-            tiler = VectorTiler(dataset_path, memory_cache_size=cache_size)
+            tiler = VectorTiler(
+                dataset_path,
+                memory_cache_size=cache_size,
+                extent=extent,
+                buffer=buffer,
+                feature_capacity=feature_capacity,
+            )
             _TILER_CACHE[key] = tiler
         return tiler
 
@@ -59,7 +80,11 @@ def list_datasets(datasets_dir: str | Path) -> list[str]:
         return []
     if not root.is_dir():
         raise NotADirectoryError(f"Datasets path is not a directory: {root}")
-    return sorted(child.name for child in root.iterdir() if child.is_dir())
+    return sorted(
+        child.name
+        for child in root.iterdir()
+        if child.is_dir() and (child / "parquet_tiles").is_dir()
+    )
 
 
 def get_tile(
@@ -235,7 +260,6 @@ def query_dataset_size(
         dataset_dir,
         geometry,
         geometry_crs=geometry_crs,
-        geom_col=geom_col,
         batch_size=batch_size,
     ):
         total += _estimate_batch_size(batch)

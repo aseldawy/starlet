@@ -7,7 +7,6 @@ from pyproj import Transformer
 from shapely.geometry import box
 
 LIM = 20037508.342789244
-EXTENT = 4096
 
 tf_3857_to_4326 = Transformer.from_crs(3857, 4326, always_xy=True)
 tf_4326_to_3857 = Transformer.from_crs(4326, 3857, always_xy=True)
@@ -41,8 +40,13 @@ class TileBounds:
         return lon1, lat1, lon2, lat2
 
     @staticmethod
-    def scale_to_tile_coords(xx: float, yy: float, bbox_3857: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    def scale_to_tile_coords(
+        xx: float,
+        yy: float,
+        bbox_3857: Tuple[float, float, float, float],
+        extent: int = 4096,
+    ) -> Tuple[float, float]:
         minx, miny, maxx, maxy = bbox_3857
-        xs = (xx - minx) / (maxx - minx) * EXTENT
-        ys = (yy - miny) / (maxy - miny) * EXTENT
+        xs = (xx - minx) / (maxx - minx) * extent
+        ys = (yy - miny) / (maxy - miny) * extent
         return xs, ys

@@ -3,9 +3,9 @@
 Tests cover:
 - BucketMVTGenerator initialization
 - Histogram loading
-- Tile assignment orchestration
-- Rendering orchestration
-- Integration with TileAssigner and TileRenderer
+- Tile partitioning orchestration
+- MVT generation orchestration
+- Integration with the current intermediate-tile pipeline
 """
 import pytest
 from pathlib import Path

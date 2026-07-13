@@ -24,7 +24,7 @@ def _setup_logging(log_level: str) -> None:
 
 
 def _resolved_log_level(command: str, explicit: str | None) -> str:
-    return str(resolve_command_value(command, "log_level", explicit, default="INFO"))
+    return str(resolve_command_value(command, "log_level", explicit))
 
 
 def _format_zoom_counts(result: object) -> str:
@@ -111,23 +111,23 @@ def tile(
         input=input_path,
         outdir=outdir,
         parallelism=command_parallelism("tile", explicit=parallelism),
-        partition_size=parse_size_value(resolve_command_value("tile", "partition_size", partition_size, default=None)),
-        sort=str(resolve_command_value("tile", "sort", sort, default="zorder")),
-        compression=str(resolve_command_value("tile", "compression", compression, default="zstd")),
-        sample_cap=resolve_command_value("tile", "sample_cap", sample_cap, default=10_000),
-        sample_ratio=float(resolve_command_value("tile", "sample_ratio", sample_ratio, default=1.0)),
+        partition_size=parse_size_value(resolve_command_value("tile", "partition_size", partition_size)),
+        sort=str(resolve_command_value("tile", "sort", sort)),
+        compression=str(resolve_command_value("tile", "compression", compression)),
+        sample_cap=resolve_command_value("tile", "sample_cap", sample_cap),
+        sample_ratio=float(resolve_command_value("tile", "sample_ratio", sample_ratio)),
         seed=seed,
         geom_col=geom_col,
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
-        csv_split_size=parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size, default="32mb")),
+        csv_split_size=parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size)),
         src_crs=src_crs,
-        sfc_bits=int(resolve_command_value("tile", "sfc_bits", sfc_bits, default=16)),
+        sfc_bits=int(resolve_command_value("tile", "sfc_bits", sfc_bits)),
         covering_bbox=covering_bbox,
-        temp_dir=resolve_command_value("tile", "temp_dir", temp_dir, default=None),
-        grid_size=int(resolve_command_value("tile", "grid_size", grid_size, default=4096)),
-        histogram_dtype=str(resolve_command_value("tile", "dtype", histogram_dtype, default="float64")),
+        temp_dir=resolve_command_value("tile", "temp_dir", temp_dir),
+        grid_size=int(resolve_command_value("tile", "grid_size", grid_size)),
+        histogram_dtype=str(resolve_command_value("tile", "dtype", histogram_dtype)),
     )
     click.echo(f"Tiling complete: {result.num_files} tiles, {result.total_rows} rows")
     click.echo(f"  Output: {result.outdir}")
@@ -154,16 +154,16 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
 
     result = starlet.generate_mvt(
         tile_dir=tile_dir,
-        zoom=int(resolve_command_value("mvt", "zoom", zoom, default=7)),
-        threshold=float(resolve_command_value("mvt", "threshold", threshold, default=100_000)),
-        pmtiles=bool(resolve_command_value("mvt", "pmtiles", pmtiles, default=False)),
-        pmtiles_compression=str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression, default="gzip")),
+        zoom=int(resolve_command_value("mvt", "zoom", zoom)),
+        threshold=float(resolve_command_value("mvt", "threshold", threshold)),
+        pmtiles=bool(resolve_command_value("mvt", "pmtiles", pmtiles)),
+        pmtiles_compression=str(resolve_command_value("mvt", "pmtiles_compression", pmtiles_compression)),
         outdir=outdir,
-        temp_dir=resolve_command_value("mvt", "temp_dir", temp_dir, default=None),
+        temp_dir=resolve_command_value("mvt", "temp_dir", temp_dir),
         parallelism=command_parallelism("mvt", explicit=parallelism),
-        feature_capacity=int(resolve_command_value("mvt", "feature_capacity", feature_capacity, default=10_000)),
-        extent=int(resolve_command_value("mvt", "extent", extent, default=4096)),
-        buffer=int(resolve_command_value("mvt", "buffer", buffer, default=256)),
+        feature_capacity=int(resolve_command_value("mvt", "feature_capacity", feature_capacity)),
+        extent=int(resolve_command_value("mvt", "extent", extent)),
+        buffer=int(resolve_command_value("mvt", "buffer", buffer)),
     )
     click.echo(f"MVT generation complete: {result.tile_count} tiles")
     output_path = result.pmtiles_path if result.pmtiles_path and not Path(result.outdir).exists() else result.outdir
@@ -238,29 +238,29 @@ def build(
     tile_result, mvt_result, pmtiles_path = starlet.build(
         input=input_path,
         outdir=outdir,
-        zoom=int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",), default=7)),
-        partition_size=parse_size_value(resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",), default=None)),
-        threshold=float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",), default=100_000)),
-        pmtiles=bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",), default=False)),
-        pmtiles_compression=str(resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",), default="gzip")),
-        temp_dir=resolve_command_value("build", "temp_dir", temp_dir, default=None),
+        zoom=int(resolve_command_value("build", "zoom", zoom, fallback_sections=("mvt",))),
+        partition_size=parse_size_value(resolve_command_value("build", "partition_size", partition_size, fallback_sections=("tile",))),
+        threshold=float(resolve_command_value("build", "threshold", threshold, fallback_sections=("mvt",))),
+        pmtiles=bool(resolve_command_value("build", "pmtiles", pmtiles, fallback_sections=("mvt",))),
+        pmtiles_compression=str(resolve_command_value("build", "pmtiles_compression", pmtiles_compression, fallback_sections=("mvt",))),
+        temp_dir=resolve_command_value("build", "temp_dir", temp_dir),
         parallelism=parallelism,
-        feature_capacity=int(resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",), default=10_000)),
-        extent=int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",), default=4096)),
-        buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",), default=256)),
-        sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",), default="zorder")),
-        compression=str(resolve_command_value("build", "compression", compression, fallback_sections=("tile",), default="zstd")),
-        sample_cap=resolve_command_value("build", "sample_cap", sample_cap, fallback_sections=("tile",), default=10_000),
-        sample_ratio=float(resolve_command_value("build", "sample_ratio", sample_ratio, fallback_sections=("tile",), default=1.0)),
+        feature_capacity=int(resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))),
+        extent=int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",))),
+        buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",))),
+        sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",))),
+        compression=str(resolve_command_value("build", "compression", compression, fallback_sections=("tile",))),
+        sample_cap=resolve_command_value("build", "sample_cap", sample_cap, fallback_sections=("tile",)),
+        sample_ratio=float(resolve_command_value("build", "sample_ratio", sample_ratio, fallback_sections=("tile",))),
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
-        csv_split_size=parse_size_value(resolve_command_value("build", "csv_split_size", csv_split_size, fallback_sections=("tile",), default="32mb")),
+        csv_split_size=parse_size_value(resolve_command_value("build", "csv_split_size", csv_split_size, fallback_sections=("tile",))),
         src_crs=src_crs,
-        sfc_bits=int(resolve_command_value("build", "sfc_bits", sfc_bits, fallback_sections=("tile",), default=16)),
+        sfc_bits=int(resolve_command_value("build", "sfc_bits", sfc_bits, fallback_sections=("tile",))),
         covering_bbox=covering_bbox,
-        grid_size=int(resolve_command_value("build", "grid_size", grid_size, fallback_sections=("tile",), default=4096)),
-        histogram_dtype=str(resolve_command_value("build", "dtype", histogram_dtype, fallback_sections=("tile",), default="float64")),
+        grid_size=int(resolve_command_value("build", "grid_size", grid_size, fallback_sections=("tile",))),
+        histogram_dtype=str(resolve_command_value("build", "dtype", histogram_dtype, fallback_sections=("tile",))),
     )
     click.echo("Build complete:")
     click.echo(f"  Tiles: {tile_result.num_files} files, {tile_result.total_rows} rows")
@@ -280,9 +280,9 @@ def serve(data_dir, host, port, cache_size, log_level):
     _setup_logging(_resolved_log_level("serve", log_level))
     import starlet
 
-    host = str(resolve_command_value("serve", "host", host, default="0.0.0.0"))
-    port = int(resolve_command_value("serve", "port", port, default=8765))
-    cache_size = int(resolve_command_value("serve", "cache_size", cache_size, default=256))
+    host = str(resolve_command_value("serve", "host", host))
+    port = int(resolve_command_value("serve", "port", port))
+    cache_size = int(resolve_command_value("serve", "cache_size", cache_size))
     app = starlet.create_app(
         data_dir=data_dir,
         cache_size=cache_size,

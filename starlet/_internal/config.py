@@ -115,7 +115,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
 def set_loaded_config(config: dict[str, Any], path: str | Path | None = None) -> None:
     """Install process-wide Starlet configuration for the current session."""
     global _loaded_config, _loaded_config_path, _loaded_config_initialized
-    _loaded_config = deepcopy(config)
+    merged = default_config()
+    _deep_update(merged, config)
+    _loaded_config = merged
     _loaded_config_path = Path(path) if path is not None else None
     _loaded_config_initialized = True
     set_temp_dir(config_value("global", "temp_dir"))
@@ -162,9 +164,8 @@ def resolve_command_value(
     explicit: Any,
     *,
     fallback_sections: tuple[str, ...] = (),
-    default: Any = None,
 ) -> Any:
-    """Resolve one option using CLI, then config sections, then defaults."""
+    """Resolve one option using CLI, then loaded config sections."""
     if explicit is not None:
         return explicit
 
@@ -172,7 +173,7 @@ def resolve_command_value(
         section_values = _loaded_config.get(section) or {}
         if key in section_values and section_values[key] is not None:
             return section_values[key]
-    return default
+    return None
 
 
 def command_parallelism(
@@ -188,7 +189,6 @@ def command_parallelism(
         "global",
         "parallelism",
         explicit,
-        default=None,
     )
     if value is None:
         return None

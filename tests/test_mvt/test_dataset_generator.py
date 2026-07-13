@@ -151,6 +151,41 @@ def test_generate_single_mvt_tile_queries_buffered_tile_bounds(tmp_path):
     assert features[0]["properties"] == {"id": 9}
 
 
+def test_generate_single_mvt_tile_honors_custom_extent(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(0.0, 0.0))],
+            "id": [7],
+            "_bbox_xmin": [0.0],
+            "_bbox_ymin": [0.0],
+            "_bbox_xmax": [0.0],
+            "_bbox_ymax": [0.0],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__0_0_0_0_0_0_0.parquet",
+    )
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (0, 0, 0),
+        feature_capacity=10,
+        extent=256,
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["extent"] == 256
+
+
 def test_single_tile_sampling_decodes_only_retained_rows(monkeypatch, tmp_path):
     parquet_dir = tmp_path / "dataset" / "parquet_tiles"
     parquet_dir.mkdir(parents=True)

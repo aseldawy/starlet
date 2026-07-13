@@ -108,4 +108,5 @@ The CLI now expects most persistent tuning values to come from config:
   command line and loads the rest from config, forwarding MVT-related settings
   to the MVT stage.
 - `starlet serve` keeps the dataset root on the command line and loads host,
-  port, and cache settings from config.
+  port, and cache settings from config. On-demand MVT generation reuses
+  `[mvt].extent`.

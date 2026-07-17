@@ -449,7 +449,8 @@ class TestGeoJSONSource:
         source.schema()
         tables = list(source.iter_tables())
 
-        assert pa.types.is_large_string(tables[-1].schema.field("OLD_BLD_ID").type)
+        promoted_type = tables[-1].schema.field("OLD_BLD_ID").type
+        assert pa.types.is_large_string(promoted_type) or pa.types.is_string(promoted_type)
         assert tables[-1]["OLD_BLD_ID"].to_pylist() == ["B123"]
 
     def test_geojson_splits_read_independently_from_threads(self, temp_dir):

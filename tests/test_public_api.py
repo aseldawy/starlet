@@ -6,6 +6,7 @@ import importlib
 
 import starlet
 from starlet.api import AsyncDatasetHandle
+from starlet._internal.server.download_service import DatasetFeatureService
 
 
 def test_list_datasets(sample_dataset_dir):
@@ -23,6 +24,64 @@ def test_process_wide_temp_dir_can_be_configured(temp_dir):
         assert custom_temp.is_dir()
     finally:
         starlet.set_temp_dir(str(previous) if previous is not None else None)
+
+
+def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path):
+    source = tmp_path / "cemetery_tags.geojson"
+    dataset = tmp_path / "cemetery_dataset"
+    source.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": 1,
+                            "tagsMap": {
+                                "landuse": "cemetery",
+                                "type": "multipolygon",
+                            },
+                        },
+                        "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "id": 2,
+                            "tagsMap": {"name": "Oak Hill"},
+                        },
+                        "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    starlet.tile(str(source), str(dataset), partition_size=1, parallelism=1)
+
+    body = "".join(
+        DatasetFeatureService(tmp_path).get_features_stream("cemetery_dataset", "geojson")
+    )
+    exported = json.loads(body)
+    tags = [feature["properties"]["tagsMap"] for feature in exported["features"]]
+
+    assert {"landuse": "cemetery", "type": "multipolygon"} in tags
+    assert {"name": "Oak Hill"} in tags
+
+    sample = DatasetFeatureService(tmp_path).get_sample_record(
+        "cemetery_dataset",
+        "-1,-1,2,2",
+        include_geometry=True,
+    )
+    assert sample is not None
+    assert isinstance(sample["properties"]["tagsMap"], dict)
+
+    public_sample = starlet.get_sample_record(dataset, (-1, -1, 2, 2))
+    assert public_sample is not None
+    assert isinstance(public_sample["tagsMap"], dict)
+    assert public_sample["tagsMap"] in tags
 
 
 def test_import_auto_loads_config_once(tmp_path, monkeypatch):

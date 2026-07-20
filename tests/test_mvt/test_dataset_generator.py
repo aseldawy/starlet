@@ -15,7 +15,6 @@ from starlet._internal.mvt.mvt_generator import (
     _group_splits,
     _group_table_batches,
     _positive_bounds_tuple,
-    _property_value,
     _sample_single_tile_records,
     _single_tile_index_cache,
     _single_tile_parquet_index,
@@ -67,13 +66,6 @@ def test_positive_bounds_tuple_expands_zero_sized_bounds():
     assert maxy > miny
 
 
-def test_property_value_keeps_simple_scalars_and_stringifies_complex_values():
-    assert _property_value("x") == "x"
-    assert _property_value(10) == 10
-    assert _property_value(1.5) == 1.5
-    assert _property_value(("a", "b")) == "('a', 'b')"
-
-
 def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
     dataset_dir = tmp_path / "dataset"
     parquet_dir = dataset_dir / "parquet_tiles"
@@ -111,6 +103,48 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
     features = decoded["layer0"]["features"]
     assert len(features) == 1
     assert features[0]["properties"] == {"id": 1}
+
+
+def test_generate_single_mvt_tile_flattens_nested_map_properties(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "id": [1],
+            "tagsMap": pa.array(
+                [[("name", "Oak Hill"), ("landuse", "cemetery")]],
+                type=pa.map_(pa.string(), pa.string()),
+            ),
+            "_bbox_xmin": [-100.0],
+            "_bbox_ymin": [80.0],
+            "_bbox_xmax": [-100.0],
+            "_bbox_ymax": [80.0],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {
+        "id": 1,
+        "tagsMap.name": "Oak Hill",
+        "tagsMap.landuse": "cemetery",
+    }
 
 
 def test_generate_single_mvt_tile_queries_buffered_tile_bounds(tmp_path):

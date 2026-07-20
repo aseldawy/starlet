@@ -482,7 +482,7 @@ def _row_attrs(table: pa.Table, geom_col: str, row_idx: int) -> dict[str, Any]:
             continue
         value = table[column][row_idx].as_py()
         if value is not None:
-            attrs[column] = _property_value(value)
+            attrs[column] = value
     return attrs
 
 
@@ -524,11 +524,7 @@ def _sample_single_tile_records_legacy(
     return [
         (
             geom,
-            {
-                column: _property_value(values[row_idx])
-                for column, values in col_arrays.items()
-                if values[row_idx] is not None
-            },
+            _attrs_for_row(col_arrays, row_idx),
             priority,
         )
         for (priority, _, geom, col_arrays, row_idx) in heap
@@ -618,11 +614,7 @@ def _iter_web_mercator_features(table: Any, geom_col: str) -> Iterable[tuple[Any
     for index, geom in enumerate(geometries):
         if geom is None or geom.is_empty:
             continue
-        attrs = {
-            column: _property_value(values[index])
-            for column, values in attrs_by_column.items()
-            if values[index] is not None
-        }
+        attrs = _attrs_for_row(attrs_by_column, index)
         # Priority from the *source* WKB bytes: identical for this feature in
         # every tile/zoom it touches (and in the on-demand serving sampler),
         # which is what makes sampling seam-consistent.
@@ -638,10 +630,12 @@ def _positive_bounds_tuple(bounds: tuple[float, float, float, float]) -> tuple[f
     return minx, miny, maxx, maxy
 
 
-def _property_value(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)
+def _attrs_for_row(attrs_by_column: dict[str, Any], row_idx: int) -> dict[str, Any]:
+    return {
+        column: values[row_idx]
+        for column, values in attrs_by_column.items()
+        if values[row_idx] is not None
+    }
 
 
 def _group_splits(splits: Sequence[GeoParquetSplit], num_groups: int) -> list[list[GeoParquetSplit]]:

@@ -280,7 +280,10 @@ def get_sample_record(
         batch_size=1,
     ):
         if not batch.empty:
-            record = batch.iloc[0].to_dict()
+            record = {
+                key: _record_property_value(value)
+                for key, value in batch.iloc[0].to_dict().items()
+            }
             for column in _INTERNAL_QUERY_COLUMNS:
                 record.pop(column, None)
             return record
@@ -531,6 +534,23 @@ def _drop_internal_query_columns(batch: "gpd.GeoDataFrame") -> "gpd.GeoDataFrame
     if not columns:
         return batch
     return batch.drop(columns=columns)
+
+
+def _record_property_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _record_property_value(item) for key, item in value.items()}
+    if _is_map_entries(value):
+        return {key: _record_property_value(item_value) for key, item_value in value}
+    if isinstance(value, list):
+        return [_record_property_value(item) for item in value]
+    return value
+
+
+def _is_map_entries(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
 
 
 def _normalize_stats(stats: dict[str, Any]) -> dict[str, Any]:

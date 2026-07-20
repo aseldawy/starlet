@@ -77,6 +77,50 @@ def test_add_feature_delays_simplification_until_features_are_requested():
     assert mapbox_vector_tile.decode(tile.encode())["layer0"]["features"][0]["properties"] == {"id": 1}
 
 
+def test_encode_flattens_nested_properties_for_mvt_only():
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    properties = {
+        "id": 1,
+        "tagsMap": {"name": "Oak Hill", "landuse": "cemetery"},
+        "metadata": {"source": "osm", "nested": {"rank": 2}},
+    }
+
+    assert tile.add_feature(Point(0, 0), properties)
+    assert tile._features[0].properties == properties
+
+    decoded = mapbox_vector_tile.decode(tile.encode())["layer0"]["features"][0]["properties"]
+    assert decoded == {
+        "id": 1,
+        "tagsMap.name": "Oak Hill",
+        "tagsMap.landuse": "cemetery",
+        "metadata.source": "osm",
+        "metadata.nested.rank": 2,
+    }
+
+
+def test_encode_flattens_loaded_arrow_map_properties_for_mvt_only(tmp_path):
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    properties = {
+        "tagsMap": [("name", "Oak Hill"), ("landuse", "cemetery")],
+    }
+
+    assert tile.add_feature(Point(0, 0), properties)
+    path = tmp_path / "tile.arrow"
+    tile.write_features(path)
+
+    loaded = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    loaded.load_features(path)
+    assert loaded._features[0].properties == {
+        "tagsMap": [["name", "Oak Hill"], ["landuse", "cemetery"]]
+    }
+
+    decoded = mapbox_vector_tile.decode(loaded.encode())["layer0"]["features"][0]["properties"]
+    assert decoded == {
+        "tagsMap.name": "Oak Hill",
+        "tagsMap.landuse": "cemetery",
+    }
+
+
 def test_feature_can_be_skipped_by_lower_priority():
     tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1)
     assert tile.add_feature(Point(0, 0), {"id": 1}, priority=10)

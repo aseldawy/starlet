@@ -21,6 +21,7 @@ from starlet._internal.tiling.datasource import (
     _attach_geoparquet_metadata,
     _combine_spatial_samples,
     _normalize_decimal_columns,
+    _properties_dataframe_to_arrow_table,
     _reservoir_add,
     _spatial_sample_from_state,
     _split_sample_cap,
@@ -135,7 +136,7 @@ class GeoJSONSource(DataSource):
 
             props_df = gdf.drop(columns="geometry")
             props_df = _normalize_decimal_columns(props_df)
-            props_table = pa.Table.from_pandas(props_df, preserve_index=False)
+            props_table = _properties_dataframe_to_arrow_table(props_df)
 
             table = (
                 pa.table([geometry_col], names=["geometry"])
@@ -200,7 +201,7 @@ class GeoJSONSource(DataSource):
 
         props_df = pd.DataFrame.from_records(rows_props)
         props_df = _normalize_decimal_columns(props_df)
-        props_table = pa.Table.from_pandas(props_df, preserve_index=False)
+        props_table = _properties_dataframe_to_arrow_table(props_df)
 
         wkb_list = _geometries_to_wkb(geometries)
         geometry_col = pa.array(wkb_list, type=pa.binary())

@@ -290,7 +290,45 @@ class IntermediateVectorTile:
                 out.append(
                     {
                         "geometry": geometry,
-                        "properties": dict(feature.properties),
+                        "properties": _mvt_properties(feature.properties),
                     }
                 )
         return out
+
+
+def _mvt_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name, value in properties.items():
+        if value is not None:
+            for key, flattened_value in _flatten_property_items(name, value):
+                out[key] = _mvt_property_value(flattened_value)
+    return out
+
+
+def _flatten_property_items(name: str, value: Any):
+    if isinstance(value, dict):
+        for key, item_value in value.items():
+            if item_value is not None:
+                yield from _flatten_property_items(f"{name}.{key}", item_value)
+        return
+
+    if _is_map_entries(value):
+        for key, item_value in value:
+            if item_value is not None:
+                yield from _flatten_property_items(f"{name}.{key}", item_value)
+        return
+
+    yield name, value
+
+
+def _is_map_entries(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[0], str)
+        for item in value
+    )
+
+
+def _mvt_property_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)

@@ -412,16 +412,10 @@ class TestGeoJSONSource:
         tables = list(source.iter_tables())
 
         _tags_types = {table.schema.field("tagsMap").type for table in tables}
-        # nested dict properties are coerced to a stable string type across batches
-        # (string or large_string depending on the pyarrow version) — the key
-        # property is a single, consistent string type, never a struct.
-        assert len(_tags_types) == 1
-        assert all(
-            pa.types.is_large_string(t) or pa.types.is_string(t) for t in _tags_types
-        )
-        assert [value for table in tables for value in table["tagsMap"].to_pylist()] == [
-            '{"a":"1"}',
-            '{"b":"2"}',
+        assert _tags_types == {pa.map_(pa.string(), pa.string())}
+        assert [dict(value) for table in tables for value in table["tagsMap"].to_pylist()] == [
+            {"a": "1"},
+            {"b": "2"},
         ]
 
     def test_geojson_null_first_batch_promotes_later_string_column(self, temp_dir):

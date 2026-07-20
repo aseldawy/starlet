@@ -580,9 +580,9 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
     GeoJSON batches.
 
     Decimal values become float64 so Arrow does not infer different
-    decimal128 precision/scale. Nested JSON-like values become compact JSON
-    strings so dynamic tag maps do not infer a different struct field set for
-    every batch.
+    decimal128 precision/scale. Nested JSON-like values are left intact; callers
+    that build Arrow tables should use ``_properties_dataframe_to_arrow_table``
+    so dynamic tag maps get a stable Arrow map type.
     """
     if df.empty:
         return df
@@ -614,14 +614,68 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
         if isinstance(sample, Decimal):
             df[col] = s.map(lambda x: None if is_missing(x) else float(x))
-        elif isinstance(sample, (dict, list)):
-            df[col] = s.map(
-                lambda x: json.dumps(x, separators=(",", ":"), sort_keys=True, default=str)
-                if not is_missing(x)
-                else None
-            )
 
     return df
+
+
+def _properties_dataframe_to_arrow_table(df: pd.DataFrame) -> pa.Table:
+    """Build an Arrow table for GeoJSON properties without stringifying maps."""
+    if df.empty:
+        return pa.table({})
+
+    columns = []
+    fields = []
+
+    for name in df.columns:
+        values = df[name].tolist()
+        arrow_type = _geojson_property_arrow_type(values)
+        if arrow_type is None:
+            array = pa.array(values)
+        else:
+            array = pa.array(
+                [_map_entries_or_none(value) for value in values],
+                type=arrow_type,
+            )
+        columns.append(array)
+        fields.append(pa.field(str(name), array.type))
+
+    return pa.table(columns, schema=pa.schema(fields))
+
+
+def _geojson_property_arrow_type(values: list[Any]) -> pa.DataType | None:
+    sample = next((value for value in values if not _is_missing_property_value(value)), None)
+    if not isinstance(sample, dict):
+        return None
+    if all(
+        _is_missing_property_value(value) or _is_string_map(value)
+        for value in values
+    ):
+        return pa.map_(pa.string(), pa.string())
+    return None
+
+
+def _is_missing_property_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (dict, list)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _is_string_map(value: Any) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and (item is None or isinstance(item, str))
+        for key, item in value.items()
+    )
+
+
+def _map_entries_or_none(value: Any) -> list[tuple[str, str | None]] | None:
+    if _is_missing_property_value(value):
+        return None
+    return list(value.items())
 
 # Backward-compatible re-exports for callers importing concrete sources from
 # this module.

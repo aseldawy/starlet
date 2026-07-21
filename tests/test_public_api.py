@@ -157,6 +157,25 @@ temp_dir = "{temp_root}"
         _reset_loaded_config_for_tests()
 
 
+def test_get_config_returns_current_loaded_config_copy():
+    from starlet._internal.config import _reset_loaded_config_for_tests, set_loaded_config
+
+    _reset_loaded_config_for_tests()
+    set_loaded_config({"global": {"parallelism": 3}, "serve": {"cache_size": 12}})
+
+    try:
+        config = starlet.get_config()
+
+        assert config["global"]["parallelism"] == 3
+        assert config["serve"]["cache_size"] == 12
+        assert config["mvt"]["extent"] == 4096
+
+        config["serve"]["cache_size"] = 99
+        assert starlet.get_config()["serve"]["cache_size"] == 12
+    finally:
+        _reset_loaded_config_for_tests()
+
+
 def test_build_forwards_configured_pmtiles_options(monkeypatch):
     from types import SimpleNamespace
 

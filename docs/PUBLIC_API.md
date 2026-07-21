@@ -43,6 +43,17 @@ All functions below are available directly from the `starlet` package.
   for Web Mercator coordinates.
 - Query results are GeoPandas `GeoDataFrame` batches in `EPSG:4326`.
 
+## Configuration
+
+```python
+config: dict = starlet.get_config()
+```
+
+Returns the current process-wide Starlet configuration after applying built-in
+defaults and any discovered or explicitly loaded config file values. The
+returned dictionary is a copy, so changing it does not mutate Starlet's active
+configuration.
+
 ## Dataset Discovery
 
 ```python

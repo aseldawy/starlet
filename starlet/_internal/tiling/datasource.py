@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional, List, Dict, Any, Tuple
 import logging
 import json
@@ -36,19 +36,29 @@ class DataSource:
     def iter_tables(self, split: Optional[Any] = None) -> Iterable[pa.Table]:
         raise NotImplementedError
 
+    def iter_tables_for_schema_inference(
+        self,
+        split: Optional[Any] = None,
+    ) -> Iterable[pa.Table]:
+        return self.iter_tables(split)
+
+    def set_schema(self, schema: pa.Schema) -> None:
+        raise NotImplementedError
+
     def input_size_bytes(self) -> int:
         raise NotImplementedError
 
 
 @dataclass(frozen=True)
 class SpatialSample:
-    """Centroid sample and global bounds prepared for spatial partitioning."""
+    """Source metadata prepared during the initial spatial scan."""
 
     sample_points: np.ndarray
     mbr: EnvelopeNDLite
     total_seen: int
     total_sampled: int
     batches_read: int
+    schema: Optional[pa.Schema] = None
 
 
 # ------------------------- Helpers ------------------------- #
@@ -174,7 +184,7 @@ def read_spatial_sample(
     geoparquet_workers: Optional[int] = None,
     source_workers: Optional[int] = None,
 ) -> SpatialSample:
-    """Read a file once and return centroid sample points plus the global MBR."""
+    """Read a source once and return its spatial sample, MBR, and inferred schema."""
     kind = _source_kind(path)
     if kind == "geojson":
         return GeoJSONSource.read_spatial_sample(
@@ -183,6 +193,7 @@ def read_spatial_sample(
             sample_cap=sample_cap,
             seed=seed,
             workers=geojson_workers,
+            src_crs=src_crs,
         )
     if kind == "geoparquet":
         return GeoParquetSource.read_spatial_sample(
@@ -204,19 +215,8 @@ def read_spatial_sample(
         csv_batch_rows=csv_batch_rows,
         src_crs=src_crs,
     )
-    if isinstance(source, CSVSource):
-        source = CSVSource(
-            path,
-            x_col=csv_x_col,
-            y_col=csv_y_col,
-            wkt_col=csv_wkt_col,
-            split_size=csv_split_size,
-            batch_rows=csv_batch_rows,
-            src_crs=src_crs,
-            geometry_only=True,
-            geom_col=geom_col,
-        )
-    elif isinstance(source, ShapefileSource):
+    collect_schema = isinstance(source, CSVSource)
+    if isinstance(source, ShapefileSource):
         source = ShapefileSource(path, geometry_only=True, geom_col=geom_col)
     elif isinstance(source, GDBSource):
         source = GDBSource(path, geometry_only=True, geom_col=geom_col)
@@ -227,6 +227,7 @@ def read_spatial_sample(
         sample_cap=sample_cap,
         seed=seed,
         source_workers=source_workers,
+        collect_schema=collect_schema,
     )
 
 
@@ -312,6 +313,7 @@ def _spatial_sample_from_state(
     maxs: np.ndarray,
     n_seen: int,
     batches_read: int,
+    schema: Optional[pa.Schema] = None,
 ) -> SpatialSample:
     return SpatialSample(
         sample_points=(
@@ -326,6 +328,7 @@ def _spatial_sample_from_state(
         total_seen=n_seen,
         total_sampled=len(x_sample),
         batches_read=batches_read,
+        schema=schema,
     )
 
 
@@ -445,6 +448,7 @@ def _read_datasource_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
     source_workers: Optional[int],
+    collect_schema: bool = False,
 ) -> SpatialSample:
     splits = source.create_splits()
     sample_caps = _split_sample_cap(sample_cap, len(splits))
@@ -466,13 +470,20 @@ def _read_datasource_spatial_sample(
                 sample_ratio,
                 sample_caps[index],
                 seed + index,
+                collect_schema,
             )
             for index, split in enumerate(splits)
         ]
         parts: List[SpatialSample] = []
         for future in as_completed(futures):
             parts.append(future.result())
-        return _combine_spatial_samples(parts)
+        sample = _combine_spatial_samples(parts)
+        if not collect_schema:
+            return sample
+        schema = _unify_tabular_schemas(
+            part.schema for part in parts if part.schema is not None
+        )
+        return replace(sample, schema=schema)
 
 
 def _read_datasource_split_spatial_sample(
@@ -482,6 +493,7 @@ def _read_datasource_split_spatial_sample(
     sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
+    collect_schema: bool = False,
 ) -> SpatialSample:
     rng = np.random.default_rng(seed)
     mins = np.array([+np.inf, +np.inf], dtype=np.float64)
@@ -490,12 +502,20 @@ def _read_datasource_split_spatial_sample(
     y_sample: List[float] = []
     n_seen = 0
     n_batches = 0
+    schemas: List[pa.Schema] = []
 
-    for table in source.iter_tables(split):
+    tables = (
+        source.iter_tables_for_schema_inference(split)
+        if collect_schema
+        else source.iter_tables(split)
+    )
+    for table in tables:
         table = table.combine_chunks()
         if table.num_rows == 0:
             continue
         n_batches += 1
+        if collect_schema:
+            schemas.append(table.schema)
         table = ensure_large_types(table, geom_col)
         geometries = _decode_wkb_geometries(
             table[geom_col].to_numpy(zero_copy_only=False),
@@ -536,6 +556,7 @@ def _read_datasource_split_spatial_sample(
         maxs=maxs,
         n_seen=n_seen,
         batches_read=n_batches,
+        schema=_unify_tabular_schemas(schemas) if schemas else None,
     )
 
 
@@ -618,28 +639,114 @@ def _normalize_decimal_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _properties_dataframe_to_arrow_table(df: pd.DataFrame) -> pa.Table:
+def _properties_dataframe_to_arrow_table(
+    df: pd.DataFrame,
+    schema: pa.Schema | None = None,
+) -> pa.Table:
     """Build an Arrow table for GeoJSON properties without stringifying maps."""
-    if df.empty:
+    if df.empty and schema is None:
         return pa.table({})
 
     columns = []
     fields = []
 
-    for name in df.columns:
-        values = df[name].tolist()
+    column_fields = schema or pa.schema(
+        pa.field(str(name), pa.null()) for name in df.columns
+    )
+    for field in column_fields:
+        name = field.name
+        values = (
+            df[name].tolist()
+            if name in df.columns
+            else [None] * len(df.index)
+        )
+        if schema is not None:
+            if pa.types.is_map(field.type):
+                array = pa.array(
+                    [_map_entries_or_none(value) for value in values],
+                    type=field.type,
+                )
+            elif pa.types.is_string(field.type) or pa.types.is_large_string(field.type):
+                array = pa.array(
+                    [_stringify_json_property_value(value) for value in values],
+                    type=field.type,
+                )
+            else:
+                array = pa.array(values, type=field.type)
+            columns.append(array)
+            fields.append(field)
+            continue
+
         arrow_type = _geojson_property_arrow_type(values)
-        if arrow_type is None:
-            array = pa.array(values)
-        else:
+        try:
+            if arrow_type is None:
+                array = pa.array(values)
+            else:
+                array = pa.array(
+                    [_map_entries_or_none(value) for value in values],
+                    type=arrow_type,
+                )
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
             array = pa.array(
-                [_map_entries_or_none(value) for value in values],
-                type=arrow_type,
+                [_stringify_json_property_value(value) for value in values],
+                type=pa.large_string(),
             )
         columns.append(array)
         fields.append(pa.field(str(name), array.type))
 
     return pa.table(columns, schema=pa.schema(fields))
+
+
+def _unify_tabular_schemas(schemas: Iterable[pa.Schema]) -> pa.Schema:
+    """Resolve independently inferred table schemas into one source schema."""
+    schemas = list(schemas)
+    fields_by_name: Dict[str, List[pa.Field]] = {}
+    field_order: List[str] = []
+    for schema in schemas:
+        for field in schema:
+            if field.name not in fields_by_name:
+                fields_by_name[field.name] = []
+                field_order.append(field.name)
+            fields_by_name[field.name].append(field)
+
+    fields = []
+    for name in field_order:
+        source_fields = fields_by_name[name]
+        source_types = [field.type for field in source_fields]
+        non_null_types = [field_type for field_type in source_types if not pa.types.is_null(field_type)]
+
+        if not non_null_types:
+            field_type = pa.null()
+        elif all(
+            pa.types.is_integer(field_type) or pa.types.is_floating(field_type)
+            for field_type in non_null_types
+        ):
+            field_type = pa.unify_schemas(
+                [pa.schema([pa.field(name, source_type)]) for source_type in non_null_types],
+                promote_options="permissive",
+            ).field(name).type
+        elif any(
+            pa.types.is_string(field_type) or pa.types.is_large_string(field_type)
+            for field_type in non_null_types
+        ) and len(set(non_null_types)) > 1:
+            field_type = pa.large_string()
+        else:
+            try:
+                field_type = pa.unify_schemas(
+                    [pa.schema([pa.field(name, source_type)]) for source_type in non_null_types],
+                    promote_options="permissive",
+                ).field(name).type
+            except pa.ArrowTypeError:
+                field_type = pa.large_string()
+
+        metadata = next((field.metadata for field in source_fields if field.metadata), None)
+        fields.append(pa.field(name, field_type, nullable=True, metadata=metadata))
+
+    schema_metadata = next(
+        (schema.metadata for schema in schemas if schema.metadata),
+        None,
+    )
+    return pa.schema(fields, metadata=schema_metadata)
 
 
 def _geojson_property_arrow_type(values: list[Any]) -> pa.DataType | None:
@@ -676,6 +783,14 @@ def _map_entries_or_none(value: Any) -> list[tuple[str, str | None]] | None:
     if _is_missing_property_value(value):
         return None
     return list(value.items())
+
+
+def _stringify_json_property_value(value: Any) -> str | None:
+    if _is_missing_property_value(value):
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), sort_keys=True)
+    return str(value)
 
 # Backward-compatible re-exports for callers importing concrete sources from
 # this module.

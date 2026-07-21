@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from concurrent.futures import as_completed
-from dataclasses import dataclass
-import io
+from dataclasses import dataclass, replace
 import json
 import logging
 from numbers import Number
 from typing import Any, Dict, Iterable, List, Optional
 
-import ijson
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -22,6 +20,7 @@ from starlet._internal.tiling.datasource import (
     _combine_spatial_samples,
     _normalize_decimal_columns,
     _properties_dataframe_to_arrow_table,
+    _unify_tabular_schemas,
     _reservoir_add,
     _spatial_sample_from_state,
     _split_sample_cap,
@@ -90,20 +89,27 @@ class GeoJSONSource(DataSource):
     # ---------------- schema ---------------- #
     def schema(self) -> pa.Schema:
         if self._schema is None:
-            first = self._read_first_batch()
-            if first is None or first.num_rows == 0:
-                # Empty input file. Create a minimal schema with geometry column.
-                base = pa.schema([("geometry", pa.binary())])
-                self._schema = _attach_geoparquet_metadata(
-                    base, self._crs_hint or self.src_crs
-                )
-            else:
-                # Lock schema with GeoParquet metadata
-                self._schema = _attach_geoparquet_metadata(
-                    first.schema, self._crs_hint or self.src_crs
+            property_schemas = []
+            for features in self._iter_feature_batches_for_split(None):
+                rows = [feature.get("properties") or {} for feature in features]
+                props_df = _normalize_decimal_columns(pd.DataFrame.from_records(rows))
+                property_schemas.append(
+                    _properties_dataframe_to_arrow_table(props_df).schema
                 )
 
+            properties_schema = _unify_tabular_schemas(property_schemas)
+            base = properties_schema.append(pa.field("geometry", pa.binary()))
+            self._schema = _attach_geoparquet_metadata(
+                base, self._crs_hint or self.src_crs
+            )
+
         return self._schema
+
+    def set_schema(self, schema: pa.Schema) -> None:
+        """Use a schema discovered by an earlier scan of this source."""
+        if "geometry" not in schema.names:
+            raise ValueError("GeoJSON schema must contain a geometry column")
+        self._schema = schema
 
     def input_size_bytes(self) -> int:
         return sum(file_path.stat().st_size for file_path in self._files)
@@ -124,6 +130,10 @@ class GeoJSONSource(DataSource):
     def iter_tables(self, split: Optional[GeoJSONSplit] = None) -> Iterable[pa.Table]:
         batch_index = 0
         crs_value = self._crs_hint or self.src_crs
+        schema = self.schema()
+        properties_schema = pa.schema(
+            [field for field in schema if field.name != "geometry"]
+        )
 
         import geopandas as gpd
 
@@ -136,7 +146,10 @@ class GeoJSONSource(DataSource):
 
             props_df = gdf.drop(columns="geometry")
             props_df = _normalize_decimal_columns(props_df)
-            props_table = _properties_dataframe_to_arrow_table(props_df)
+            props_table = _properties_dataframe_to_arrow_table(
+                props_df,
+                schema=properties_schema,
+            )
 
             table = (
                 pa.table([geometry_col], names=["geometry"])
@@ -144,15 +157,7 @@ class GeoJSONSource(DataSource):
                 else props_table.append_column("geometry", geometry_col)
             )
 
-            # Attach GeoParquet metadata with CRS
-            schema_with_geo = _attach_geoparquet_metadata(table.schema, crs_value)
-            table = table.replace_schema_metadata(schema_with_geo.metadata)
-
-            if split is None and not self._schema:
-                self._schema = schema_with_geo
-
-            if self._schema is not None:
-                table = self._coerce_to_schema(table, self._schema)
+            table = table.cast(schema)
             table = table.combine_chunks()
 
             logger.debug(
@@ -178,84 +183,6 @@ class GeoJSONSource(DataSource):
             yield [json.loads(feature) for feature in feature_batch]
 
     # ---------------- internal helpers ---------------- #
-    def _read_first_batch(self) -> Optional[pa.Table]:
-        """Read the first batch of features to establish the schema."""
-        first_path = self._files[0]
-        file_size = first_path.stat().st_size
-        batches = GeoJSONPartitionReader(first_path, 0, file_size, batch_size=max(1, self.batch_rows)).batches()
-        try:
-            first_batch = next(batches)
-            features = [json.loads(feature_str) for feature_str in first_batch]
-        except StopIteration:
-            logger.info("GeoJSON read returned 0 rows when inferring schema")
-            return None
-        finally:
-            batches.close()
-
-        rows_props: List[Dict[str, Any]] = []
-        geometries: List[Any] = []
-
-        for feat in features:
-            rows_props.append(feat.get("properties") or {})
-            geometries.append(feat.get("geometry", None))
-
-        props_df = pd.DataFrame.from_records(rows_props)
-        props_df = _normalize_decimal_columns(props_df)
-        props_table = _properties_dataframe_to_arrow_table(props_df)
-
-        wkb_list = _geometries_to_wkb(geometries)
-        geometry_col = pa.array(wkb_list, type=pa.binary())
-
-        if props_table.num_columns == 0:
-            return pa.table([geometry_col], names=["geometry"])
-
-        return props_table.append_column("geometry", geometry_col)
-
-    def _coerce_to_schema(self, t: pa.Table, schema: pa.Schema) -> pa.Table:
-        if t.schema.equals(schema):
-            return t
-
-        out_cols = []
-        out_fields = []
-        promoted = False
-        for fld in schema:
-            name = fld.name
-            if name in t.column_names:
-                col = t[name]
-                if not col.type.equals(fld.type):
-                    if pa.types.is_null(fld.type) and not pa.types.is_null(col.type):
-                        fld = pa.field(
-                            fld.name,
-                            col.type,
-                            nullable=True,
-                            metadata=fld.metadata,
-                        )
-                        promoted = True
-                    else:
-                        try:
-                            col = col.cast(fld.type)
-                        except Exception:
-                            logger.warning(
-                                "Type mismatch for column '%s': %s -> %s (kept original)",
-                                name, col.type, fld.type
-                            )
-                            fld = pa.field(
-                                fld.name,
-                                col.type,
-                                nullable=fld.nullable,
-                                metadata=fld.metadata,
-                            )
-                out_cols.append(col)
-                out_fields.append(fld)
-            else:
-                out_cols.append(pa.nulls(t.num_rows, type=fld.type))
-                out_fields.append(fld)
-
-        out_schema = pa.schema(out_fields, metadata=schema.metadata)
-        if promoted:
-            self._schema = out_schema
-        return pa.table(out_cols, schema=out_schema)
-
     @classmethod
     def read_spatial_sample(
         cls,
@@ -265,8 +192,9 @@ class GeoJSONSource(DataSource):
         sample_cap: Optional[int],
         seed: int,
         workers: Optional[int],
+        src_crs: str = "EPSG:4326",
     ) -> SpatialSample:
-        source = cls(path)
+        source = cls(path, src_crs=src_crs)
         splits = source.create_splits()
         sample_caps = _split_sample_cap(sample_cap, len(splits))
 
@@ -297,7 +225,15 @@ class GeoJSONSource(DataSource):
             parts: List[SpatialSample] = []
             for future in as_completed(futures):
                 parts.append(future.result())
-            return _combine_spatial_samples(parts)
+            sample = _combine_spatial_samples(parts)
+            properties_schema = _unify_tabular_schemas(
+                part.schema for part in parts if part.schema is not None
+            )
+            schema = _attach_geoparquet_metadata(
+                properties_schema.append(pa.field("geometry", pa.binary())),
+                source._crs_hint or source.src_crs,
+            )
+            return replace(sample, schema=schema)
 
 
 def _read_geojson_spatial_sample(
@@ -307,6 +243,7 @@ def _read_geojson_spatial_sample(
     sample_cap: Optional[int],
     seed: int,
     geojson_workers: Optional[int],
+    src_crs: str = "EPSG:4326",
 ) -> SpatialSample:
     return GeoJSONSource.read_spatial_sample(
         path,
@@ -314,23 +251,11 @@ def _read_geojson_spatial_sample(
         sample_cap=sample_cap,
         seed=seed,
         workers=geojson_workers,
+        src_crs=src_crs,
     )
 
 
-def iter_geojson_xy(feature_json):
-    try:
-        geometry = next(
-            ijson.items(
-                io.BytesIO(feature_json.encode("utf-8")),
-                "geometry",
-                use_float=True,
-            ),
-            None,
-        )
-    except Exception:
-        print("Failed to parse feature_json:")
-        raise
-
+def _iter_geojson_geometry_xy(geometry):
     stack = [geometry]
     while stack:
         v = stack.pop()
@@ -346,6 +271,11 @@ def iter_geojson_xy(feature_json):
                 yield float(v[0]), float(v[1])
             else:
                 stack.extend(reversed(v))
+
+
+def iter_geojson_xy(feature_json):
+    feature = json.loads(feature_json)
+    yield from _iter_geojson_geometry_xy(feature.get("geometry"))
 
 
 def _read_geojson_partition_spatial_sample(
@@ -364,11 +294,15 @@ def _read_geojson_partition_spatial_sample(
     y_sample: List[float] = []
     n_seen = 0
     n_batches = 0
+    property_schemas: List[pa.Schema] = []
 
     for batch in reader:
+        property_rows = []
         for feature_json in batch:
+            feature = json.loads(feature_json)
+            property_rows.append(feature.get("properties") or {})
             first_point = True
-            for x, y in iter_geojson_xy(feature_json):
+            for x, y in _iter_geojson_geometry_xy(feature.get("geometry")):
                 if x < min_x:
                     min_x = x
                 if x > max_x:
@@ -392,6 +326,10 @@ def _read_geojson_partition_spatial_sample(
                         y=y,
                     )
 
+        props_df = _normalize_decimal_columns(pd.DataFrame.from_records(property_rows))
+        property_schemas.append(
+            _properties_dataframe_to_arrow_table(props_df).schema
+        )
         n_batches += 1
 
     return _spatial_sample_from_state(
@@ -401,6 +339,7 @@ def _read_geojson_partition_spatial_sample(
         maxs=np.array([max_x, max_y], dtype=float),
         n_seen=n_seen,
         batches_read=n_batches,
+        schema=_unify_tabular_schemas(property_schemas),
     )
 
 

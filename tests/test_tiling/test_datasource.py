@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 import geopandas as gpd
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyproj import Transformer
@@ -30,6 +31,7 @@ from starlet._internal.tiling.datasource import (
     CSVSource,
     GDBSource,
     ShapefileSource,
+    _properties_dataframe_to_arrow_table,
     _zip_gdb_member_dirs,
     read_spatial_sample,
     source_for_path,
@@ -447,6 +449,85 @@ class TestGeoJSONSource:
         assert pa.types.is_large_string(promoted_type) or pa.types.is_string(promoted_type)
         assert tables[-1]["OLD_BLD_ID"].to_pylist() == ["B123"]
 
+    def test_geojson_mixed_scalar_property_values_promote_to_string(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"parcel_id": "A123"},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"parcel_id": 123.5},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "mixed_scalar_property.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        schema = source.schema()
+        tables = list(source.iter_tables())
+
+        assert pa.types.is_large_string(schema.field("parcel_id").type)
+        assert {table.schema.field("parcel_id").type for table in tables} == {
+            pa.large_string()
+        }
+        assert [value for table in tables for value in table["parcel_id"].to_pylist()] == [
+            "A123",
+            "123.5",
+        ]
+
+    def test_geojson_numeric_property_type_is_stable_across_batches(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": 10},
+                    "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+                },
+                {
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": 2.5, "STATUS": "active"},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+                },
+            ],
+        }
+
+        json_path = temp_dir / "numeric_promotion.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f)
+
+        source = GeoJSONSource(str(json_path), batch_rows=1)
+        schema = source.schema()
+        tables = list(source.iter_tables())
+
+        assert schema.field("TOTAL_UNITS").type == pa.float64()
+        assert schema.field("STATUS").type == pa.string()
+        assert all(table.schema.equals(schema) for table in tables)
+        assert [value for table in tables for value in table["TOTAL_UNITS"].to_pylist()] == [
+            10.0,
+            2.5,
+        ]
+        assert [value for table in tables for value in table["STATUS"].to_pylist()] == [
+            None,
+            "active",
+        ]
+
+    def test_geojson_arrow_inference_failure_promotes_property_to_string(self):
+        table = _properties_dataframe_to_arrow_table(
+            pd.DataFrame({"parcel_id": [b"A123", 123.5]})
+        )
+
+        assert pa.types.is_large_string(table.schema.field("parcel_id").type)
+        assert table["parcel_id"].to_pylist() == ["b'A123'", "123.5"]
+
     def test_geojson_splits_read_independently_from_threads(self, temp_dir):
         """Test GeoJSON byte splits can be read independently by threads."""
         geojson = {
@@ -554,8 +635,44 @@ class TestGeoJSONSource:
         assert spatial_sample.total_seen == 2
         assert spatial_sample.total_sampled == 2
         assert spatial_sample.sample_points.shape == (2, 2)
+        assert spatial_sample.schema is not None
+        assert spatial_sample.schema.field("id").type == pa.int64()
+        assert spatial_sample.schema.field("geometry").type == pa.binary()
         assert spatial_sample.mbr.mins.tolist() == [0.0, 2.0]
         assert spatial_sample.mbr.maxs.tolist() == [10.0, 12.0]
+
+    def test_geojson_sampling_schema_can_be_reused_for_tiling(self, temp_dir, monkeypatch):
+        data_dir = temp_dir / "sample_schema"
+        data_dir.mkdir()
+        for index, total_units in enumerate((10, 2.5)):
+            (data_dir / f"part-{index}.geojson").write_text(json.dumps({
+                "type": "FeatureCollection",
+                "features": [{
+                    "type": "Feature",
+                    "properties": {"TOTAL_UNITS": total_units},
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [float(index), float(index)],
+                    },
+                }],
+            }))
+
+        spatial_sample = read_spatial_sample(
+            str(data_dir),
+            sample_ratio=1.0,
+            sample_cap=None,
+            seed=42,
+            geojson_workers=1,
+        )
+        source = GeoJSONSource(str(data_dir), batch_rows=1)
+        source.set_schema(spatial_sample.schema)
+        monkeypatch.setattr(
+            source,
+            "_iter_feature_batches_for_split",
+            lambda split: (_ for _ in ()).throw(AssertionError("schema rescanned input")),
+        )
+
+        assert source.schema().field("TOTAL_UNITS").type == pa.float64()
 
     def test_read_spatial_sample_splits_geojson_sample_cap(self, temp_dir):
         """Test GeoJSON partition sampling respects the total requested cap."""
@@ -735,6 +852,49 @@ class TestCSVSource:
         assert sample.total_seen == 2
         assert sample.total_sampled == 2
         assert sample.sample_points.shape == (2, 2)
+
+    def test_csv_sampling_unifies_schema_across_splits(self, temp_dir):
+        csv_path = temp_dir / "mixed_types.csv"
+        csv_path.write_text(
+            "id,x,y,units,active,mixed,optional,code,zip_code\n"
+            "1,0,1,10,true,1,,001,00123\n"
+            "2,2,3,2.5,false,label,7,ABC,00456\n"
+        )
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_col="x",
+            csv_y_col="y",
+            csv_split_size=30,
+            sample_ratio=1.0,
+            source_workers=1,
+        )
+
+        assert sample.schema is not None
+        assert sample.schema.field("units").type == pa.float64()
+        assert sample.schema.field("active").type == pa.bool_()
+        assert sample.schema.field("mixed").type == pa.large_string()
+        assert sample.schema.field("optional").type == pa.int64()
+        assert sample.schema.field("code").type == pa.string()
+        assert sample.schema.field("zip_code").type == pa.string()
+
+        source = CSVSource(
+            str(csv_path),
+            x_col="x",
+            y_col="y",
+            split_size=30,
+        )
+        source.set_schema(sample.schema)
+        tables = list(source.iter_tables())
+
+        assert all(table.schema.equals(sample.schema) for table in tables)
+        combined = pa.concat_tables(tables)
+        assert combined["units"].to_pylist() == [10.0, 2.5]
+        assert combined["active"].to_pylist() == [True, False]
+        assert combined["mixed"].to_pylist() == ["1", "label"]
+        assert combined["optional"].to_pylist() == [None, 7]
+        assert combined["code"].to_pylist() == ["001", "ABC"]
+        assert combined["zip_code"].to_pylist() == ["00123", "00456"]
 
     def test_csv_source_preserves_native_crs(self, temp_dir):
         lon, lat = -118.25, 34.05

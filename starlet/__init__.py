@@ -207,6 +207,8 @@ def tile(
         geoparquet_workers=parallelism,
         source_workers=parallelism,
     )
+    if spatial_sample.schema is not None:
+        source.set_schema(spatial_sample.schema)
     assigner = RSGroveAssigner.from_sample_and_mbr(
         sample_points=spatial_sample.sample_points,
         mbr=spatial_sample.mbr,

@@ -7,6 +7,8 @@ import importlib
 import starlet
 from starlet.api import AsyncDatasetHandle
 from starlet._internal.server.download_service import DatasetFeatureService
+from starlet._internal.tiling.csv_source import CSVSource
+from starlet._internal.tiling.geojson_source import GeoJSONSource
 
 
 def test_list_datasets(sample_dataset_dir):
@@ -26,7 +28,18 @@ def test_process_wide_temp_dir_can_be_configured(temp_dir):
         starlet.set_temp_dir(str(previous) if previous is not None else None)
 
 
-def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path):
+def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path, monkeypatch):
+    original_batches = GeoJSONSource._iter_feature_batches_for_split
+    schema_scans = 0
+
+    def tracked_batches(self, split):
+        nonlocal schema_scans
+        if split is None:
+            schema_scans += 1
+        yield from original_batches(self, split)
+
+    monkeypatch.setattr(GeoJSONSource, "_iter_feature_batches_for_split", tracked_batches)
+
     source = tmp_path / "cemetery_tags.geojson"
     dataset = tmp_path / "cemetery_dataset"
     source.write_text(
@@ -61,6 +74,8 @@ def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path):
 
     starlet.tile(str(source), str(dataset), partition_size=1, parallelism=1)
 
+    assert schema_scans == 0
+
     body = "".join(
         DatasetFeatureService(tmp_path).get_features_stream("cemetery_dataset", "geojson")
     )
@@ -82,6 +97,38 @@ def test_geojson_tiling_preserves_nested_properties_in_geojson_export(tmp_path):
     assert public_sample is not None
     assert isinstance(public_sample["tagsMap"], dict)
     assert public_sample["tagsMap"] in tags
+
+
+def test_csv_tiling_reuses_schema_from_sampling(tmp_path, monkeypatch):
+    source = tmp_path / "mixed.csv"
+    dataset = tmp_path / "mixed_dataset"
+    source.write_text(
+        "id,x,y,units,active\n"
+        "1,0,0,10,true\n"
+        "2,1,1,2.5,false\n"
+    )
+
+    original_inference = CSVSource.iter_tables_for_schema_inference
+    full_schema_scans = 0
+
+    def tracked_inference(self, split=None):
+        nonlocal full_schema_scans
+        if split is None:
+            full_schema_scans += 1
+        yield from original_inference(self, split)
+
+    monkeypatch.setattr(CSVSource, "iter_tables_for_schema_inference", tracked_inference)
+
+    starlet.tile(
+        str(source),
+        str(dataset),
+        partition_size=1,
+        parallelism=1,
+        csv_x_col="x",
+        csv_y_col="y",
+    )
+
+    assert full_schema_scans == 0
 
 
 def test_import_auto_loads_config_once(tmp_path, monkeypatch):

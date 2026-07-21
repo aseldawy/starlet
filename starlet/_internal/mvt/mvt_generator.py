@@ -154,13 +154,20 @@ class DatasetMVTGenerator:
 
         pmtiles_path = None
         if self.output_format == "pmtiles":
-            pmtiles_path = str(self.pmtiles_path)
-            export_to_pmtiles(
-                mvt_dir=str(self.outdir),
-                output_path=pmtiles_path,
-                tile_type="mvt",
-                compression=self.pmtiles_compression,
-            )
+            if tile_count == 0:
+                logger.warning(
+                    "No MVT tiles passed threshold %s; skipping PMTiles export. "
+                    "Lower the MVT threshold to generate a prebuilt pyramid.",
+                    self.threshold,
+                )
+            else:
+                pmtiles_path = str(self.pmtiles_path)
+                export_to_pmtiles(
+                    mvt_dir=str(self.outdir),
+                    output_path=pmtiles_path,
+                    tile_type="mvt",
+                    compression=self.pmtiles_compression,
+                )
             if self.outdir.exists():
                 shutil.rmtree(self.outdir)
         return DatasetMVTGenerationResult(

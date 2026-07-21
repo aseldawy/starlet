@@ -430,3 +430,55 @@ def test_dataset_generator_removes_mvt_dir_after_pmtiles_export(monkeypatch, tmp
     assert result.pmtiles_path == str(dataset_dir / "tiles.pmtiles")
     assert exported["output_path"] == str(dataset_dir / "tiles.pmtiles")
     assert not generator.outdir.exists()
+
+
+def test_dataset_generator_skips_pmtiles_export_when_threshold_filters_all_tiles(
+    monkeypatch,
+    tmp_path,
+):
+    from starlet._internal.mvt.mvt_generator import DatasetMVTGenerator, _MapStageResult
+
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    hist_dir = dataset_dir / "histograms"
+    parquet_dir.mkdir(parents=True)
+    hist_dir.mkdir(parents=True)
+    (hist_dir / "global_prefix.npy").write_bytes(b"fake")
+
+    generator = DatasetMVTGenerator(
+        str(dataset_dir),
+        num_zoom_levels=2,
+        threshold=100_000,
+        output_format="pmtiles",
+    )
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.GeoParquetSource",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator._create_map_groups",
+        lambda source, workers: [[object()]],
+    )
+    monkeypatch.setattr(
+        DatasetMVTGenerator,
+        "_run_map_stage",
+        lambda self, groups, source, temp_root: [_MapStageResult("tmp", [])],
+    )
+
+    def make_empty_output(self, map_results):
+        self.outdir.mkdir(parents=True)
+
+    monkeypatch.setattr(DatasetMVTGenerator, "_run_reduce_stage", make_empty_output)
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.export_to_pmtiles",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("empty tiles exported")),
+    )
+
+    result = generator.run()
+
+    assert result.tile_count == 0
+    assert result.tile_counts_by_zoom == []
+    assert result.zoom_levels == []
+    assert result.pmtiles_path is None
+    assert not generator.outdir.exists()

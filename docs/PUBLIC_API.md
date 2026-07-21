@@ -153,6 +153,21 @@ tile_bytes: bytes = starlet.get_tile(
 
 Returns a Mapbox Vector Tile payload as `bytes`.
 
+To limit attributes when Starlet generates a tile on the fly, pass an attribute
+whitelist. Geometry is always included. If `attributes` is omitted, all
+attributes are included by default. Pre-generated PMTiles and MVT files are
+returned as-is even when `attributes` is provided.
+
+```python
+tile_bytes = starlet.get_tile(
+    "datasets/postal_codes",
+    z=7,
+    x=22,
+    y=49,
+    attributes=["name", "population"],
+)
+```
+
 Pass an output dictionary to receive details about how the tile was served:
 
 ```python
@@ -181,21 +196,29 @@ path, and elapsed time.
 
 Lookup behavior:
 
-1. Check `<dataset>/mvt/<z>/<x>/<y>.mvt`.
+1. Check pre-generated PMTiles and `<dataset>/mvt/<z>/<x>/<y>.mvt`.
 2. If missing, read matching GeoParquet partitions and generate the MVT on the
    fly.
-3. Generated tiles are not persisted to disk.
+3. If `attributes` is provided for an on-the-fly tile, only those attributes
+   are read from GeoParquet and encoded.
+4. Generated tiles are not persisted to disk.
 
 Typical web response:
 
 ```python
-from flask import Response
+from flask import Response, request
 
 @app.get("/tiles/<dataset>/<int:z>/<int:x>/<int:y>.mvt")
 def tile(dataset: str, z: int, x: int, y: int):
-    data = starlet.get_tile(f"datasets/{dataset}", z, x, y)
+    attrs = request.args.get("attributes")
+    attributes = [a.strip() for a in attrs.split(",") if a.strip()] if attrs else None
+    data = starlet.get_tile(f"datasets/{dataset}", z, x, y, attributes=attributes)
     return Response(data, mimetype="application/vnd.mapbox-vector-tile")
 ```
+
+The built-in REST server accepts the same whitelist as a comma-separated
+query parameter, for example
+`/postal_codes/7/22/49.mvt?attributes=name,population`.
 
 ## Histogram Estimate
 

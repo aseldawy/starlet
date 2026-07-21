@@ -106,6 +106,53 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
     assert features[0]["properties"] == {"_id": 10, "id": 1}
 
 
+def test_generate_single_mvt_tile_projects_requested_attributes(tmp_path, monkeypatch):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "id": [1],
+            "name": ["keep"],
+            "unused": ["drop"],
+            "_bbox_xmin": [-100.0],
+            "_bbox_ymin": [80.0],
+            "_bbox_xmax": [-100.0],
+            "_bbox_ymax": [80.0],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    read_columns = []
+    original_read_table = mvt_generator.pq.read_table
+
+    def recording_read_table(*args, **kwargs):
+        read_columns.append(kwargs.get("columns"))
+        return original_read_table(*args, **kwargs)
+
+    monkeypatch.setattr(mvt_generator.pq, "read_table", recording_read_table)
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+        attributes=["name"],
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {"name": "keep"}
+    assert read_columns == [["geometry", "name", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"]]
+
+
 def test_generate_single_mvt_tile_flattens_nested_map_properties(tmp_path):
     dataset_dir = tmp_path / "dataset"
     parquet_dir = dataset_dir / "parquet_tiles"

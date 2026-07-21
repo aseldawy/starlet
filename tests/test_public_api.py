@@ -322,11 +322,13 @@ def test_vector_tiler_only_caches_generated_tiles(temp_dir, monkeypatch):
     tiler = VectorTiler(str(dataset_dir), memory_cache_size=8)
 
     assert tiler.get_tile(0, 0, 0) == disk_bytes
-    assert (0, 0, 0) not in tiler.cache.store
+    assert (0, 0, 0, None) not in tiler.cache.store
 
     generated_bytes = b"generated-tile"
+    captured = {}
 
     def fake_generate_single_mvt_tile(dataset_root, tile_coords, **kwargs):
+        captured.update(kwargs)
         return generated_bytes
 
     monkeypatch.setattr(
@@ -335,7 +337,60 @@ def test_vector_tiler_only_caches_generated_tiles(temp_dir, monkeypatch):
     )
 
     assert tiler.get_tile(1, 0, 0) == generated_bytes
-    assert tiler.cache.store[(1, 0, 0)] == generated_bytes
+    assert tiler.cache.store[(1, 0, 0, None)] == generated_bytes
+    assert captured["attributes"] is None
+
+
+def test_get_tile_returns_prebuilt_tile_when_attributes_are_requested(temp_dir, monkeypatch):
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+    tile_path = dataset_dir / "mvt" / "0" / "0" / "0.mvt"
+    tile_path.parent.mkdir(parents=True)
+    disk_bytes = b"disk-tile"
+    tile_path.write_bytes(disk_bytes)
+
+    def fail_generate_single_mvt_tile(*args, **kwargs):
+        raise AssertionError("prebuilt tiles should be returned without generation")
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.generate_single_mvt_tile",
+        fail_generate_single_mvt_tile,
+    )
+
+    output = {}
+    data = starlet.get_tile(dataset_dir, 0, 0, 0, output=output, attributes=["name", "id"])
+
+    assert data == disk_bytes
+    assert output["source"] == "disk"
+    assert output["generation"] == "read_from_disk"
+    assert "attributes" not in output
+
+
+def test_get_tile_forwards_attribute_whitelist_on_generated_miss(temp_dir, monkeypatch):
+    dataset_dir = temp_dir / "tile_dataset"
+    (dataset_dir / "parquet_tiles").mkdir(parents=True)
+
+    generated_bytes = b"generated-tile"
+    captured = {}
+
+    def fake_generate_single_mvt_tile(dataset_root, tile_coords, **kwargs):
+        captured["dataset_root"] = dataset_root
+        captured["tile_coords"] = tile_coords
+        captured.update(kwargs)
+        return generated_bytes
+
+    monkeypatch.setattr(
+        "starlet._internal.mvt.mvt_generator.generate_single_mvt_tile",
+        fake_generate_single_mvt_tile,
+    )
+
+    output = {}
+    data = starlet.get_tile(dataset_dir, 0, 0, 0, output=output, attributes=["name", "id"])
+
+    assert data == generated_bytes
+    assert output["source"] == "generated"
+    assert output["attributes"] == ["id", "name"]
+    assert captured["attributes"] == ("id", "name")
 
 
 def test_query_dataset_uses_indexed_tile(temp_dir, sample_parquet_file):

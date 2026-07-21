@@ -94,6 +94,7 @@ def get_tile(
     x: int,
     y: int,
     output: dict[str, Any] | None = None,
+    attributes: Sequence[str] | None = None,
 ) -> bytes:
     """Return a pre-generated MVT tile or generate it on the fly.
 
@@ -103,8 +104,12 @@ def get_tile(
     If ``output`` is provided, it is updated with details such as where the tile
     came from and how long serving took. On-the-fly generation also reports the
     number of encoded features.
+
+    Pass ``attributes`` to limit non-geometry attributes when the tile is
+    generated from GeoParquet. Geometry is always included. Pre-generated
+    MVT/PMTiles are returned as-is.
     """
-    return _get_cached_vector_tiler(dataset_dir).get_tile(z, x, y, output=output)
+    return _get_cached_vector_tiler(dataset_dir).get_tile(z, x, y, output=output, attributes=attributes)
 
 
 def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:

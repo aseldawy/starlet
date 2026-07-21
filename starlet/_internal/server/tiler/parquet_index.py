@@ -219,8 +219,10 @@ class ParquetIndex:
         crs,
         *,
         include_feature_id: bool = False,
+        attributes: frozenset[str] | None = None,
     ) -> gpd.GeoDataFrame:
-        table = pq.read_table(path)
+        columns = self._projected_columns(path, geom_col, attributes)
+        table = pq.read_table(path, columns=columns)
         return self._table_to_geodataframe(
             table,
             geom_col,
@@ -258,6 +260,7 @@ class ParquetIndex:
         crs,
         target_crs=WEB_MERCATOR_CRS,
         include_feature_id: bool = False,
+        attributes: frozenset[str] | None = None,
     ) -> gpd.GeoDataFrame:
         """Read only rows whose bbox overlaps ``bbox_native``, reprojected if requested.
 
@@ -271,7 +274,8 @@ class ParquetIndex:
             & (pc.field("_bbox_ymax") >= miny)
             & (pc.field("_bbox_ymin") <= maxy)
         )
-        table = pq.read_table(path, filters=flt)
+        columns = self._projected_columns(path, geom_col, attributes, include_bbox=True)
+        table = pq.read_table(path, filters=flt, columns=columns)
         return self._table_to_geodataframe(
             table,
             geom_col,
@@ -287,6 +291,7 @@ class ParquetIndex:
         *,
         target_crs=WEB_MERCATOR_CRS,
         include_feature_id: bool = False,
+        attributes: frozenset[str] | None = None,
     ) -> gpd.GeoDataFrame:
         """Load a partition in ``target_crs``, pruned to ``bbox_4326`` when given.
 
@@ -312,9 +317,21 @@ class ParquetIndex:
                     crs,
                     target_crs=target_crs,
                     include_feature_id=include_feature_id,
+                    attributes=attributes,
                 )
 
-        gdf, bounds = self._read_native(path, include_feature_id=include_feature_id)
+        if attributes is None:
+            gdf, bounds = self._read_native(path, include_feature_id=include_feature_id)
+        else:
+            _, geom_col, _, crs = self._schema_info(path)
+            gdf = self._read_wkb_table(
+                path,
+                geom_col,
+                crs,
+                include_feature_id=include_feature_id,
+                attributes=attributes,
+            )
+            bounds = gdf.geometry.bounds
         if bbox_4326 is not None and len(gdf):
             bbox_native = self._transform_bbox(bbox_4326, WGS84_CRS, gdf.crs or WGS84_CRS)
             minx, miny, maxx, maxy = bbox_native
@@ -337,6 +354,22 @@ class ParquetIndex:
         """Backward-compatible wrapper around :meth:`load_partition`."""
         return self.load_partition(path, bbox_4326, target_crs=WEB_MERCATOR_CRS)
 
+    def _projected_columns(
+        self,
+        path: Path,
+        geom_col: str,
+        attributes: frozenset[str] | None,
+        *,
+        include_bbox: bool = False,
+    ) -> list[str] | None:
+        if attributes is None:
+            return None
+        names, _, _, _ = self._schema_info(path)
+        required = {geom_col}
+        if include_bbox:
+            required.update(BBOX_COLS)
+        return [name for name in names if name in required or name in attributes]
+
     def iter_query_batches(
         self,
         geometry: Sequence[float] | dict[str, Any] | Any,
@@ -345,6 +378,7 @@ class ParquetIndex:
         target_crs: str = WGS84_CRS,
         batch_size: int | None = None,
         include_feature_id: bool = False,
+        attributes: frozenset[str] | None = None,
     ) -> Iterator[gpd.GeoDataFrame]:
         """Yield batches of records whose geometries intersect ``geometry``."""
         query_geom = _coerce_geometry(geometry)
@@ -358,6 +392,7 @@ class ParquetIndex:
                 query_bounds_4326,
                 target_crs=target_crs,
                 include_feature_id=include_feature_id,
+                attributes=attributes,
             )
             if gdf.empty:
                 continue

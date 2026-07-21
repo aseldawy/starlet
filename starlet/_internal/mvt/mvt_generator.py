@@ -35,7 +35,7 @@ from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile, feat
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
 from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
-from starlet._internal.internal_columns import MVT_EXCLUDED_ATTRIBUTE_COLS
+from starlet._internal.internal_columns import BBOX_COLS, MVT_EXCLUDED_ATTRIBUTE_COLS
 from starlet._internal.server.tiler.parquet_index import ParquetIndex
 from starlet._internal.tiling.crs import WEB_MERCATOR_CRS, WGS84_CRS, geoparquet_crs, reproject_geometries
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
@@ -381,6 +381,7 @@ def generate_single_mvt_tile(
     extent: int | None = None,
     buffer: int | None = None,
     layer_name: str = "layer0",
+    attributes: Sequence[str] | None = None,
 ) -> bytes:
     """Generate one MVT tile directly from an indexed Starlet dataset."""
     feature_capacity = int(
@@ -398,17 +399,20 @@ def generate_single_mvt_tile(
     query_bounds = _expand_tile_bounds_for_buffer(tile_bounds, extent, buffer)
     index = _single_tile_parquet_index(parquet_dir)
     query_bounds_4326 = index._transform_bbox(query_bounds, WEB_MERCATOR_CRS, WGS84_CRS)
+    attribute_set = _normalize_attribute_whitelist(attributes)
 
     sampled_features = _sample_single_tile_records(
         index,
         query_bounds_4326,
         feature_capacity,
+        attributes=attribute_set,
     )
     if sampled_features is None:
         sampled_features = _sample_single_tile_records_legacy(
             index,
             query_bounds_4326,
             feature_capacity,
+            attributes=attribute_set,
         )
 
     tile = IntermediateVectorTile(
@@ -430,6 +434,8 @@ def _sample_single_tile_records(
     index: ParquetIndex,
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]] | None:
     """Top-k sample raw parquet rows by priority before WKB parsing.
 
@@ -453,7 +459,7 @@ def _sample_single_tile_records(
             return None
 
         bbox_native = index._transform_bbox(query_bounds_4326, WGS84_CRS, crs)
-        table = _read_bbox_filtered_table(path, bbox_native)
+        table = _read_bbox_filtered_table(path, bbox_native, geom_col=geom_col, attributes=attributes)
         if table.num_rows == 0:
             continue
         for row_idx, geometry_wkb in enumerate(table[geom_col].to_pylist()):
@@ -488,10 +494,19 @@ def _row_attrs(table: pa.Table, geom_col: str, row_idx: int) -> dict[str, Any]:
     return attrs
 
 
+def _normalize_attribute_whitelist(attributes: Sequence[str] | None) -> frozenset[str] | None:
+    if attributes is None:
+        return None
+    normalized = frozenset(str(attribute).strip() for attribute in attributes if str(attribute).strip())
+    return normalized
+
+
 def _sample_single_tile_records_legacy(
     index: ParquetIndex,
     query_bounds_4326: tuple[float, float, float, float],
     feature_capacity: int,
+    *,
+    attributes: frozenset[str] | None = None,
 ) -> list[tuple[Any, dict[str, Any], int]]:
     """Top-k sample after exact legacy geometry filtering (no bbox columns).
 
@@ -508,6 +523,7 @@ def _sample_single_tile_records_legacy(
         query_bounds_4326,
         target_crs=WEB_MERCATOR_CRS,
         include_feature_id=True,
+        attributes=attributes,
     ):
         col_arrays = {
             column: gdf[column].to_numpy()
@@ -537,7 +553,13 @@ def _sample_single_tile_records_legacy(
     ]
 
 
-def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float, float]) -> pa.Table:
+def _read_bbox_filtered_table(
+    path: Path,
+    bbox_native: tuple[float, float, float, float],
+    *,
+    geom_col: str,
+    attributes: frozenset[str] | None = None,
+) -> pa.Table:
     minx, miny, maxx, maxy = bbox_native
     flt = (
         (pc.field("_bbox_xmax") >= minx)
@@ -545,7 +567,12 @@ def _read_bbox_filtered_table(path: Path, bbox_native: tuple[float, float, float
         & (pc.field("_bbox_ymax") >= miny)
         & (pc.field("_bbox_ymin") <= maxy)
     )
-    return pq.read_table(path, filters=flt)
+    columns = None
+    if attributes is not None:
+        names = pq.ParquetFile(path).schema_arrow.names
+        required = {geom_col, *BBOX_COLS}
+        columns = [name for name in names if name in required or name in attributes]
+    return pq.read_table(path, filters=flt, columns=columns)
 
 
 def _decode_sampled_features(

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import mapbox_vector_tile
+import numpy as np
 import pyarrow as pa
 import shapely
 from shapely.affinity import affine_transform
@@ -329,6 +330,8 @@ def _is_map_entries(value: Any) -> bool:
 
 
 def _mvt_property_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, (str, int, float, bool)):
         return value
     return str(value)

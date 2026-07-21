@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from starlet._internal.config import config_value, ensure_config_loaded
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
+from starlet._internal.internal_columns import QUERY_INTERNAL_COLS
 
 if TYPE_CHECKING:
     import geopandas as gpd
@@ -23,13 +24,7 @@ GLOBAL_BBOX: BBox = (-LIM, -LIM, LIM, LIM)
 
 _TILER_CACHE: dict[tuple[str, int, int, int, int], Any] = {}
 _TILER_CACHE_LOCK = threading.Lock()
-_INTERNAL_QUERY_COLUMNS = frozenset((
-    "_tile_id",
-    "_bbox_xmin",
-    "_bbox_ymin",
-    "_bbox_xmax",
-    "_bbox_ymax",
-))
+_INTERNAL_QUERY_COLUMNS = frozenset(QUERY_INTERNAL_COLS)
 
 
 def _configured_tiler_cache_size() -> int:

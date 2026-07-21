@@ -299,6 +299,10 @@ def test_query_dataset_hides_internal_tile_columns(temp_dir, sample_parquet_tabl
         "_tile_id",
         pa.array([0] * sample_parquet_table.num_rows, type=pa.int64()),
     )
+    internal_table = internal_table.append_column(
+        "_id",
+        pa.array(list(range(sample_parquet_table.num_rows)), type=pa.int64()),
+    )
     for col in ("_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"):
         internal_table = internal_table.append_column(
             col,
@@ -309,7 +313,7 @@ def test_query_dataset_hides_internal_tile_columns(temp_dir, sample_parquet_tabl
     result = next(starlet.query_dataset(dataset_dir, (0, 0, 15, 15)))
     record = starlet.get_sample_record(dataset_dir, (0, 0, 15, 15))
 
-    internal_columns = {"_tile_id", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"}
+    internal_columns = {"_id", "_tile_id", "_bbox_xmin", "_bbox_ymin", "_bbox_xmax", "_bbox_ymax"}
     assert internal_columns.isdisjoint(result.columns)
     assert record is not None
     assert internal_columns.isdisjoint(record)

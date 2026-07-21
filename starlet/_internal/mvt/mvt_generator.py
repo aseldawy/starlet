@@ -35,19 +35,14 @@ from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile, feat
 from starlet._internal.mvt.pyramid_partitioner import PyramidPartitioner
 from starlet._internal.pmtiles.paths import default_pmtiles_path
 from starlet._internal.pmtiles.exporter import export_to_pmtiles
-from starlet._internal.server.tiler.parquet_index import INTERNAL_COLS, ParquetIndex
+from starlet._internal.internal_columns import MVT_EXCLUDED_ATTRIBUTE_COLS
+from starlet._internal.server.tiler.parquet_index import ParquetIndex
 from starlet._internal.tiling.crs import WEB_MERCATOR_CRS, WGS84_CRS, geoparquet_crs, reproject_geometries
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 
 logger = logging.getLogger(__name__)
 
-_INTERNAL_ATTRIBUTE_COLUMNS = {
-    "_tile_id",
-    "_bbox_xmin",
-    "_bbox_ymin",
-    "_bbox_xmax",
-    "_bbox_ymax",
-}
+_INTERNAL_ATTRIBUTE_COLUMNS = set(MVT_EXCLUDED_ATTRIBUTE_COLS)
 _SINGLE_TILE_INDEX_CACHE_SIZE = 16
 _single_tile_index_cache: "OrderedDict[str, ParquetIndex]" = OrderedDict()
 _REDUCE_GROUP_SIZE = 10
@@ -478,7 +473,7 @@ def _row_attrs(table: pa.Table, geom_col: str, row_idx: int) -> dict[str, Any]:
     """Attribute dict for a single sampled row (winners only)."""
     attrs: dict[str, Any] = {}
     for column in table.column_names:
-        if column == geom_col or column in INTERNAL_COLS:
+        if column == geom_col or column in _INTERNAL_ATTRIBUTE_COLUMNS:
             continue
         value = table[column][row_idx].as_py()
         if value is not None:
@@ -502,11 +497,15 @@ def _sample_single_tile_records_legacy(
     heap: list[tuple[int, int, Any, dict[str, Any], int]] = []
     seq = 0
 
-    for gdf in index.iter_query_batches(query_bounds_4326, target_crs=WEB_MERCATOR_CRS):
+    for gdf in index.iter_query_batches(
+        query_bounds_4326,
+        target_crs=WEB_MERCATOR_CRS,
+        include_feature_id=True,
+    ):
         col_arrays = {
             column: gdf[column].to_numpy()
             for column in gdf.columns
-            if column != "geometry" and column not in INTERNAL_COLS
+            if column != "geometry" and column not in _INTERNAL_ATTRIBUTE_COLUMNS
         }
         for row_idx, geom in enumerate(gdf.geometry.values):
             if geom is None or geom.is_empty:

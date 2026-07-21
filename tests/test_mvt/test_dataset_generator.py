@@ -81,6 +81,7 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
                 wkb.dumps(Point(-100.0, 80.0)),
                 wkb.dumps(Point(100.0, -80.0)),
             ],
+            "_id": [10, 11],
             "id": [1, 2],
             "_bbox_xmin": [-100.0, 100.0],
             "_bbox_ymin": [80.0, -80.0],
@@ -102,7 +103,7 @@ def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
 
     features = decoded["layer0"]["features"]
     assert len(features) == 1
-    assert features[0]["properties"] == {"id": 1}
+    assert features[0]["properties"] == {"_id": 10, "id": 1}
 
 
 def test_generate_single_mvt_tile_flattens_nested_map_properties(tmp_path):
@@ -145,6 +146,42 @@ def test_generate_single_mvt_tile_flattens_nested_map_properties(tmp_path):
         "tagsMap.name": "Oak Hill",
         "tagsMap.landuse": "cemetery",
     }
+
+
+def test_generate_single_mvt_tile_keeps_feature_id_without_bbox_columns(tmp_path):
+    dataset_dir = tmp_path / "dataset"
+    parquet_dir = dataset_dir / "parquet_tiles"
+    parquet_dir.mkdir(parents=True)
+    geo = {
+        "version": "1.1.0",
+        "primary_column": "geometry",
+        "columns": {"geometry": {"encoding": "WKB", "crs": "EPSG:4326"}},
+    }
+    table = pa.table(
+        {
+            "geometry": [wkb.dumps(Point(-100.0, 80.0))],
+            "_id": [42],
+            "id": [1],
+        }
+    ).replace_schema_metadata({b"geo": json.dumps(geo).encode("utf-8")})
+    pq.write_table(
+        table,
+        parquet_dir / "tile_000000__-100_0_80_0_-100_0_80_0.parquet",
+    )
+
+    # Warm the public-query cache first; on-demand MVT must still be able to
+    # opt into _id even if a hidden-column read happened earlier.
+    index = ParquetIndex(parquet_dir)
+    assert "_id" not in next(index.iter_query_batches((-101.0, 79.0, -99.0, 81.0))).columns
+
+    tile_bytes = generate_single_mvt_tile(
+        str(dataset_dir),
+        (1, 0, 0),
+        feature_capacity=10,
+    )
+    decoded = mapbox_vector_tile.decode(tile_bytes)
+
+    assert decoded["layer0"]["features"][0]["properties"] == {"_id": 42, "id": 1}
 
 
 def test_generate_single_mvt_tile_queries_buffered_tile_bounds(tmp_path):

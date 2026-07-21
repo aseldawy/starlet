@@ -18,6 +18,7 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 from starlet._internal.executor import create_process_executor
+from starlet._internal.internal_columns import FEATURE_ID_COL, TILE_ID_COL
 from starlet._internal.tiling.datasource import DataSource
 from starlet._internal.tiling.writer_pool import (
     SortKey,
@@ -30,7 +31,7 @@ from starlet._internal.config import resolve_temp_dir
 
 logger = logging.getLogger(__name__)
 
-_TILE_COL = "_tile_id"
+_TILE_COL = TILE_ID_COL
 _INTERMEDIATE_SUFFIX = ".arrow"
 _INTERMEDIATE_BATCH_SIZE = 64_000
 _MIN_MERGE_FAN_IN = 16
@@ -73,6 +74,27 @@ def _table_with_partition_column(original_table: pa.Table, partition_table: pa.T
     return original_table.append_column(
         _TILE_COL,
         partition_table.column(0).cast(pa.int64()),
+    )
+
+
+def _table_with_feature_id_column(
+    original_table: pa.Table,
+    *,
+    mapper_index: int,
+    mapper_count: int,
+    start_offset: int,
+) -> pa.Table:
+    if FEATURE_ID_COL in original_table.column_names:
+        raise ValueError(f"input table already contains internal column {FEATURE_ID_COL!r}")
+    if mapper_count <= 0:
+        raise ValueError("mapper_count must be positive")
+    ids = [
+        int(mapper_index) + (start_offset + row_index) * int(mapper_count)
+        for row_index in range(original_table.num_rows)
+    ]
+    return original_table.append_column(
+        FEATURE_ID_COL,
+        pa.array(ids, type=pa.int64()),
     )
 
 
@@ -405,6 +427,7 @@ def _assignment_stage_worker(
     num_reducers: int,
     temp_dir: str,
     compression: Optional[str],
+    mapper_count: int,
     collect_stats: bool = False,
     geom_col: str = "geometry",
 ) -> _ShardManifest:
@@ -413,6 +436,7 @@ def _assignment_stage_worker(
 
     reducer_run_paths: Dict[int, List[str]] = defaultdict(list)
     rows_read = 0
+    feature_id_offset = 0
     rows_assigned = 0
     batches_read = 0
     # Partial attribute statistics for this split. Collected here (where every
@@ -435,7 +459,14 @@ def _assignment_stage_worker(
             stats_collector.consume_table(table)
 
         partition_table = assigner.partition_by_tile(table)
-        assigned_table = _table_with_partition_column(table, partition_table)
+        table_with_id = _table_with_feature_id_column(
+            table,
+            mapper_index=split_index,
+            mapper_count=mapper_count,
+            start_offset=feature_id_offset,
+        )
+        feature_id_offset += table.num_rows
+        assigned_table = _table_with_partition_column(table_with_id, partition_table)
         grouped = _group_table_by_reducer(assigned_table, num_reducers)
 
         for reducer_id, reducer_table in grouped.items():
@@ -671,6 +702,7 @@ class TwoStageOrchestrator:
                     num_reducers,
                     str(temp_root),
                     self.compression,
+                    len(splits),
                     self.collect_stats,
                     self.geom_col,
                 )

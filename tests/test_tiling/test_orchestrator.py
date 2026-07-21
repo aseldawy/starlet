@@ -181,6 +181,12 @@ class TestTwoStageOrchestrator:
         assert tile_files
         total_rows = sum(pq.read_metadata(str(path)).num_rows for path in tile_files)
         assert total_rows == len(sample_polygons)
+        tables = [pq.read_table(path) for path in tile_files]
+        ids = []
+        for table in tables:
+            assert "_id" in table.column_names
+            ids.extend(table["_id"].to_pylist())
+        assert sorted(ids) == list(range(len(sample_polygons)))
 
     def test_two_stage_orchestrator_uses_custom_temp_dir(self, sample_parquet_file, sample_polygons, temp_dir):
         source = GeoParquetSource(str(sample_parquet_file))
@@ -217,8 +223,47 @@ class TestTwoStageOrchestrator:
         assert intermediate_files
         for path in intermediate_files:
             with pa.memory_map(str(path), "r") as source:
-                tile_ids = ipc.open_file(source).read_all()["_tile_id"].to_pylist()
+                table = ipc.open_file(source).read_all()
+                tile_ids = table["_tile_id"].to_pylist()
+                feature_ids = table["_id"].to_pylist()
             assert tile_ids == sorted(tile_ids)
+            assert all(feature_id % 2 in {0, 1} for feature_id in feature_ids)
+
+    def test_assignment_worker_feature_ids_follow_mapper_stride(self, sample_parquet_file, sample_polygons, temp_dir):
+        source = GeoParquetSource(str(sample_parquet_file))
+        splits = list(source.create_splits())
+        centers = np.array(
+            [[geom.centroid.x for geom in sample_polygons], [geom.centroid.y for geom in sample_polygons]],
+            dtype=np.float64,
+        )
+        bounds = np.array([geom.bounds for geom in sample_polygons], dtype=np.float64)
+        mbr = EnvelopeNDLite(
+            np.array([bounds[:, 0].min(), bounds[:, 1].min()], dtype=np.float64),
+            np.array([bounds[:, 2].max(), bounds[:, 3].max()], dtype=np.float64),
+        )
+        assigner = RSGroveAssigner.from_sample_and_mbr(
+            sample_points=centers,
+            mbr=mbr,
+            num_partitions=2,
+        )
+
+        manifest = two_stage_module._assignment_stage_worker(
+            source,
+            splits[0],
+            1,
+            assigner,
+            2,
+            str(temp_dir),
+            None,
+            3,
+            False,
+        )
+
+        feature_ids = []
+        for path in manifest.intermediate_by_reducer.values():
+            with pa.memory_map(path, "r") as source_file:
+                feature_ids.extend(ipc.open_file(source_file).read_all()["_id"].to_pylist())
+        assert sorted(feature_ids) == [1, 4, 7, 10, 13]
 
 
 class TestOrchestratorErrorHandling:

@@ -7,8 +7,10 @@ Tests cover:
 - Error handling for missing files
 - Schema validation
 """
+import bz2
 import json
 import logging
+import os
 import struct
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +57,10 @@ def _multicurve_wkb(lines):
     for coords in lines:
         data.extend(_linestring_wkb(coords))
     return bytes(data)
+
+
+def _write_bz2(path: Path, data: bytes, *, compresslevel: int = 1) -> None:
+    path.write_bytes(bz2.compress(data, compresslevel=compresslevel))
 
 
 class TestGeoParquetSource:
@@ -602,6 +608,34 @@ class TestGeoJSONSource:
         assert {Path(split.path).name for split in splits} == {"part-0.geojson", "part-1.geojson"}
         assert ids == [1, 2]
 
+    def test_bzip2_feature_collection_splits_read_features_once(self, temp_dir):
+        features = [
+            {
+                "type": "Feature",
+                "properties": {
+                    "id": i,
+                    "blob": os.urandom(120).hex(),
+                },
+                "geometry": {"type": "Point", "coordinates": [float(i), float(i)]},
+            }
+            for i in range(8_000)
+        ]
+        payload = json.dumps({"type": "FeatureCollection", "features": features}).encode("utf-8")
+        json_path = temp_dir / "features.geojson.bz2"
+        _write_bz2(json_path, payload, compresslevel=1)
+
+        source = GeoJSONSource(str(json_path), batch_rows=256)
+        splits = source.create_splits(num_splits=4)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert len(splits) == 4
+        assert ids == list(range(8_000))
+
     def test_read_spatial_sample_returns_mbr_and_sample(self, temp_dir):
         """Test standalone sampling reads centroids and global MBR from a file."""
         geojson = {
@@ -804,6 +838,27 @@ class TestCSVSource:
 
         assert ids == [1, 2, 3, 4]
 
+    def test_bzip2_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv.bz2"
+        header = "id,x,y,name\n".encode("utf-8")
+        rows = [
+            f"{i},{i},{i + 1},{os.urandom(96).hex()}\n".encode("utf-8")
+            for i in range(14_000)
+        ]
+        _write_bz2(csv_path, header + b"".join(rows), compresslevel=1)
+
+        source = CSVSource(str(csv_path), x_col="x", y_col="y")
+        splits = source.create_splits(num_splits=4)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["id"].to_pylist()
+        ]
+
+        assert len(splits) == 4
+        assert ids == list(range(14_000))
+
     def test_create_splits_does_not_open_csv(self, temp_dir, monkeypatch):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
@@ -832,6 +887,15 @@ class TestCSVSource:
     def test_source_for_path_detects_csv(self, temp_dir):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text("id,x,y\n1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_col="x", csv_y_col="y")
+
+        assert isinstance(source, CSVSource)
+        assert next(source.iter_tables()).column_names[-1] == "geom"
+
+    def test_source_for_path_detects_bzip2_csv(self, temp_dir):
+        csv_path = temp_dir / "points.csv.bz2"
+        _write_bz2(csv_path, b"id,x,y\n1,0,1\n")
 
         source = source_for_path(str(csv_path), geom_col="geom", csv_x_col="x", csv_y_col="y")
 

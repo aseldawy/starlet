@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import bz2
 from dataclasses import dataclass
 import io
 import logging
+import os
 import re
 from typing import Iterable, List, Optional
 
@@ -19,6 +21,8 @@ from starlet._internal.tiling.datasource import (
 )
 
 logger = logging.getLogger(__name__)
+_BZ2_BLOCK_MAGIC = bytes.fromhex("314159265359")
+_BZ2_STREAM_HEADER_LEN = 4
 
 
 @dataclass(frozen=True)
@@ -241,6 +245,9 @@ def _parse_csv_value(value: object, arrow_type: pa.DataType):
 
 
 def _read_csv_split_bytes(split: CSVSplit) -> bytes | None:
+    if split.path.lower().endswith(".bz2"):
+        return _read_bz2_csv_split_bytes(split)
+
     split_start = split.offset
     split_end = split.offset + split.length
     with open(split.path, "rb") as f:
@@ -272,3 +279,98 @@ def _read_csv_split_bytes(split: CSVSplit) -> bytes | None:
     if not rows:
         return None
     return header + bytes(rows)
+
+
+def _read_bz2_csv_split_bytes(split: CSVSplit) -> bytes | None:
+    block_starts, file_size = _bz2_block_starts(split.path)
+    split_end = min(split.offset + split.length, file_size)
+    first_owned = next((start for start in block_starts if start >= split.offset), None)
+    if first_owned is None or first_owned >= split_end:
+        return None
+
+    stop_before = next((start for start in block_starts if start >= split_end), file_size)
+    payload, previous_output_ended_with_newline, owned_output_len = _decompress_bz2_owned_blocks(
+        split.path,
+        block_starts=block_starts,
+        first_owned=first_owned,
+        stop_before=stop_before,
+    )
+    if not payload:
+        return None
+
+    if split.offset > 0 and not previous_output_ended_with_newline:
+        first_newline = payload.find(b"\n")
+        if first_newline == -1:
+            return None
+        payload = payload[first_newline + 1 :]
+        owned_output_len = max(0, owned_output_len - (first_newline + 1))
+
+    if stop_before < file_size:
+        if owned_output_len <= 0:
+            return None
+        if payload[:owned_output_len].endswith(b"\n"):
+            payload = payload[:owned_output_len]
+        else:
+            trailing_newline = payload.find(b"\n", owned_output_len)
+            if trailing_newline == -1:
+                return None
+            payload = payload[: trailing_newline + 1]
+
+    if not payload:
+        return None
+    if split.offset == 0:
+        return payload
+    return _read_bz2_header_line(split.path) + payload
+
+
+def _read_bz2_header_line(path: str) -> bytes:
+    with bz2.open(path, "rb") as stream:
+        return stream.readline()
+
+
+def _bz2_block_starts(path: str) -> tuple[list[int], int]:
+    with open(path, "rb") as stream:
+        data = stream.read()
+    starts = [match.start() for match in re.finditer(re.escape(_BZ2_BLOCK_MAGIC), data)]
+    if not starts:
+        starts = [_BZ2_STREAM_HEADER_LEN]
+    return starts, len(data)
+
+
+def _decompress_bz2_owned_blocks(
+    path: str,
+    *,
+    block_starts: list[int],
+    first_owned: int,
+    stop_before: int,
+) -> tuple[bytes, bool, int]:
+    with open(path, "rb") as stream:
+        header = stream.read(_BZ2_STREAM_HEADER_LEN)
+        decompressor = bz2.BZ2Decompressor()
+        header_output = decompressor.decompress(header)
+
+        owned_output = bytearray()
+        last_discarded_byte = header_output[-1:] if header_output else b"\n"
+        boundaries = [start for start in block_starts if start >= _BZ2_STREAM_HEADER_LEN]
+        if not boundaries or boundaries[0] != _BZ2_STREAM_HEADER_LEN:
+            boundaries.insert(0, _BZ2_STREAM_HEADER_LEN)
+        lookahead_stop = next((start for start in boundaries if start > stop_before), None)
+        boundaries.append(lookahead_stop if lookahead_stop is not None else os.path.getsize(path))
+        owned_output_len = 0
+
+        for segment_start, segment_end in zip(boundaries, boundaries[1:]):
+            if segment_start > stop_before:
+                break
+            if segment_end <= segment_start:
+                continue
+            stream.seek(segment_start)
+            chunk = stream.read(segment_end - segment_start)
+            decoded = decompressor.decompress(chunk)
+            if segment_start >= first_owned:
+                owned_output.extend(decoded)
+                if segment_start < stop_before:
+                    owned_output_len = len(owned_output)
+            elif decoded:
+                last_discarded_byte = decoded[-1:]
+
+    return bytes(owned_output), last_discarded_byte == b"\n", owned_output_len

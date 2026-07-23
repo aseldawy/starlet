@@ -19,8 +19,17 @@ from starlet._internal.tiling.utils_large import ensure_large_types
 
 logger = logging.getLogger(__name__)
 _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
-_GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
-_CSV_SUFFIXES = (".csv",".tsv",)
+_GEOJSON_SUFFIXES = (
+    ".geojson",
+    ".geojsonl",
+    ".json",
+    ".jsonl",
+    ".geojson.bz2",
+    ".geojsonl.bz2",
+    ".json.bz2",
+    ".jsonl.bz2",
+)
+_CSV_SUFFIXES = (".csv", ".tsv", ".csv.bz2", ".tsv.bz2")
 _PLT_SUFFIXES = (".plt",)
 _GPX_SUFFIXES = (".gpx",)
 _SHAPEFILE_SUFFIXES = (".shp",)
@@ -72,7 +81,7 @@ def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
         return sorted(
             file_path
             for file_path in source_path.rglob("*")
-            if file_path.is_file() and file_path.suffix.lower() in suffixes
+            if file_path.is_file() and str(file_path).lower().endswith(suffixes)
         )
     raise FileNotFoundError(f"Source path does not exist: {path}")
 
@@ -98,17 +107,18 @@ def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
 def _source_kind(path: str) -> str:
     source_path = Path(path)
     if source_path.is_file():
-        suffix = source_path.suffix.lower()
-        if suffix in _GEOJSON_SUFFIXES:
+        lower_path = str(source_path).lower()
+        if lower_path.endswith(_GEOJSON_SUFFIXES):
             return "geojson"
-        if suffix in _GEOPARQUET_SUFFIXES:
+        if lower_path.endswith(_GEOPARQUET_SUFFIXES):
             return "geoparquet"
-        if suffix in _CSV_SUFFIXES:
+        if lower_path.endswith(_CSV_SUFFIXES):
             return "csv"
-        if suffix in _PLT_SUFFIXES:
+        if lower_path.endswith(_PLT_SUFFIXES):
             return "plt"
-        if suffix in _GPX_SUFFIXES:
+        if lower_path.endswith(_GPX_SUFFIXES):
             return "gpx"
+        suffix = source_path.suffix.lower()
         if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
             return "gdb"
         if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:

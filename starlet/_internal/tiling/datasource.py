@@ -31,7 +31,7 @@ _GEOJSON_SUFFIXES = (
     ".json.bz2",
     ".jsonl.bz2",
 )
-_CSV_SUFFIXES = (".csv", ".tsv", ".csv.bz2", ".tsv.bz2")
+_CSV_SUFFIXES = (".csv", ".tsv", ".txt", ".csv.bz2", ".tsv.bz2", ".txt.bz2")
 _PLT_SUFFIXES = (".plt",)
 _GPX_SUFFIXES = (".gpx",)
 _SHAPEFILE_SUFFIXES = (".shp",)

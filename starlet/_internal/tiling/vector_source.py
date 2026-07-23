@@ -22,7 +22,6 @@ from starlet._internal.tiling.datasource import (
     _ZIP_SUFFIXES,
     _attach_geoparquet_metadata,
     _normalize_decimal_columns,
-    _zip_gdb_member_dirs,
     _wkb_geometry_type,
 )
 from starlet._internal.tiling.nonlinear_wkb import linearize_wkb
@@ -329,6 +328,24 @@ def _dataset_size_path(path: str) -> str:
     if path.startswith("/vsizip/"):
         return path[len("/vsizip/") :]
     return path
+
+
+def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
+    """Return .gdb directory names contained in a zip archive."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except zipfile.BadZipFile:
+        return []
+
+    gdb_dirs = set()
+    for name in names:
+        parts = [part for part in Path(name).parts if part not in {"", "."}]
+        for index, part in enumerate(parts):
+            if part.lower().endswith(_GDB_SUFFIXES):
+                gdb_dirs.add("/".join(parts[: index + 1]))
+                break
+    return sorted(gdb_dirs)
 
 
 def _extract_zipped_gdbs(path: Path) -> List[Path]:

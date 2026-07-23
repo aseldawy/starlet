@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import tarfile
 
 import pyarrow as pa
 import pytest
@@ -27,6 +28,20 @@ _PLT_HEADER = (
 def _write_plt(path: Path, rows: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_PLT_HEADER + "".join(f"{row}\n" for row in rows))
+
+
+def _write_tar(archive_path: Path, members: dict[str, str]) -> None:
+    with tarfile.open(archive_path, "w") as archive:
+        for name, content in members.items():
+            temp_path = archive_path.parent / name
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(content, encoding="utf-8")
+            archive.add(temp_path, arcname=name)
+            temp_path.unlink()
+            parent = temp_path.parent
+            while parent != archive_path.parent and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
 
 
 def test_plt_source_reads_files_recursively_and_groups_points(temp_dir):
@@ -117,3 +132,70 @@ def test_plt_source_reports_file_and_line_for_invalid_records(temp_dir):
 
     with pytest.raises(ValueError, match=r"broken\.plt at line 7: expected 7 fields"):
         list(source.iter_tables())
+
+
+def test_plt_source_reads_tar_members_across_splits(temp_dir, monkeypatch):
+    import starlet._internal.tiling.datasource as datasource_module
+
+    archive_path = temp_dir / "tracks.tar"
+    members = {
+        "user-a/track1.plt": _PLT_HEADER + "".join(
+            f"40.{i:06d},116.{i:06d},0,10,39979.0,2009-06-15,00:00:{i:02d}\n"
+            for i in range(12)
+        ),
+        "user-b/track2.PLT": _PLT_HEADER + "".join(
+            f"41.{i:06d},117.{i:06d},0,11,39980.0,2009-06-16,00:01:{i:02d}\n"
+            for i in range(12)
+        ),
+        "user-c/track3.plt": _PLT_HEADER + "".join(
+            f"42.{i:06d},118.{i:06d},0,12,39981.0,2009-06-17,00:02:{i:02d}\n"
+            for i in range(12)
+        ),
+    }
+    _write_tar(archive_path, members)
+    monkeypatch.setattr(datasource_module, "_TAR_SPLIT_SIZE", 2048)
+
+    source = source_for_path(str(archive_path))
+    tables = list(source.iter_tables())
+    table = pa.concat_tables(tables)
+
+    assert isinstance(source, PLTSource)
+    assert len(source.create_splits()) >= 2
+    assert sorted(table["filename"].to_pylist()) == [
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track1.plt",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track2.PLT",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+        "track3.plt",
+    ]

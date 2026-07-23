@@ -34,13 +34,13 @@ from starlet._internal.tiling.datasource import (
     GDBSource,
     ShapefileSource,
     _properties_dataframe_to_arrow_table,
-    _zip_gdb_member_dirs,
     read_spatial_sample,
     source_for_path,
 )
 from starlet._internal.tiling.geojson_source import iter_geojson_xy
 from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
+from starlet._internal.tiling.vector_source import _zip_gdb_member_dirs
 
 
 def _linestring_wkb(coords):
@@ -1161,6 +1161,54 @@ class TestGDBSource:
 
         assert isinstance(source, GDBSource)
         assert source._layers[0].path.endswith("CAMS-Export.gdb")
+
+    def test_source_for_path_detects_renamed_zipped_gdb(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        zip_path = temp_dir / "Export.zip"
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("CAMS-Export.gdb/gdb", "gdb\n")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtable", "")
+            archive.writestr("CAMS-Export.gdb/a00000001.gdbtablx", "")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path.endswith("CAMS-Export.gdb")
+
+    def test_source_for_path_detects_gdb_directory_by_marker_file(self, temp_dir, monkeypatch):
+        import pyogrio
+
+        gdb_path = temp_dir / "CAMS-Export.gdb"
+        gdb_path.mkdir()
+        (gdb_path / "gdb").write_text("gdb\n")
+        (gdb_path / "a00000001.gdbtable").write_text("")
+        (gdb_path / "a00000001.gdbtablx").write_text("")
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 1,
+                "geometry_type": "Point",
+            },
+        )
+
+        source = source_for_path(str(gdb_path))
+
+        assert isinstance(source, GDBSource)
+        assert source._layers[0].path == str(gdb_path)
 
 
 class TestDataSourceIntegration:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import io
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -10,9 +11,14 @@ from shapely import points, to_wkb
 
 from starlet._internal.tiling.datasource import (
     DataSource,
+    TarFileSplit,
+    _iter_tar_members_for_split,
     _PLT_SUFFIXES,
+    _TAR_SUFFIXES,
+    _source_tar_files,
     _attach_geoparquet_metadata,
     _source_files,
+    _tar_splits,
 )
 
 
@@ -21,6 +27,8 @@ class PLTSplit:
     """One GeoLife trajectory file, used as a natural source split."""
 
     path: str
+    tar_offset: int | None = None
+    tar_length: int | None = None
 
 
 class PLTSource(DataSource):
@@ -43,8 +51,8 @@ class PLTSource(DataSource):
         source_path = Path(path)
         if not source_path.exists():
             raise FileNotFoundError(f"Source path does not exist: {path}")
-        if source_path.is_file() and source_path.suffix.lower() not in _PLT_SUFFIXES:
-            raise ValueError(f"PLT source file must have a .plt extension: {path}")
+        if source_path.is_file() and source_path.suffix.lower() not in (*_PLT_SUFFIXES, *_TAR_SUFFIXES):
+            raise ValueError(f"PLT source file must have a .plt or .tar extension: {path}")
         if batch_rows <= 0:
             raise ValueError("batch_rows must be greater than zero")
 
@@ -52,8 +60,13 @@ class PLTSource(DataSource):
         self.batch_rows = int(batch_rows)
         self.geometry_only = bool(geometry_only)
         self.geom_col = geom_col
-        self._files = _source_files(self.path, _PLT_SUFFIXES)
-        if not self._files:
+        self._files = (
+            []
+            if source_path.is_file() and source_path.suffix.lower() in _TAR_SUFFIXES
+            else _source_files(self.path, _PLT_SUFFIXES)
+        )
+        self._tar_files = _source_tar_files(self.path, _PLT_SUFFIXES)
+        if not self._files and not self._tar_files:
             raise ValueError(f"No PLT files found in {self.path}")
         self._schema = self._default_schema()
 
@@ -84,42 +97,70 @@ class PLTSource(DataSource):
         self._schema = schema
 
     def input_size_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self._files)
+        return sum(path.stat().st_size for path in [*self._files, *self._tar_files])
 
     def create_splits(self, num_splits: Optional[int] = None) -> List[PLTSplit]:
-        # A file is the indivisible unit because its first six lines contain
-        # trajectory-level metadata.
-        return [PLTSplit(path=str(path)) for path in self._files]
+        # Regular files stay indivisible; tar archives are split into fixed-size
+        # regions and aligned to member headers at read time.
+        splits = [PLTSplit(path=str(path)) for path in self._files]
+        for tar_path in self._tar_files:
+            splits.extend(
+                PLTSplit(path=tar_split.path, tar_offset=tar_split.offset, tar_length=tar_split.length)
+                for tar_split in _tar_splits(str(tar_path))
+            )
+        return splits
 
     def iter_tables(self, split: Optional[PLTSplit] = None) -> Iterable[pa.Table]:
         splits = [split] if split is not None else self.create_splits()
         for source_split in splits:
-            yield from self._iter_file_tables(Path(source_split.path))
+            if source_split.tar_offset is None or source_split.tar_length is None:
+                yield from self._iter_file_tables(Path(source_split.path))
+                continue
+            for member in _iter_tar_members_for_split(
+                source_split.path,
+                offset=source_split.tar_offset,
+                length=source_split.tar_length,
+                suffixes=_PLT_SUFFIXES,
+            ):
+                yield from self._iter_member_tables(member.data, filename=Path(member.name).name)
 
     def _iter_file_tables(self, path: Path) -> Iterable[pa.Table]:
-        rows: List[Tuple[float, float, int, float, float, str, str]] = []
-
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
-            reader = csv.reader(stream)
-            for header_line in range(1, 7):
-                try:
-                    next(reader)
-                except StopIteration as exc:
-                    raise ValueError(
-                        f"Invalid PLT file {path}: expected six header lines, "
-                        f"stopped at line {header_line}"
-                    ) from exc
+            yield from self._iter_stream_tables(stream, filename=path.name, source_label=path)
 
-            for line_number, values in enumerate(reader, start=7):
-                if not values or all(not value.strip() for value in values):
-                    continue
-                rows.append(_parse_plt_point(values, path=path, line_number=line_number))
-                if len(rows) >= self.batch_rows:
-                    yield self._rows_to_table(rows, path.name)
-                    rows = []
+    def _iter_member_tables(self, data: bytes, *, filename: str) -> Iterable[pa.Table]:
+        text = data.decode("utf-8-sig")
+        with io.StringIO(text, newline="") as stream:
+            yield from self._iter_stream_tables(stream, filename=filename, source_label=filename)
+
+    def _iter_stream_tables(
+        self,
+        stream,
+        *,
+        filename: str,
+        source_label: str | Path,
+    ) -> Iterable[pa.Table]:
+        rows: List[Tuple[float, float, int, float, float, str, str]] = []
+        reader = csv.reader(stream)
+        for header_line in range(1, 7):
+            try:
+                next(reader)
+            except StopIteration as exc:
+                raise ValueError(
+                    f"Invalid PLT file {source_label}: expected six header lines, "
+                    f"stopped at line {header_line}"
+                ) from exc
+
+        for line_number, values in enumerate(reader, start=7):
+            if not values or all(not value.strip() for value in values):
+                continue
+            rows.append(_parse_plt_point(values, path=Path(filename), line_number=line_number))
+            if len(rows) >= self.batch_rows:
+                yield self._rows_to_table(rows, filename)
+                rows = []
 
         if rows:
-            yield self._rows_to_table(rows, path.name)
+            yield self._rows_to_table(rows, filename)
 
     def _rows_to_table(
         self,

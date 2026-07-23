@@ -5,8 +5,10 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Optional, List, Dict, Any, Tuple
 import logging
 import json
+import os
 from pathlib import Path
 from decimal import Decimal
+import math
 import zipfile
 
 import pandas as pd
@@ -35,6 +37,9 @@ _GPX_SUFFIXES = (".gpx",)
 _SHAPEFILE_SUFFIXES = (".shp",)
 _ZIP_SUFFIXES = (".zip",)
 _GDB_SUFFIXES = (".gdb",)
+_TAR_SUFFIXES = (".tar",)
+_TAR_BLOCK_SIZE = 512
+_TAR_SPLIT_SIZE = 32 * 1024 * 1024
 
 
 class DataSource:
@@ -72,11 +77,39 @@ class SpatialSample:
     schema: Optional[pa.Schema] = None
 
 
+@dataclass(frozen=True)
+class TarFileSplit:
+    path: str
+    offset: int
+    length: int
+
+
+@dataclass(frozen=True)
+class TarMember:
+    name: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class _TarHeader:
+    name: str
+    size: int
+    typeflag: str
+
+    @property
+    def data_size_padded(self) -> int:
+        return int(math.ceil(self.size / _TAR_BLOCK_SIZE) * _TAR_BLOCK_SIZE)
+
+    @property
+    def record_size(self) -> int:
+        return _TAR_BLOCK_SIZE + self.data_size_padded
+
+
 # ------------------------- Helpers ------------------------- #
 def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     source_path = Path(path)
     if source_path.is_file():
-        return [source_path]
+        return [source_path] if str(source_path).lower().endswith(suffixes) else []
     if source_path.is_dir():
         return sorted(
             file_path
@@ -86,82 +119,200 @@ def _source_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
     raise FileNotFoundError(f"Source path does not exist: {path}")
 
 
-def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
-    """Return .gdb directory names contained in a zip archive."""
+def _iter_discoverable_files(path: str) -> Iterable[str]:
+    # Entry point for lightweight source detection: yield discoverable file
+    # names from a single file input or by walking a directory tree lazily.
+    source_path = Path(path)
+    if source_path.is_file():
+        yield from _iter_discoverable_file_path(source_path, relative_name=source_path.name)
+        return
+    if source_path.is_dir():
+        yield from _iter_discoverable_dir(source_path, root=source_path)
+        return
+    raise FileNotFoundError(f"Source path does not exist: {path}")
+
+
+def _iter_discoverable_dir(directory: Path, *, root: Path) -> Iterable[str]:
+    # Walk one directory level at a time and hand each real file off to the
+    # file-level helper while preserving root-relative names for detection.
+    with os.scandir(directory) as entries:
+        ordered_entries = sorted(entries, key=lambda entry: (entry.name.lower(), entry.name))
+    for entry in ordered_entries:
+        entry_path = Path(entry.path)
+        if entry.is_dir():
+            yield from _iter_discoverable_dir(entry_path, root=root)
+            continue
+        if entry.is_file():
+            relative_name = entry_path.relative_to(root).as_posix()
+            yield from _iter_discoverable_file_path(entry_path, relative_name=relative_name)
+
+
+def _iter_discoverable_file_path(path: Path, *, relative_name: str) -> Iterable[str]:
+    # Expand archive files into their member names; otherwise just yield the
+    # file name itself as a detection candidate.
+    lower_name = path.name.lower()
+    if lower_name.endswith(_TAR_SUFFIXES):
+        yield from _iter_tar_member_names(path)
+        return
+    if lower_name.endswith(_ZIP_SUFFIXES):
+        yield from _iter_zip_member_names(path)
+        return
+    yield relative_name
+
+
+def _iter_zip_member_names(path: str | Path) -> Iterable[str]:
     try:
         with zipfile.ZipFile(path) as archive:
-            names = archive.namelist()
+            for info in archive.infolist():
+                if not info.is_dir():
+                    yield info.filename
     except zipfile.BadZipFile:
+        return
+
+
+def _source_tar_files(path: str, suffixes: Tuple[str, ...]) -> List[Path]:
+    source_path = Path(path)
+    if source_path.is_file():
+        if source_path.suffix.lower() in _TAR_SUFFIXES and _tar_first_member_matches_suffixes(source_path, suffixes):
+            return [source_path]
         return []
+    if source_path.is_dir():
+        return sorted(
+            tar_path
+            for tar_path in source_path.rglob("*")
+            if tar_path.is_file()
+            and tar_path.suffix.lower() in _TAR_SUFFIXES
+            and _tar_first_member_matches_suffixes(tar_path, suffixes)
+        )
+    raise FileNotFoundError(f"Source path does not exist: {path}")
 
-    gdb_dirs = set()
-    for name in names:
-        parts = [part for part in Path(name).parts if part not in {"", "."}]
-        for index, part in enumerate(parts):
-            if part.lower().endswith(_GDB_SUFFIXES):
-                gdb_dirs.add("/".join(parts[: index + 1]))
+
+def _tar_first_member_matches_suffixes(path: str | Path, suffixes: Tuple[str, ...]) -> bool:
+    member = _tar_first_member_name(path)
+    return bool(member and member.lower().endswith(suffixes))
+
+
+def _tar_first_member_name(path: str | Path) -> str | None:
+    for member_name in _iter_tar_member_names(path):
+        return member_name
+    return None
+
+
+def _iter_tar_member_names(path: str | Path) -> Iterable[str]:
+    with open(path, "rb") as stream:
+        file_size = Path(path).stat().st_size
+        offset = 0
+        while offset + _TAR_BLOCK_SIZE <= file_size:
+            stream.seek(offset)
+            block = stream.read(_TAR_BLOCK_SIZE)
+            if len(block) < _TAR_BLOCK_SIZE or not any(block):
                 break
-    return sorted(gdb_dirs)
+            header = _parse_tar_header(block)
+            if header is None:
+                break
+            if header.typeflag in {"", "0"}:
+                yield header.name
+            offset += header.record_size
 
 
-def _zip_contains_shapefile(path: str | Path) -> bool:
-    """Return True when a zip archive contains at least one .shp member."""
+def _tar_splits(path: str) -> List[TarFileSplit]:
+    file_size = Path(path).stat().st_size
+    return [
+        TarFileSplit(path=path, offset=offset, length=min(_TAR_SPLIT_SIZE, file_size - offset))
+        for offset in range(0, file_size, _TAR_SPLIT_SIZE)
+    ]
+
+
+def _iter_tar_members_for_split(
+    path: str,
+    *,
+    offset: int,
+    length: int,
+    suffixes: Tuple[str, ...],
+) -> Iterable[TarMember]:
+    file_size = Path(path).stat().st_size
+    split_end = min(offset + length, file_size)
+    position = offset
+    with open(path, "rb") as stream:
+        while position + _TAR_BLOCK_SIZE <= file_size:
+            stream.seek(position)
+            block = stream.read(_TAR_BLOCK_SIZE)
+            if len(block) < _TAR_BLOCK_SIZE or not any(block):
+                break
+            header = _parse_tar_header(block)
+            if header is None:
+                position += _TAR_BLOCK_SIZE
+                continue
+            if position >= split_end:
+                break
+            data_offset = position + _TAR_BLOCK_SIZE
+            if header.typeflag in {"", "0"} and header.name.lower().endswith(suffixes):
+                stream.seek(data_offset)
+                yield TarMember(name=header.name, data=stream.read(header.size))
+            position += header.record_size
+
+
+def _parse_tar_header(block: bytes) -> _TarHeader | None:
+    if len(block) != _TAR_BLOCK_SIZE or not any(block):
+        return None
+    stored_checksum = _parse_tar_octal(block[148:156])
+    size = _parse_tar_octal(block[124:136])
+    if stored_checksum is None or size is None:
+        return None
+
+    checksum_block = bytearray(block)
+    checksum_block[148:156] = b" " * 8
+    if sum(checksum_block) != stored_checksum:
+        return None
+
+    name = block[0:100].split(b"\0", 1)[0].decode("utf-8", "replace")
+    prefix = block[345:500].split(b"\0", 1)[0].decode("utf-8", "replace")
+    if prefix:
+        name = f"{prefix}/{name}" if name else prefix
+    if not name:
+        return None
+    typeflag = block[156:157].decode("ascii", "ignore")
+    return _TarHeader(name=name, size=size, typeflag=typeflag)
+
+
+def _parse_tar_octal(raw: bytes) -> int | None:
+    text = raw.rstrip(b"\0 ").lstrip(b" ")
+    if not text:
+        return 0
     try:
-        with zipfile.ZipFile(path) as archive:
-            return any(name.lower().endswith(_SHAPEFILE_SUFFIXES) for name in archive.namelist())
-    except zipfile.BadZipFile:
-        return False
+        return int(text, 8)
+    except ValueError:
+        return None
 
 
 def _source_kind(path: str) -> str:
-    source_path = Path(path)
-    if source_path.is_file():
-        lower_path = str(source_path).lower()
-        if lower_path.endswith(_GEOJSON_SUFFIXES):
-            return "geojson"
-        if lower_path.endswith(_GEOPARQUET_SUFFIXES):
-            return "geoparquet"
-        if lower_path.endswith(_CSV_SUFFIXES):
-            return "csv"
-        if lower_path.endswith(_PLT_SUFFIXES):
-            return "plt"
-        if lower_path.endswith(_GPX_SUFFIXES):
-            return "gpx"
-        suffix = source_path.suffix.lower()
-        if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
-            return "gdb"
-        if suffix in _SHAPEFILE_SUFFIXES or (
-            suffix in _ZIP_SUFFIXES and _zip_contains_shapefile(source_path)
-        ):
-            return "shapefile"
-        raise ValueError(f"Unsupported source file type: {path}")
-
-    if source_path.is_dir() and source_path.suffix.lower() in _GDB_SUFFIXES:
-        return "gdb"
-
-    source_types = []
-    if _source_files(path, _GEOJSON_SUFFIXES):
-        source_types.append("geojson")
-    if _source_files(path, _GEOPARQUET_SUFFIXES):
-        source_types.append("geoparquet")
-    if _source_files(path, _CSV_SUFFIXES):
-        source_types.append("csv")
-    if _source_files(path, _PLT_SUFFIXES):
-        source_types.append("plt")
-    if _source_files(path, _GPX_SUFFIXES):
-        source_types.append("gpx")
-    if _source_files(path, _SHAPEFILE_SUFFIXES) or any(
-        _zip_contains_shapefile(zip_path) for zip_path in _source_files(path, _ZIP_SUFFIXES)
-    ):
-        source_types.append("shapefile")
-    if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
-        source_types.append("gdb")
-
-    if len(source_types) == 1:
-        return source_types[0]
-    if source_types:
-        raise ValueError(f"Source directory contains multiple supported source types: {path}")
+    for discovered_name in _iter_discoverable_files(path):
+        detected_type = _detect_source_type_from_name(discovered_name)
+        if detected_type is not None:
+            return detected_type
     raise ValueError(f"No supported geospatial files found in {path}")
+
+
+def _detect_source_type_from_name(name: str) -> str | None:
+    lower_name = name.lower()
+    if lower_name.endswith(_GEOJSON_SUFFIXES):
+        return "geojson"
+    if lower_name.endswith(_GEOPARQUET_SUFFIXES):
+        return "geoparquet"
+    if lower_name.endswith(_CSV_SUFFIXES):
+        return "csv"
+    if lower_name.endswith(_PLT_SUFFIXES):
+        return "plt"
+    if lower_name.endswith(_GPX_SUFFIXES):
+        return "gpx"
+    if lower_name.endswith(_SHAPEFILE_SUFFIXES):
+        return "shapefile"
+    path = Path(name)
+    if path.name.lower() == "gdb" or any(
+        part.lower().endswith(_GDB_SUFFIXES) for part in path.parts
+    ):
+        return "gdb"
+    return None
 
 
 def source_for_path(

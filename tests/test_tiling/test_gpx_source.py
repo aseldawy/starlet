@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import tarfile
 
 import pyarrow as pa
 import pytest
@@ -24,6 +25,20 @@ def _write_gpx(path: Path, body: str, *, version: str = "1.1") -> None:
         "</gpx>\n",
         encoding="utf-8",
     )
+
+
+def _write_tar(archive_path: Path, members: dict[str, str]) -> None:
+    with tarfile.open(archive_path, "w") as archive:
+        for name, content in members.items():
+            temp_path = archive_path.parent / name
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(content, encoding="utf-8")
+            archive.add(temp_path, arcname=name)
+            temp_path.unlink()
+            parent = temp_path.parent
+            while parent != archive_path.parent and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
 
 
 def test_gpx_source_reads_tracks_recursively_and_preserves_hierarchy(temp_dir):
@@ -262,3 +277,50 @@ def test_gpx_source_reports_context_for_invalid_points(temp_dir):
 
     with pytest.raises(ValueError, match=r"broken\.gpx .*missing 'lon'"):
         list(source.iter_tables())
+
+
+def test_gpx_source_reads_tar_members_across_splits(temp_dir, monkeypatch):
+    import starlet._internal.tiling.datasource as datasource_module
+
+    archive_path = temp_dir / "tracks.tar"
+    members = {
+        "user-a/track1.gpx": (
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<gpx xmlns=\"http://www.topografix.com/GPX/1.1\" version=\"1.1\" creator=\"pytest\">\n"
+            "<trk><trkseg>"
+            + "".join(
+                f"<trkpt lat=\"40.{i:06d}\" lon=\"-118.{i:06d}\"><time>2024-01-01T00:00:{i:02d}Z</time></trkpt>"
+                for i in range(10)
+            )
+            + "</trkseg></trk></gpx>\n"
+        ),
+        "user-b/route2.GPX": (
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<gpx xmlns=\"http://www.topografix.com/GPX/1.1\" version=\"1.1\" creator=\"pytest\">\n"
+            "<rte>"
+            + "".join(
+                f"<rtept lat=\"41.{i:06d}\" lon=\"-117.{i:06d}\"><time>2024-01-02T00:00:{i:02d}Z</time></rtept>"
+                for i in range(10)
+            )
+            + "</rte></gpx>\n"
+        ),
+        "user-c/points.gpx": (
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<gpx xmlns=\"http://www.topografix.com/GPX/1.1\" version=\"1.1\" creator=\"pytest\">\n"
+            + "".join(
+                f"<wpt lat=\"42.{i:06d}\" lon=\"-116.{i:06d}\"><name>p{i}</name></wpt>"
+                for i in range(10)
+            )
+            + "</gpx>\n"
+        ),
+    }
+    _write_tar(archive_path, members)
+    monkeypatch.setattr(datasource_module, "_TAR_SPLIT_SIZE", 2048)
+
+    source = source_for_path(str(archive_path))
+    table = pa.concat_tables(list(source.iter_tables()))
+
+    assert isinstance(source, GPXSource)
+    assert len(source.create_splits()) >= 2
+    assert table.num_rows == 30
+    assert sorted(set(table["filename"].to_pylist())) == ["points.gpx", "route2.GPX", "track1.gpx"]

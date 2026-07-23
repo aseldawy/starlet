@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import io
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 import xml.etree.ElementTree as ET
@@ -11,9 +12,16 @@ import numpy as np
 import pyarrow as pa
 from shapely import points, to_wkb
 
+from starlet._internal.tiling.RSGrove import EnvelopeNDLite
 from starlet._internal.tiling.datasource import (
     DataSource,
-    _GPX_SUFFIXES,
+    TarFileSplit,
+    TarMember,
+        _GPX_SUFFIXES,
+        _TAR_SUFFIXES,
+        _iter_tar_members_for_split,
+    _source_tar_files,
+    _tar_splits,
     _attach_geoparquet_metadata,
     _combine_spatial_samples,
     _reservoir_add,
@@ -29,6 +37,8 @@ class GPXSplit:
     """One GPX file, used as a natural source split."""
 
     path: str
+    tar_offset: int | None = None
+    tar_length: int | None = None
 
 
 _GPX_VALUE_FIELDS = (
@@ -161,8 +171,8 @@ class GPXSource(DataSource):
         source_path = Path(path)
         if not source_path.exists():
             raise FileNotFoundError(f"Source path does not exist: {path}")
-        if source_path.is_file() and source_path.suffix.lower() not in _GPX_SUFFIXES:
-            raise ValueError(f"GPX source file must have a .gpx extension: {path}")
+        if source_path.is_file() and source_path.suffix.lower() not in (*_GPX_SUFFIXES, *_TAR_SUFFIXES):
+            raise ValueError(f"GPX source file must have a .gpx or .tar extension: {path}")
         if batch_rows <= 0:
             raise ValueError("batch_rows must be greater than zero")
 
@@ -170,8 +180,13 @@ class GPXSource(DataSource):
         self.batch_rows = int(batch_rows)
         self.geometry_only = bool(geometry_only)
         self.geom_col = geom_col
-        self._files = _source_files(self.path, _GPX_SUFFIXES)
-        if not self._files:
+        self._files = (
+            []
+            if source_path.is_file() and source_path.suffix.lower() in _TAR_SUFFIXES
+            else _source_files(self.path, _GPX_SUFFIXES)
+        )
+        self._tar_files = _source_tar_files(self.path, _GPX_SUFFIXES)
+        if not self._files and not self._tar_files:
             raise ValueError(f"No GPX files found in {self.path}")
         self._schema: pa.Schema | None = (
             _schema_for_gpx_fields((), geom_col=self.geom_col)
@@ -198,7 +213,7 @@ class GPXSource(DataSource):
             futures = [
                 executor.submit(
                     _read_gpx_file_spatial_sample,
-                    Path(split.path),
+                    split,
                     sample_ratio,
                     sample_caps[index],
                     seed + index,
@@ -236,13 +251,13 @@ class GPXSource(DataSource):
         self._schema = schema
 
     def input_size_bytes(self) -> int:
-        return sum(path.stat().st_size for path in self._files)
+        return sum(path.stat().st_size for path in [*self._files, *self._tar_files])
 
     def _infer_schema(self) -> pa.Schema:
         schema_fields: set[str] = set()
-        for path in self._files:
+        for split in self.create_splits():
             sample = _read_gpx_file_spatial_sample(
-                path,
+                split,
                 sample_ratio=0.0,
                 sample_cap=0,
                 seed=0,
@@ -257,7 +272,13 @@ class GPXSource(DataSource):
         return _schema_for_gpx_fields(schema_fields, geom_col=self.geom_col)
 
     def create_splits(self, num_splits: Optional[int] = None) -> List[GPXSplit]:
-        return [GPXSplit(path=str(path)) for path in self._files]
+        splits = [GPXSplit(path=str(path)) for path in self._files]
+        for tar_path in self._tar_files:
+            splits.extend(
+                GPXSplit(path=tar_split.path, tar_offset=tar_split.offset, tar_length=tar_split.length)
+                for tar_split in _tar_splits(str(tar_path))
+            )
+        return splits
 
     def iter_tables(self, split: Optional[GPXSplit] = None) -> Iterable[pa.Table]:
         schema = self.schema()
@@ -265,7 +286,16 @@ class GPXSource(DataSource):
         selected_fields.discard(self.geom_col)
         splits = [split] if split is not None else self.create_splits()
         for source_split in splits:
-            yield from self._iter_file_tables(Path(source_split.path), selected_fields)
+            if source_split.tar_offset is None or source_split.tar_length is None:
+                yield from self._iter_file_tables(Path(source_split.path), selected_fields)
+                continue
+            for member in _iter_tar_members_for_split(
+                source_split.path,
+                offset=source_split.tar_offset,
+                length=source_split.tar_length,
+                suffixes=_GPX_SUFFIXES,
+            ):
+                yield from self._iter_member_tables(member, selected_fields)
 
     def _iter_file_tables(
         self,
@@ -282,28 +312,60 @@ class GPXSource(DataSource):
         if rows:
             yield self._rows_to_table(rows)
 
+    def _iter_member_tables(
+        self,
+        member: TarMember,
+        selected_fields: set[str],
+    ) -> Iterable[pa.Table]:
+        rows: List[dict[str, Any]] = []
+        for row in self._iter_member_rows(member, selected_fields):
+            rows.append(row)
+            if len(rows) >= self.batch_rows:
+                yield self._rows_to_table(rows)
+                rows = []
+
+        if rows:
+            yield self._rows_to_table(rows)
+
     def _iter_file_rows(
         self,
         path: Path,
         selected_fields: set[str],
     ) -> Iterable[dict[str, Any]]:
+        with path.open("rb") as stream:
+            yield from self._iter_xml_rows(stream.read(), path.name, str(path), selected_fields)
+
+    def _iter_member_rows(
+        self,
+        member: TarMember,
+        selected_fields: set[str],
+    ) -> Iterable[dict[str, Any]]:
+        yield from self._iter_xml_rows(member.data, Path(member.name).name, member.name, selected_fields)
+
+    def _iter_xml_rows(
+        self,
+        xml_bytes: bytes,
+        filename: str,
+        source_label: str,
+        selected_fields: set[str],
+    ) -> Iterable[dict[str, Any]]:
         try:
-            root = ET.parse(path).getroot()
+            root = ET.fromstring(xml_bytes)
         except ET.ParseError as exc:
-            raise ValueError(f"Invalid GPX XML in {path}: {exc}") from exc
+            raise ValueError(f"Invalid GPX XML in {source_label}: {exc}") from exc
 
         if _local_name(root.tag) != "gpx":
-            raise ValueError(f"Invalid GPX file {path}: expected root <gpx>")
+            raise ValueError(f"Invalid GPX file {source_label}: expected root <gpx>")
 
         base = {
-            **_selected_value("filename", path.name, selected_fields),
+            **_selected_value("filename", filename, selected_fields),
             **_gpx_metadata(root, selected_fields),
         }
 
         for waypoint_index, waypoint in enumerate(_children(root, "wpt")):
             yield _point_row(
                 waypoint,
-                path=path,
+                path=Path(filename),
                 context=f"waypoint[{waypoint_index}]",
                 base=base,
                 point_kind="waypoint",
@@ -319,7 +381,7 @@ class GPXSource(DataSource):
                 route_base.update(_selected_value("route_index", route_index, selected_fields))
                 yield _point_row(
                     route_point,
-                    path=path,
+                    path=Path(filename),
                     context=f"route[{route_index}]/point[{point_index}]",
                     base=route_base,
                     point_kind="route",
@@ -346,7 +408,7 @@ class GPXSource(DataSource):
                     track_base.update(_selected_value("track_index", track_index, selected_fields))
                     yield _point_row(
                         track_point,
-                        path=path,
+                        path=Path(filename),
                         context=(
                             f"track[{track_index}]/segment[{segment_index}]"
                             f"/point[{point_index}]"
@@ -548,7 +610,93 @@ def _put_selected(
 
 
 def _read_gpx_file_spatial_sample(
-    path: Path,
+    split: GPXSplit,
+    sample_ratio: float,
+    sample_cap: Optional[int],
+    seed: int,
+    geom_col: str,
+) -> SpatialSample:
+    if split.tar_offset is None or split.tar_length is None:
+        return _read_gpx_bytes_spatial_sample(
+            Path(split.path).read_bytes(),
+            filename=Path(split.path).name,
+            source_label=split.path,
+            sample_ratio=sample_ratio,
+            sample_cap=sample_cap,
+            seed=seed,
+            geom_col=geom_col,
+        )
+
+    parts = [
+        _read_gpx_bytes_spatial_sample(
+            member.data,
+            filename=Path(member.name).name,
+            source_label=member.name,
+            sample_ratio=sample_ratio,
+            sample_cap=sample_cap,
+            seed=seed + index,
+            geom_col=geom_col,
+        )
+        for index, member in enumerate(
+            _iter_tar_members_for_split(
+                split.path,
+                offset=split.tar_offset,
+                length=split.tar_length,
+                suffixes=_GPX_SUFFIXES,
+            )
+        )
+    ]
+    if not parts:
+        return _spatial_sample_from_state(
+            x_sample=[],
+            y_sample=[],
+            mins=np.array([+np.inf, +np.inf], dtype=np.float64),
+            maxs=np.array([-np.inf, -np.inf], dtype=np.float64),
+            n_seen=0,
+            batches_read=0,
+            schema=_schema_for_gpx_fields((), geom_col=geom_col),
+        )
+    non_empty = [part for part in parts if part.total_seen > 0]
+    if non_empty:
+        mins = np.minimum.reduce([part.mbr.mins for part in non_empty])
+        maxs = np.maximum.reduce([part.mbr.maxs for part in non_empty])
+        sampled = [part.sample_points for part in non_empty if part.sample_points.shape[1] > 0]
+        sample_points = (
+            np.concatenate(sampled, axis=1)
+            if sampled
+            else np.empty((2, 0), dtype=np.float64)
+        )
+        combined = SpatialSample(
+            sample_points=sample_points,
+            mbr=EnvelopeNDLite(mins, maxs),
+            total_seen=sum(part.total_seen for part in parts),
+            total_sampled=sample_points.shape[1],
+            batches_read=sum(part.batches_read for part in parts),
+        )
+    else:
+        combined = _spatial_sample_from_state(
+            x_sample=[],
+            y_sample=[],
+            mins=np.array([+np.inf, +np.inf], dtype=np.float64),
+            maxs=np.array([-np.inf, -np.inf], dtype=np.float64),
+            n_seen=0,
+            batches_read=sum(part.batches_read for part in parts),
+        )
+    schema_fields = {
+        field.name
+        for part in parts
+        if part.schema is not None
+        for field in part.schema
+        if field.name != geom_col
+    }
+    return replace(combined, schema=_schema_for_gpx_fields(schema_fields, geom_col=geom_col))
+
+
+def _read_gpx_bytes_spatial_sample(
+    xml_bytes: bytes,
+    *,
+    filename: str,
+    source_label: str,
     sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
@@ -572,7 +720,7 @@ def _read_gpx_file_spatial_sample(
     track_index = -1
 
     try:
-        events = ET.iterparse(path, events=("start", "end"))
+        events = ET.iterparse(io.BytesIO(xml_bytes), events=("start", "end"))
         for event, element in events:
             tag = _local_name(element.tag)
             if event == "start":
@@ -641,7 +789,7 @@ def _read_gpx_file_spatial_sample(
             if tag in _POINT_TAGS:
                 _, point_index, context, structural_fields = _point_scan_context(
                     tag,
-                    path,
+                    Path(filename),
                     waypoint_index,
                     route_stack,
                     track_stack,
@@ -656,13 +804,13 @@ def _read_gpx_file_spatial_sample(
                 x = _required_float_attr(
                     element,
                     "lon",
-                    path=path,
+                    path=Path(filename),
                     context=context,
                 )
                 y = _required_float_attr(
                     element,
                     "lat",
-                    path=path,
+                    path=Path(filename),
                     context=context,
                 )
                 if x < mins[0]:
@@ -696,7 +844,7 @@ def _read_gpx_file_spatial_sample(
             stack.pop()
             element.clear()
     except ET.ParseError as exc:
-        raise ValueError(f"Invalid GPX XML in {path}: {exc}") from exc
+        raise ValueError(f"Invalid GPX XML in {source_label}: {exc}") from exc
 
     return _spatial_sample_from_state(
         x_sample=x_sample,

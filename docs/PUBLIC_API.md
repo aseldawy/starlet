@@ -353,6 +353,7 @@ Supported sources:
 | GeoParquet | `.parquet`, `.geoparquet`, or a directory containing only GeoParquet files | `geom_col="geometry"` by default | Reads Parquet row groups as splits. Geometry-only sampling reads only the geometry column. |
 | GeoJSON | `.geojson`, `.geojsonl`, `.json`, `.jsonl`, or a directory containing only GeoJSON files | Geometry comes from GeoJSON feature geometry | FeatureCollection inputs are byte-partitioned; GeoJSONL is streamed by feature records. |
 | GeoLife PLT | A `.plt` file or a directory containing only `.plt` files, nested at any depth | Longitude/latitude records become WGS 84 points | Each file is a split. `trajectory_id` repeats the file ID on every point so trajectories can be regrouped. |
+| GPX | A `.gpx` file or a directory containing only `.gpx` files, nested at any depth | GPX longitude/latitude points become WGS 84 points | Tracks, routes, and waypoints are flattened into point rows. File and GPX hierarchy metadata repeats on every point when present in the selected input. |
 | Shapefile | `.shp`, `.zip` containing shapefile sidecars, or a directory containing `.shp` and/or `.zip` files | Geometry comes from the Shapefile geometry | Uses `pyogrio`. Feature-range splits are used when feature counts are available. Geometry-only sampling reads geometry without attributes. |
 | CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, or `csv_wkt_col` | Files are read in row chunks. `src_crs` provides the CRS hint. |
 | File Geodatabase | `.gdb` directory, `.gdb.zip` archive, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. Zipped GDBs are extracted to a temp cache before reading. |
@@ -430,6 +431,40 @@ into a WGS 84 point. It preserves `latitude`, `longitude`, `reserved`,
 relative to the input directory for directory input. `filename` always contains
 the basename. Keeping both makes same-named files in different subdirectories
 unambiguous without losing the convenient filename property.
+
+### GPX Sources
+
+Pass either one `.gpx` file or the directory above a collection of GPX files.
+
+```python
+result = starlet.tile(
+    input="data/tracks",
+    outdir="datasets/gpx-tracks",
+)
+```
+
+Starlet recursively discovers `.gpx` files and flattens tracks (`trkpt`),
+routes (`rtept`), and waypoints (`wpt`) into WGS 84 point rows. As with PLT,
+`trajectory_id` is the basename for single-file input and the file path
+relative to the input directory for directory input. `filename` always contains
+the basename.
+
+The first spatial scan also infers a compact GPX schema while computing the
+sample and MBR. Fields that never appear in the selected input are omitted, so
+a track-only file does not get all-null route columns, and a file without GPX
+metadata does not get all-null metadata columns.
+
+The flattened schema can repeat GPX hierarchy on each point: file metadata
+(`gpx_version`, `gpx_creator`, `gpx_name`, `gpx_description`, `gpx_author`,
+`gpx_time`, `gpx_keywords`, `gpx_bounds`, `gpx_metadata_xml`,
+`gpx_extensions_xml`), point placement (`point_kind`, `track_index`,
+`route_index`, `segment_index`, `point_index`), track/route fields
+(`track_name`, `track_number`, `track_type`, `route_name`, `route_number`,
+`route_type`, plus comments, descriptions, sources, links, and extensions),
+and point fields (`latitude`, `longitude`, `elevation`, `point_time`,
+`point_name`, `point_comment`, `point_description`, `point_source`,
+`point_symbol`, `point_type`, `point_fix`, `point_satellites`, DOP/DGPS
+fields, `point_links`, and `point_extensions_xml`).
 
 ### Shapefile Sources
 
@@ -577,6 +612,12 @@ GeoLife PLT directory:
 
 ```bash
 starlet tile --input data/geolife/trajectory --outdir datasets/trajectories
+```
+
+GPX file or directory:
+
+```bash
+starlet tile --input data/tracks.gpx --outdir datasets/gpx-tracks
 ```
 
 File Geodatabase:

@@ -73,8 +73,8 @@ def tile(
     Parameters
     ----------
     input : str
-        Path to a supported source file or directory. GeoLife PLT input may be
-        one ``.plt`` file or a directory containing ``.plt`` files.
+        Path to a supported source file or directory. GeoLife PLT and GPX
+        inputs may be one file or a directory containing matching files.
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.

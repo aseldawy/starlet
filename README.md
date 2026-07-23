@@ -1,8 +1,8 @@
 # Starlet
 
 Spatial tiling, Mapbox Vector Tile (MVT) generation, and on-demand tile serving
-for large geospatial datasets (GeoParquet, GeoJSON, CSV, vector files, and
-GeoLife PLT trajectories).
+for large geospatial datasets (GeoParquet, GeoJSON, CSV, vector files, GPX
+tracks, and GeoLife PLT trajectories).
 
 The pipeline is: **partition a dataset into spatial tiles → build density
 histograms → (optionally) pre-generate MVTs → serve them over HTTP.**
@@ -135,6 +135,10 @@ Once `starlet serve` is running:
 - **GeoLife PLT trajectories:** pass one `.plt` file or a directory. Starlet
   reads every trajectory record as a WGS 84 point and repeats its file ID in
   the `trajectory_id` field.
+- **GPX tracks/routes/waypoints:** pass one `.gpx` file or a directory. Starlet
+  flattens point-like GPX content into WGS 84 points, repeats the filename on
+  each row, and preserves GPX file, track, route, segment, and point metadata
+  in output fields when those fields appear in the selected input.
 - **Serving tiles on the fly** (zooming past the pre-generated levels)? The
   default tiling output includes covering bbox columns so the server can prune
   row groups at read time. Use `--no-covering-bbox` only when optimizing for

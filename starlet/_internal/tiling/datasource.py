@@ -22,6 +22,7 @@ _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
 _GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
 _CSV_SUFFIXES = (".csv",".tsv",)
 _PLT_SUFFIXES = (".plt",)
+_GPX_SUFFIXES = (".gpx",)
 _SHAPEFILE_SUFFIXES = (".shp",)
 _ZIP_SUFFIXES = (".zip",)
 _GDB_SUFFIXES = (".gdb",)
@@ -106,6 +107,8 @@ def _source_kind(path: str) -> str:
             return "csv"
         if suffix in _PLT_SUFFIXES:
             return "plt"
+        if suffix in _GPX_SUFFIXES:
+            return "gpx"
         if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
             return "gdb"
         if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
@@ -124,6 +127,8 @@ def _source_kind(path: str) -> str:
         source_types.append("csv")
     if _source_files(path, _PLT_SUFFIXES):
         source_types.append("plt")
+    if _source_files(path, _GPX_SUFFIXES):
+        source_types.append("gpx")
     if _source_files(path, _SHAPEFILE_SUFFIXES) or _source_files(path, _ZIP_SUFFIXES):
         source_types.append("shapefile")
     if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
@@ -167,6 +172,8 @@ def source_for_path(
         )
     if kind == "plt":
         return PLTSource(path, geom_col=geom_col)
+    if kind == "gpx":
+        return GPXSource(path, geom_col=geom_col)
     if kind == "shapefile":
         return ShapefileSource(path, geom_col=geom_col)
     if kind == "gdb":
@@ -210,6 +217,15 @@ def read_spatial_sample(
             sample_cap=sample_cap,
             seed=seed,
             workers=geoparquet_workers,
+        )
+    if kind == "gpx":
+        return GPXSource.read_spatial_sample(
+            path,
+            geom_col=geom_col,
+            sample_ratio=sample_ratio,
+            sample_cap=sample_cap,
+            seed=seed,
+            workers=source_workers,
         )
 
     source = source_for_path(
@@ -812,4 +828,5 @@ from starlet._internal.tiling.geojson_source import GeoJSONSource, GeoJSONSplit
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 from starlet._internal.tiling.csv_source import CSVSource, CSVSplit
 from starlet._internal.tiling.plt_source import PLTSource, PLTSplit
+from starlet._internal.tiling.gpx_source import GPXSource, GPXSplit
 from starlet._internal.tiling.vector_source import GDBSource, ShapefileSource, VectorLayerSplit

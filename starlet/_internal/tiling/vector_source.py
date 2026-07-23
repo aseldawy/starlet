@@ -244,7 +244,7 @@ class _OGRVectorSource(DataSource):
         raise NotImplementedError
 
     def _source_paths_for_size(self) -> List[str]:
-        return sorted({layer.path for layer in self._layers})
+        return sorted({_dataset_size_path(layer.path) for layer in self._layers})
 
     @staticmethod
     def _layers_for_dataset(path: str) -> List[_VectorLayer]:
@@ -323,6 +323,12 @@ class GDBSource(_OGRVectorSource):
 
 def _zip_vsi_path(path: Path) -> str:
     return f"/vsizip/{path}"
+
+
+def _dataset_size_path(path: str) -> str:
+    if path.startswith("/vsizip/"):
+        return path[len("/vsizip/") :]
+    return path
 
 
 def _extract_zipped_gdbs(path: Path) -> List[Path]:

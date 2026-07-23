@@ -63,6 +63,13 @@ def _write_bz2(path: Path, data: bytes, *, compresslevel: int = 1) -> None:
     path.write_bytes(bz2.compress(data, compresslevel=compresslevel))
 
 
+def _write_zip_from_dir(zip_path: Path, source_dir: Path) -> None:
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for member in sorted(source_dir.rglob("*")):
+            if member.is_file():
+                archive.write(member, arcname=member.relative_to(source_dir).as_posix())
+
+
 class TestGeoParquetSource:
     """Test GeoParquet data source."""
 
@@ -1070,6 +1077,55 @@ class TestShapefileSource:
         assert "geometry_type=CurvePolygon" in caplog.text
         assert "linearized_records=1" in caplog.text
         assert "skip_features=0" in caplog.text
+
+    def test_reads_all_shapefiles_from_zip_directly(self, temp_dir):
+        source_dir = temp_dir / "shapes"
+        source_dir.mkdir()
+        first = gpd.GeoDataFrame(
+            {"dataset": ["a", "a"], "id": [1, 2]},
+            geometry=[Point(0, 1), Point(2, 3)],
+            crs="EPSG:4326",
+        )
+        second = gpd.GeoDataFrame(
+            {"dataset": ["b", "b", "b"], "id": [10, 11, 12]},
+            geometry=[Point(4, 5), Point(6, 7), Point(8, 9)],
+            crs="EPSG:4326",
+        )
+        first.to_file(source_dir / "alpha.shp", engine="pyogrio")
+        second.to_file(source_dir / "beta.shp", engine="pyogrio")
+
+        zip_path = temp_dir / "bundle.zip"
+        _write_zip_from_dir(zip_path, source_dir)
+
+        source = ShapefileSource(str(zip_path))
+        tables = list(source.iter_tables())
+        ids = sorted(
+            row_id
+            for table in tables
+            for row_id in table["id"].to_pylist()
+        )
+        datasets = sorted(
+            value
+            for table in tables
+            for value in table["dataset"].to_pylist()
+        )
+
+        assert len(source._layers) == 2
+        assert ids == [1, 2, 10, 11, 12]
+        assert datasets == ["a", "a", "b", "b", "b"]
+        assert source.input_size_bytes() == zip_path.stat().st_size
+
+    def test_source_for_path_detects_zipped_shapefile(self, temp_dir):
+        source_dir = temp_dir / "zip-shp"
+        source_dir.mkdir()
+        gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[Point(0, 1)], crs="EPSG:4326")
+        gdf.to_file(source_dir / "points.shp", engine="pyogrio")
+        zip_path = temp_dir / "points.zip"
+        _write_zip_from_dir(zip_path, source_dir)
+
+        source = source_for_path(str(zip_path))
+
+        assert isinstance(source, ShapefileSource)
 
 
 class TestGDBSource:

@@ -104,6 +104,15 @@ def _zip_gdb_member_dirs(path: str | Path) -> List[str]:
     return sorted(gdb_dirs)
 
 
+def _zip_contains_shapefile(path: str | Path) -> bool:
+    """Return True when a zip archive contains at least one .shp member."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return any(name.lower().endswith(_SHAPEFILE_SUFFIXES) for name in archive.namelist())
+    except zipfile.BadZipFile:
+        return False
+
+
 def _source_kind(path: str) -> str:
     source_path = Path(path)
     if source_path.is_file():
@@ -121,7 +130,9 @@ def _source_kind(path: str) -> str:
         suffix = source_path.suffix.lower()
         if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
             return "gdb"
-        if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
+        if suffix in _SHAPEFILE_SUFFIXES or (
+            suffix in _ZIP_SUFFIXES and _zip_contains_shapefile(source_path)
+        ):
             return "shapefile"
         raise ValueError(f"Unsupported source file type: {path}")
 
@@ -139,7 +150,9 @@ def _source_kind(path: str) -> str:
         source_types.append("plt")
     if _source_files(path, _GPX_SUFFIXES):
         source_types.append("gpx")
-    if _source_files(path, _SHAPEFILE_SUFFIXES) or _source_files(path, _ZIP_SUFFIXES):
+    if _source_files(path, _SHAPEFILE_SUFFIXES) or any(
+        _zip_contains_shapefile(zip_path) for zip_path in _source_files(path, _ZIP_SUFFIXES)
+    ):
         source_types.append("shapefile")
     if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
         source_types.append("gdb")

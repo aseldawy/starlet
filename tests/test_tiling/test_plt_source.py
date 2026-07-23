@@ -51,10 +51,6 @@ def test_plt_source_reads_files_recursively_and_groups_points(temp_dir):
     assert len(splits) == 2
     assert len(tables) == 3
     assert table.num_rows == 3
-    assert set(table["trajectory_id"].to_pylist()) == {
-        "user-a/track.plt",
-        "user-b/track.PLT",
-    }
     assert table["filename"].to_pylist() == ["track.plt", "track.plt", "track.PLT"]
     assert table["altitude"].to_pylist() == [219.0, 184.0, -777.0]
     assert table["date"].to_pylist() == ["2009-06-15", "2009-06-15", "2009-06-16"]
@@ -89,7 +85,6 @@ def test_plt_source_reads_a_single_file_with_basename_id(temp_dir):
 
     assert isinstance(source, PLTSource)
     assert len(source.create_splits()) == 1
-    assert table["trajectory_id"].to_pylist() == ["track.plt"]
     assert table["filename"].to_pylist() == ["track.plt"]
 
 

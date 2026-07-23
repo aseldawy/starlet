@@ -32,7 +32,6 @@ class GPXSplit:
 
 
 _GPX_VALUE_FIELDS = (
-    ("trajectory_id", pa.string()),
     ("filename", pa.string()),
     ("gpx_version", pa.string()),
     ("gpx_creator", pa.string()),
@@ -87,7 +86,6 @@ _GPX_VALUE_FIELDS = (
     ("point_extensions_xml", pa.string()),
 )
 _GPX_BASE_FIELDS = (
-    "trajectory_id",
     "filename",
     "point_kind",
     "point_index",
@@ -297,14 +295,7 @@ class GPXSource(DataSource):
         if _local_name(root.tag) != "gpx":
             raise ValueError(f"Invalid GPX file {path}: expected root <gpx>")
 
-        source_path = Path(self.path)
-        trajectory_id = (
-            path.name
-            if source_path.is_file()
-            else path.relative_to(source_path).as_posix()
-        )
         base = {
-            **_selected_value("trajectory_id", trajectory_id, selected_fields),
             **_selected_value("filename", path.name, selected_fields),
             **_gpx_metadata(root, selected_fields),
         }

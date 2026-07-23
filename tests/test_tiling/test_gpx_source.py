@@ -100,10 +100,6 @@ def test_gpx_source_reads_tracks_recursively_and_preserves_hierarchy(temp_dir):
     assert len(splits) == 2
     assert len(tables) == 3
     assert table.num_rows == 3
-    assert set(table["trajectory_id"].to_pylist()) == {
-        "user-a/track.gpx",
-        "user-b/route.GPX",
-    }
     assert table["filename"].to_pylist() == ["track.gpx", "track.gpx", "route.GPX"]
     assert table["gpx_version"].to_pylist() == ["1.1", "1.1", "1.1"]
     assert table["gpx_creator"].to_pylist() == ["pytest", "pytest", "pytest"]
@@ -161,7 +157,6 @@ def test_gpx_source_reads_waypoints_and_single_file_with_basename_id(temp_dir):
 
     assert isinstance(source, GPXSource)
     assert len(source.create_splits()) == 1
-    assert table["trajectory_id"].to_pylist() == ["points.gpx"]
     assert table["filename"].to_pylist() == ["points.gpx"]
     assert table["point_kind"].to_pylist() == ["waypoint"]
     assert table["point_index"].to_pylist() == [0]
@@ -221,7 +216,6 @@ def test_gpx_spatial_sample_uses_all_points_and_infers_compact_schema(temp_dir):
     assert sample.total_sampled == 2
     assert sample.schema is not None
     assert sample.schema.names == [
-        "trajectory_id",
         "filename",
         "gpx_version",
         "gpx_creator",

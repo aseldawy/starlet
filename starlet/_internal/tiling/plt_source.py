@@ -29,8 +29,7 @@ class PLTSource(DataSource):
     GeoLife files have six header lines followed by seven comma-separated
     values per point: latitude, longitude, a reserved value, altitude, a date
     serial, date, and time. Each output row also carries the source filename
-    and a root-relative trajectory ID so points from one file can be grouped
-    back together.
+    so points from one file can be grouped back together.
     """
 
     def __init__(
@@ -60,7 +59,6 @@ class PLTSource(DataSource):
 
     def _default_schema(self) -> pa.Schema:
         fields = [] if self.geometry_only else [
-            pa.field("trajectory_id", pa.string()),
             pa.field("filename", pa.string()),
             pa.field("latitude", pa.float64()),
             pa.field("longitude", pa.float64()),
@@ -90,7 +88,7 @@ class PLTSource(DataSource):
 
     def create_splits(self, num_splits: Optional[int] = None) -> List[PLTSplit]:
         # A file is the indivisible unit because its first six lines contain
-        # trajectory-level metadata and its relative path is the grouping ID.
+        # trajectory-level metadata.
         return [PLTSplit(path=str(path)) for path in self._files]
 
     def iter_tables(self, split: Optional[PLTSplit] = None) -> Iterable[pa.Table]:
@@ -99,12 +97,6 @@ class PLTSource(DataSource):
             yield from self._iter_file_tables(Path(source_split.path))
 
     def _iter_file_tables(self, path: Path) -> Iterable[pa.Table]:
-        source_path = Path(self.path)
-        trajectory_id = (
-            path.name
-            if source_path.is_file()
-            else path.relative_to(source_path).as_posix()
-        )
         rows: List[Tuple[float, float, int, float, float, str, str]] = []
 
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
@@ -123,16 +115,15 @@ class PLTSource(DataSource):
                     continue
                 rows.append(_parse_plt_point(values, path=path, line_number=line_number))
                 if len(rows) >= self.batch_rows:
-                    yield self._rows_to_table(rows, trajectory_id, path.name)
+                    yield self._rows_to_table(rows, path.name)
                     rows = []
 
         if rows:
-            yield self._rows_to_table(rows, trajectory_id, path.name)
+            yield self._rows_to_table(rows, path.name)
 
     def _rows_to_table(
         self,
         rows: Sequence[Tuple[float, float, int, float, float, str, str]],
-        trajectory_id: str,
         filename: str,
     ) -> pa.Table:
         latitudes = [row[0] for row in rows]
@@ -148,7 +139,6 @@ class PLTSource(DataSource):
             row_count = len(rows)
             table = pa.table(
                 {
-                    "trajectory_id": pa.array([trajectory_id] * row_count, type=pa.string()),
                     "filename": pa.array([filename] * row_count, type=pa.string()),
                     "latitude": pa.array(latitudes, type=pa.float64()),
                     "longitude": pa.array(longitudes, type=pa.float64()),

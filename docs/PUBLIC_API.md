@@ -352,6 +352,7 @@ Supported sources:
 | --- | --- | --- | --- |
 | GeoParquet | `.parquet`, `.geoparquet`, or a directory containing only GeoParquet files | `geom_col="geometry"` by default | Reads Parquet row groups as splits. Geometry-only sampling reads only the geometry column. |
 | GeoJSON | `.geojson`, `.geojsonl`, `.json`, `.jsonl`, or a directory containing only GeoJSON files | Geometry comes from GeoJSON feature geometry | FeatureCollection inputs are byte-partitioned; GeoJSONL is streamed by feature records. |
+| GeoLife PLT | A `.plt` file or a directory containing only `.plt` files, nested at any depth | Longitude/latitude records become WGS 84 points | Each file is a split. `trajectory_id` repeats the file ID on every point so trajectories can be regrouped. |
 | Shapefile | `.shp`, `.zip` containing shapefile sidecars, or a directory containing `.shp` and/or `.zip` files | Geometry comes from the Shapefile geometry | Uses `pyogrio`. Feature-range splits are used when feature counts are available. Geometry-only sampling reads geometry without attributes. |
 | CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, or `csv_wkt_col` | Files are read in row chunks. `src_crs` provides the CRS hint. |
 | File Geodatabase | `.gdb` directory, `.gdb.zip` archive, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. Zipped GDBs are extracted to a temp cache before reading. |
@@ -409,6 +410,26 @@ result = starlet.tile(
 
 GeoJSON FeatureCollections are partitioned by byte range while preserving
 complete feature objects. GeoJSON Lines inputs are streamed by feature record.
+
+### GeoLife PLT Sources
+
+Pass either one `.plt` file or the directory above a collection of trajectory
+files.
+
+```python
+result = starlet.tile(
+    input="data/geolife/trajectory",
+    outdir="datasets/trajectories",
+)
+```
+
+Starlet recursively discovers `.plt` files and turns every trajectory record
+into a WGS 84 point. It preserves `latitude`, `longitude`, `reserved`,
+`altitude` (in feet), `date_days`, `date`, and `time`. The repeated
+`trajectory_id` is just the basename for single-file input and the file path
+relative to the input directory for directory input. `filename` always contains
+the basename. Keeping both makes same-named files in different subdirectories
+unambiguous without losing the convenient filename property.
 
 ### Shapefile Sources
 
@@ -550,6 +571,12 @@ Shapefile:
 
 ```bash
 starlet tile --input data/roads.zip --outdir datasets/roads
+```
+
+GeoLife PLT directory:
+
+```bash
+starlet tile --input data/geolife/trajectory --outdir datasets/trajectories
 ```
 
 File Geodatabase:

@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _GEOPARQUET_SUFFIXES = (".parquet", ".geoparquet")
 _GEOJSON_SUFFIXES = (".geojson", ".geojsonl", ".json", ".jsonl")
 _CSV_SUFFIXES = (".csv",".tsv",)
+_PLT_SUFFIXES = (".plt",)
 _SHAPEFILE_SUFFIXES = (".shp",)
 _ZIP_SUFFIXES = (".zip",)
 _GDB_SUFFIXES = (".gdb",)
@@ -103,6 +104,8 @@ def _source_kind(path: str) -> str:
             return "geoparquet"
         if suffix in _CSV_SUFFIXES:
             return "csv"
+        if suffix in _PLT_SUFFIXES:
+            return "plt"
         if suffix in _ZIP_SUFFIXES and _zip_gdb_member_dirs(source_path):
             return "gdb"
         if suffix in _SHAPEFILE_SUFFIXES or suffix in _ZIP_SUFFIXES:
@@ -119,6 +122,8 @@ def _source_kind(path: str) -> str:
         source_types.append("geoparquet")
     if _source_files(path, _CSV_SUFFIXES):
         source_types.append("csv")
+    if _source_files(path, _PLT_SUFFIXES):
+        source_types.append("plt")
     if _source_files(path, _SHAPEFILE_SUFFIXES) or _source_files(path, _ZIP_SUFFIXES):
         source_types.append("shapefile")
     if sorted(child for child in source_path.rglob("*.gdb") if child.is_dir()):
@@ -160,6 +165,8 @@ def source_for_path(
             src_crs=src_crs,
             geom_col=geom_col,
         )
+    if kind == "plt":
+        return PLTSource(path, geom_col=geom_col)
     if kind == "shapefile":
         return ShapefileSource(path, geom_col=geom_col)
     if kind == "gdb":
@@ -220,6 +227,8 @@ def read_spatial_sample(
         source = ShapefileSource(path, geometry_only=True, geom_col=geom_col)
     elif isinstance(source, GDBSource):
         source = GDBSource(path, geometry_only=True, geom_col=geom_col)
+    elif isinstance(source, PLTSource):
+        source = PLTSource(path, geometry_only=True, geom_col=geom_col)
     return _read_datasource_spatial_sample(
         source,
         geom_col=geom_col,
@@ -560,16 +569,21 @@ def _read_datasource_split_spatial_sample(
     )
 
 
-def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> pa.Schema:
+def _attach_geoparquet_metadata(
+    schema: pa.Schema,
+    crs_hint: Optional[str],
+    *,
+    geom_col: str = "geometry",
+) -> pa.Schema:
     """
     Return a copy of `schema` with a minimal GeoParquet 'geo' JSON block so
     downstream writers (WriterPool) can inject tile bbox.
 
     Includes:
       - version: 1.1.0
-      - primary_column: geometry
-      - columns.geometry.encoding: WKB
-      - columns.geometry.crs: <crs_hint> (string hint if provided)
+      - primary_column: the selected geometry column
+      - columns.<geometry>.encoding: WKB
+      - columns.<geometry>.crs: <crs_hint> (string hint if provided)
     """
     md = dict(schema.metadata or {})
     if b"geo" in md:
@@ -581,9 +595,9 @@ def _attach_geoparquet_metadata(schema: pa.Schema, crs_hint: Optional[str]) -> p
         geo = {}
 
     geo.setdefault("version", "1.1.0")
-    geo.setdefault("primary_column", "geometry")
+    geo.setdefault("primary_column", geom_col)
     columns = geo.setdefault("columns", {})
-    geometry_meta = columns.setdefault("geometry", {})
+    geometry_meta = columns.setdefault(geom_col, {})
     geometry_meta.setdefault("encoding", "WKB")
     if crs_hint:
         try:
@@ -797,4 +811,5 @@ def _stringify_json_property_value(value: Any) -> str | None:
 from starlet._internal.tiling.geojson_source import GeoJSONSource, GeoJSONSplit
 from starlet._internal.tiling.geoparquet_source import GeoParquetSource, GeoParquetSplit
 from starlet._internal.tiling.csv_source import CSVSource, CSVSplit
+from starlet._internal.tiling.plt_source import PLTSource, PLTSplit
 from starlet._internal.tiling.vector_source import GDBSource, ShapefileSource, VectorLayerSplit

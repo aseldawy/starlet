@@ -68,12 +68,13 @@ def tile(
     grid_size: int | None = None,
     histogram_dtype: str | None = None,
 ) -> TileResult:
-    """Partition a GeoParquet/GeoJSON dataset into spatially-tiled Parquet files.
+    """Partition a supported geospatial source into spatially-tiled Parquet files.
 
     Parameters
     ----------
     input : str
-        Path to a GeoParquet, GeoJSON, or GeoJSON-Lines file.
+        Path to a supported source file or directory. GeoLife PLT input may be
+        one ``.plt`` file or a directory containing ``.plt`` files.
     outdir : str
         Output directory. Tiled files go into ``<outdir>/parquet_tiles/``
         and histograms into ``<outdir>/histograms/``.
@@ -379,7 +380,7 @@ def build(
     Parameters
     ----------
     input : str
-        Path to source GeoParquet or GeoJSON file.
+        Path to a supported source file or directory.
     outdir : str
         Output dataset directory.
     zoom : int

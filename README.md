@@ -1,7 +1,8 @@
 # Starlet
 
 Spatial tiling, Mapbox Vector Tile (MVT) generation, and on-demand tile serving
-for large geospatial datasets (GeoParquet / GeoJSON).
+for large geospatial datasets (GeoParquet, GeoJSON, CSV, vector files, and
+GeoLife PLT trajectories).
 
 The pipeline is: **partition a dataset into spatial tiles → build density
 histograms → (optionally) pre-generate MVTs → serve them over HTTP.**
@@ -19,7 +20,7 @@ Requires Python 3.10+. This installs the `starlet` command-line tool.
 
 ## Quick start
 
-Turn a GeoParquet or GeoJSON file into a running tile server in two commands:
+Turn a supported geospatial source into a running tile server in two commands:
 
 ```bash
 # 1. Build a dataset: partition into tiles + pre-generate vector tiles
@@ -56,7 +57,7 @@ starlet build --input data.parquet --outdir datasets/mydata --zoom 8
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input` | (required) | Path to a GeoParquet or GeoJSON file |
+| `--input` | (required) | Path to a supported source file or directory |
 | `--outdir` | (required) | Output dataset directory |
 | `--zoom` | 7 | Maximum MVT zoom level |
 | `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size, e.g. `256mb`, `1gb` |
@@ -72,7 +73,7 @@ starlet tile --input data.parquet --outdir datasets/mydata
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--input` | (required) | Path to a GeoParquet or GeoJSON file |
+| `--input` | (required) | Path to a supported source file or directory |
 | `--outdir` | (required) | Output dataset directory |
 | `--partition-size` | 512mb (GeoJSON) / 128mb (GeoParquet) | Target partition size; the number of tiles is derived from the input size |
 | `--sort` | zorder | Within-tile row order: `zorder`, `hilbert`, `columns`, `none` |
@@ -131,6 +132,9 @@ Once `starlet serve` is running:
 
 - **Geometry column** not named `geometry` (common with OGR/`pyogrio`
   exports)? Pass `--geom-col wkb_geometry`.
+- **GeoLife PLT trajectories:** pass one `.plt` file or a directory. Starlet
+  reads every trajectory record as a WGS 84 point and repeats its file ID in
+  the `trajectory_id` field.
 - **Serving tiles on the fly** (zooming past the pre-generated levels)? The
   default tiling output includes covering bbox columns so the server can prune
   row groups at read time. Use `--no-covering-bbox` only when optimizing for

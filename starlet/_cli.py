@@ -75,6 +75,9 @@ def main(ctx: click.Context, config_path: str | None):
 @click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
 @click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
 @click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--csv-x-index", type=int, default=None, help="Headerless CSV x-coordinate column index. Use with --csv-y-index.")
+@click.option("--csv-y-index", type=int, default=None, help="Headerless CSV y-coordinate column index. Use with --csv-x-index.")
+@click.option("--csv-wkt-index", type=int, default=None, help="Headerless CSV WKT geometry column index.")
 @click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
 @click.option("--covering-bbox/--no-covering-bbox", default=True, show_default=True,
               help="Write per-row bbox covering columns + bounded row groups for "
@@ -99,6 +102,9 @@ def tile(
     csv_x_col,
     csv_y_col,
     csv_wkt_col,
+    csv_x_index,
+    csv_y_index,
+    csv_wkt_index,
     src_crs,
     covering_bbox,
     log_level,
@@ -121,6 +127,9 @@ def tile(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=parse_size_value(resolve_command_value("tile", "csv_split_size", csv_split_size)),
         src_crs=src_crs,
         sfc_bits=int(resolve_command_value("tile", "sfc_bits", sfc_bits)),
@@ -199,6 +208,9 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
 @click.option("--csv-x-col", default=None, help="CSV x-coordinate column. Use with --csv-y-col.")
 @click.option("--csv-y-col", default=None, help="CSV y-coordinate column. Use with --csv-x-col.")
 @click.option("--csv-wkt-col", default=None, help="CSV WKT geometry column.")
+@click.option("--csv-x-index", type=int, default=None, help="Headerless CSV x-coordinate column index. Use with --csv-y-index.")
+@click.option("--csv-y-index", type=int, default=None, help="Headerless CSV y-coordinate column index. Use with --csv-x-index.")
+@click.option("--csv-wkt-index", type=int, default=None, help="Headerless CSV WKT geometry column index.")
 @click.option("--src-crs", default="EPSG:4326", show_default=True, help="Source CRS hint for CSV inputs.")
 @click.option("--pmtiles/--no-pmtiles", default=None, help="Export MVT tiles to a PMTiles archive after generation.")
 @click.option("--log-level", default=None, help="Logging level.")
@@ -226,6 +238,9 @@ def build(
     csv_x_col,
     csv_y_col,
     csv_wkt_col,
+    csv_x_index,
+    csv_y_index,
+    csv_wkt_index,
     src_crs,
     pmtiles,
     log_level,
@@ -255,6 +270,9 @@ def build(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=parse_size_value(resolve_command_value("build", "csv_split_size", csv_split_size, fallback_sections=("tile",))),
         src_crs=src_crs,
         sfc_bits=int(resolve_command_value("build", "sfc_bits", sfc_bits, fallback_sections=("tile",))),

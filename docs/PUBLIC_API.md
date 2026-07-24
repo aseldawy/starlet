@@ -355,7 +355,7 @@ Supported sources:
 | GeoLife PLT | A `.plt` file or a directory containing only `.plt` files, nested at any depth | Longitude/latitude records become WGS 84 points | Each file is a split. `trajectory_id` repeats the file ID on every point so trajectories can be regrouped. |
 | GPX | A `.gpx` file or a directory containing only `.gpx` files, nested at any depth | GPX longitude/latitude points become WGS 84 points | Tracks, routes, and waypoints are flattened into point rows. File and GPX hierarchy metadata repeats on every point when present in the selected input. |
 | Shapefile | `.shp`, `.zip` containing shapefile sidecars, or a directory containing `.shp` and/or `.zip` files | Geometry comes from the Shapefile geometry | Uses `pyogrio`. Feature-range splits are used when feature counts are available. Geometry-only sampling reads geometry without attributes. |
-| CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, or `csv_wkt_col` | Files are read in row chunks. `src_crs` provides the CRS hint. |
+| CSV/TSV | `.csv`, `.tsv`, or a directory containing only CSV/TSV files | Use either `csv_x_col` + `csv_y_col`, `csv_wkt_col`, `csv_x_index` + `csv_y_index`, or `csv_wkt_index` | Files are read in row chunks. `src_crs` provides the CRS hint. Name-based options expect a header row; index-based options read the file as headerless. |
 | File Geodatabase | `.gdb` directory, `.gdb.zip` archive, or a directory containing `.gdb` directories | Geometry comes from each GDB layer | Uses `pyogrio`. Multiple layers are read as separate splits. Zipped GDBs are extracted to a temp cache before reading. |
 
 Directories must contain one supported source type. For example, a directory
@@ -502,7 +502,21 @@ it requests geometry only so attribute columns are not read unnecessarily.
 
 CSV and TSV inputs need explicit geometry column configuration.
 
-For x/y coordinate columns:
+For headered files, configure geometry fields by column name:
+
+- `csv_x_col` and `csv_y_col` must match the x/y header names, or
+- `csv_wkt_col` must match the WKT header name.
+
+For headerless files, configure geometry fields by zero-based column index:
+
+- `csv_x_index` and `csv_y_index` for x/y coordinates, or
+- `csv_wkt_index` for WKT geometry.
+
+When you use index-based CSV geometry options, Starlet does not read a header
+row from the file. Non-geometry columns are exposed with generated names such
+as `column_0`, `column_1`, and so on.
+
+For x/y coordinate columns in a headered file:
 
 ```python
 result = starlet.tile(
@@ -514,13 +528,36 @@ result = starlet.tile(
 )
 ```
 
-For WKT geometry:
+For x/y coordinate columns in a headerless file:
+
+```python
+result = starlet.tile(
+    input="data/stops-no-header.csv",
+    outdir="datasets/stops",
+    csv_x_index=0,
+    csv_y_index=1,
+    src_crs="EPSG:4326",
+)
+```
+
+For WKT geometry in a headered file:
 
 ```python
 result = starlet.tile(
     input="data/parcels.csv",
     outdir="datasets/parcels",
     csv_wkt_col="wkt",
+    src_crs="EPSG:4326",
+)
+```
+
+For WKT geometry in a headerless file:
+
+```python
+result = starlet.tile(
+    input="data/parcels-no-header.csv",
+    outdir="datasets/parcels",
+    csv_wkt_index=2,
     src_crs="EPSG:4326",
 )
 ```
@@ -593,6 +630,16 @@ starlet tile \
   --csv-y-col latitude
 ```
 
+Headerless CSV with x/y columns:
+
+```bash
+starlet tile \
+  --input data/stops-no-header.csv \
+  --outdir datasets/stops \
+  --csv-x-index 0 \
+  --csv-y-index 1
+```
+
 CSV with WKT:
 
 ```bash
@@ -600,6 +647,15 @@ starlet tile \
   --input data/parcels.csv \
   --outdir datasets/parcels \
   --csv-wkt-col wkt
+```
+
+Headerless CSV with WKT:
+
+```bash
+starlet tile \
+  --input data/parcels-no-header.csv \
+  --outdir datasets/parcels \
+  --csv-wkt-index 2
 ```
 
 Shapefile:

@@ -824,6 +824,28 @@ class TestCSVSource:
         assert tables[0]["id"].to_pylist() == [1, 2]
         assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
 
+    def test_headerless_xy_indexes_are_converted_to_geometry(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n2,2,3\n")
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["column_0", "column_1", "column_2", "geometry"]
+        assert tables[0]["column_0"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
+    def test_headerless_wkt_index_can_be_geometry_only(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,POINT (0 1)\n2,POINT (2 3)\n")
+
+        source = CSVSource(str(csv_path), wkt_col=1, geometry_only=True)
+        table = next(source.iter_tables())
+
+        assert table.column_names == ["geometry"]
+        assert wkb.loads(table["geometry"][0].as_py()).equals(Point(0, 1))
+
     def test_byte_splits_read_complete_rows_once(self, temp_dir):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text(
@@ -866,6 +888,26 @@ class TestCSVSource:
         assert len(splits) == 4
         assert ids == list(range(14_000))
 
+    def test_headerless_byte_splits_read_complete_rows_once(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text(
+            "1,0,1,alpha\n"
+            "2,2,3,beta\n"
+            "3,4,5,gamma\n"
+            "4,6,7,delta\n"
+        )
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        splits = source.create_splits(num_splits=5)
+        ids = [
+            row_id
+            for split in splits
+            for table in source.iter_tables(split)
+            for row_id in table["column_0"].to_pylist()
+        ]
+
+        assert ids == [1, 2, 3, 4]
+
     def test_create_splits_does_not_open_csv(self, temp_dir, monkeypatch):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text("id,x,y\n1,0,1\n2,2,3\n")
@@ -900,6 +942,16 @@ class TestCSVSource:
         assert isinstance(source, CSVSource)
         assert next(source.iter_tables()).column_names[-1] == "geom"
 
+    def test_source_for_path_detects_headerless_csv_with_indexes(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n")
+
+        source = source_for_path(str(csv_path), geom_col="geom", csv_x_index=1, csv_y_index=2)
+
+        assert isinstance(source, CSVSource)
+        table = next(source.iter_tables())
+        assert table.column_names == ["column_0", "column_1", "column_2", "geom"]
+
     def test_source_for_path_detects_bzip2_csv(self, temp_dir):
         csv_path = temp_dir / "points.csv.bz2"
         _write_bz2(csv_path, b"id,x,y\n1,0,1\n")
@@ -923,6 +975,23 @@ class TestCSVSource:
         assert sample.total_seen == 2
         assert sample.total_sampled == 2
         assert sample.sample_points.shape == (2, 2)
+
+    def test_read_spatial_sample_uses_headerless_csv_indexes(self, temp_dir):
+        csv_path = temp_dir / "points.csv"
+        csv_path.write_text("1,0,1\n2,2,3\n")
+
+        sample = read_spatial_sample(
+            str(csv_path),
+            csv_x_index=1,
+            csv_y_index=2,
+            source_workers=1,
+        )
+
+        assert sample.total_seen == 2
+        assert sample.total_sampled == 2
+        assert sample.sample_points.shape == (2, 2)
+        assert sample.schema is not None
+        assert sample.schema.names == ["column_0", "column_1", "column_2", "geometry"]
 
     def test_csv_sampling_unifies_schema_across_splits(self, temp_dir):
         csv_path = temp_dir / "mixed_types.csv"

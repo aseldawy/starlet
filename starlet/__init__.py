@@ -62,6 +62,9 @@ def tile(
     csv_x_col: str | None = None,
     csv_y_col: str | None = None,
     csv_wkt_col: str | None = None,
+    csv_x_index: int | None = None,
+    csv_y_index: int | None = None,
+    csv_wkt_index: int | None = None,
     csv_split_size: int | str | None = None,
     src_crs: str | None = None,
     temp_dir: str | None = None,
@@ -110,6 +113,11 @@ def tile(
         or provide ``csv_wkt_col`` instead.
     csv_wkt_col : str | None
         Column name containing WKT geometry for CSV inputs.
+    csv_x_index, csv_y_index : int | None
+        Zero-based x/y column positions for headerless CSV inputs. Provide
+        both, or provide ``csv_wkt_index`` instead.
+    csv_wkt_index : int | None
+        Zero-based WKT column position for a headerless CSV input.
     csv_split_size : int
         Target byte length for each CSV source split.
     src_crs : str
@@ -170,6 +178,9 @@ def tile(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=csv_split_size,
         src_crs=src_crs,
     )
@@ -203,6 +214,9 @@ def tile(
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,
+        csv_x_index=csv_x_index,
+        csv_y_index=csv_y_index,
+        csv_wkt_index=csv_wkt_index,
         csv_split_size=csv_split_size,
         src_crs=src_crs,
         geojson_workers=parallelism,

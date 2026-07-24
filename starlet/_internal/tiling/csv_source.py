@@ -23,6 +23,7 @@ from starlet._internal.tiling.datasource import (
 logger = logging.getLogger(__name__)
 _BZ2_BLOCK_MAGIC = bytes.fromhex("314159265359")
 _BZ2_STREAM_HEADER_LEN = 4
+_HEADERLESS_COLUMN_PREFIX = "column_"
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,9 @@ class CSVSource(DataSource):
         self,
         path: str,
         *,
-        x_col: str | None = None,
-        y_col: str | None = None,
-        wkt_col: str | None = None,
+        x_col: str | int | None = None,
+        y_col: str | int | None = None,
+        wkt_col: str | int | None = None,
         split_size: int = 32 * 1024 * 1024,
         batch_rows: int | None = None,
         src_crs: str = "EPSG:4326",
@@ -48,6 +49,8 @@ class CSVSource(DataSource):
     ) -> None:
         if bool(wkt_col) == bool(x_col and y_col):
             raise ValueError("CSV input requires either wkt_col or both x_col and y_col")
+        if (x_col is None) != (y_col is None):
+            raise ValueError("CSV x/y geometry requires both x_col and y_col")
 
         self.path = str(path)
         self.x_col = x_col
@@ -57,6 +60,7 @@ class CSVSource(DataSource):
         self.src_crs = src_crs
         self.geometry_only = bool(geometry_only)
         self.geom_col = geom_col
+        self.has_header = _csv_uses_header(x_col=x_col, y_col=y_col, wkt_col=wkt_col)
         self._files = _source_files(self.path, _CSV_SUFFIXES)
         if not self._files:
             raise ValueError(f"No CSV files found in {self.path}")
@@ -130,12 +134,21 @@ class CSVSource(DataSource):
 
     def _read_split(self, split: CSVSplit) -> pd.DataFrame:
         usecols = self._geometry_columns() if self.geometry_only else None
-        data = _read_csv_split_bytes(split)
+        data = _read_csv_split_bytes(split, has_header=self.has_header)
         if data is None:
             return pd.DataFrame()
-        return pd.read_csv(io.BytesIO(data), usecols=usecols, dtype=str)
+        read_kwargs = {
+            "usecols": usecols,
+            "dtype": str,
+        }
+        if not self.has_header:
+            read_kwargs["header"] = None
+        df = pd.read_csv(io.BytesIO(data), **read_kwargs)
+        if not self.has_header:
+            df = df.rename(columns=lambda name: _headerless_column_name(int(name)))
+        return df
 
-    def _geometry_columns(self) -> List[str]:
+    def _geometry_columns(self) -> List[str | int]:
         if self.wkt_col:
             return [self.wkt_col]
         return [self.x_col, self.y_col]  # type: ignore[list-item]
@@ -145,16 +158,19 @@ class CSVSource(DataSource):
         df: pd.DataFrame,
         schema: pa.Schema | None = None,
     ) -> pa.Table:
+        wkt_column = _csv_column_name(self.wkt_col)
+        x_column = _csv_column_name(self.x_col)
+        y_column = _csv_column_name(self.y_col)
         if self.wkt_col:
-            if self.wkt_col not in df.columns:
+            if wkt_column not in df.columns:
                 raise ValueError(f"CSV missing WKT column {self.wkt_col!r}")
-            geoms = from_wkt(df[self.wkt_col].astype("string").to_numpy())
+            geoms = from_wkt(df[wkt_column].astype("string").to_numpy())
         else:
-            if self.x_col not in df.columns or self.y_col not in df.columns:
+            if x_column not in df.columns or y_column not in df.columns:
                 raise ValueError(f"CSV missing x/y columns {self.x_col!r}, {self.y_col!r}")
             geoms = points(
-                pd.to_numeric(df[self.x_col], errors="coerce").to_numpy(),
-                pd.to_numeric(df[self.y_col], errors="coerce").to_numpy(),
+                pd.to_numeric(df[x_column], errors="coerce").to_numpy(),
+                pd.to_numeric(df[y_column], errors="coerce").to_numpy(),
             )
 
         geometry_col = pa.array(to_wkb(geoms, hex=False).tolist(), type=pa.binary())
@@ -244,15 +260,47 @@ def _parse_csv_value(value: object, arrow_type: pa.DataType):
     return text
 
 
-def _read_csv_split_bytes(split: CSVSplit) -> bytes | None:
+def _csv_uses_header(
+    *,
+    x_col: str | int | None,
+    y_col: str | int | None,
+    wkt_col: str | int | None,
+) -> bool:
+    refs = [ref for ref in (x_col, y_col, wkt_col) if ref is not None]
+    if not refs:
+        return True
+    has_named = any(isinstance(ref, str) for ref in refs)
+    has_indexed = any(isinstance(ref, int) for ref in refs)
+    if has_named and has_indexed:
+        raise ValueError("CSV geometry columns must be specified either all by name or all by index")
+    return has_named
+
+
+def _csv_column_name(column: str | int | None) -> str | None:
+    if column is None:
+        return None
+    if isinstance(column, int):
+        return _headerless_column_name(column)
+    return column
+
+
+def _headerless_column_name(index: int) -> str:
+    return f"{_HEADERLESS_COLUMN_PREFIX}{index}"
+
+
+def _read_csv_split_bytes(split: CSVSplit, *, has_header: bool) -> bytes | None:
     if split.path.lower().endswith(".bz2"):
-        return _read_bz2_csv_split_bytes(split)
+        return _read_bz2_csv_split_bytes(split, has_header=has_header)
 
     split_start = split.offset
     split_end = split.offset + split.length
     with open(split.path, "rb") as f:
-        header = f.readline()
-        data_start = f.tell()
+        if has_header:
+            header = f.readline()
+            data_start = f.tell()
+        else:
+            header = b""
+            data_start = 0
         start = max(split_start, data_start)
 
         if start > data_start:
@@ -281,7 +329,7 @@ def _read_csv_split_bytes(split: CSVSplit) -> bytes | None:
     return header + bytes(rows)
 
 
-def _read_bz2_csv_split_bytes(split: CSVSplit) -> bytes | None:
+def _read_bz2_csv_split_bytes(split: CSVSplit, *, has_header: bool) -> bytes | None:
     block_starts, file_size = _bz2_block_starts(split.path)
     split_end = min(split.offset + split.length, file_size)
     first_owned = next((start for start in block_starts if start >= split.offset), None)
@@ -318,7 +366,7 @@ def _read_bz2_csv_split_bytes(split: CSVSplit) -> bytes | None:
 
     if not payload:
         return None
-    if split.offset == 0:
+    if not has_header or split.offset == 0:
         return payload
     return _read_bz2_header_line(split.path) + payload
 

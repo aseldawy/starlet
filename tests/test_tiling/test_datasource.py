@@ -836,6 +836,18 @@ class TestCSVSource:
         assert tables[0]["column_0"].to_pylist() == [1, 2]
         assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
 
+    def test_headerless_txt_uses_whitespace_delimiter(self, temp_dir):
+        csv_path = temp_dir / "points.txt"
+        csv_path.write_text("1 0 1\n2 2 3\n")
+
+        source = CSVSource(str(csv_path), x_col=1, y_col=2)
+        tables = list(source.iter_tables())
+
+        assert len(tables) == 1
+        assert tables[0].column_names == ["column_0", "column_1", "column_2", "geometry"]
+        assert tables[0]["column_0"].to_pylist() == [1, 2]
+        assert wkb.loads(tables[0]["geometry"][0].as_py()).equals(Point(0, 1))
+
     def test_headerless_wkt_index_can_be_geometry_only(self, temp_dir):
         csv_path = temp_dir / "points.csv"
         csv_path.write_text("1,POINT (0 1)\n2,POINT (2 3)\n")

@@ -143,6 +143,8 @@ class CSVSource(DataSource):
         }
         if not self.has_header:
             read_kwargs["header"] = None
+        if split.path.lower().endswith(".txt"):
+            read_kwargs["sep"] = r"\s+"
         df = pd.read_csv(io.BytesIO(data), **read_kwargs)
         if not self.has_header:
             df = df.rename(columns=lambda name: _headerless_column_name(int(name)))

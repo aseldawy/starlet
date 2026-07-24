@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from dataclasses import dataclass, replace
 from typing import Iterable, Optional, List, Dict, Any, Tuple
 import logging
@@ -16,6 +16,7 @@ import pyarrow as pa
 import numpy as np
 from shapely import from_wkb
 
+from starlet._internal.executor import create_process_executor
 from starlet._internal.tiling.RSGrove import EnvelopeNDLite
 from starlet._internal.tiling.utils_large import ensure_large_types
 
@@ -662,13 +663,17 @@ def _read_datasource_spatial_sample(
     sample_caps = _split_sample_cap(sample_cap, len(splits))
 
     logger.info(
-        "Reading spatial sample from %s in %d source partitions with %s thread workers",
+        "Reading spatial sample from %s in %d source partitions with %s process workers",
         getattr(source, "path", "<source>"),
         len(splits),
         source_workers or "auto",
     )
 
-    with ThreadPoolExecutor(max_workers=source_workers) as executor:
+    with create_process_executor(
+        max_workers=source_workers,
+        logger=logger,
+        context="datasource spatial sampling",
+    ) as executor:
         futures = [
             executor.submit(
                 _read_datasource_split_spatial_sample,

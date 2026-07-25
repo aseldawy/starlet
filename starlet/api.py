@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from starlet._internal.config import config_value, ensure_config_loaded, get_loaded_config
+from starlet._internal.histogram.io import load_prefix_histogram, resolve_histogram_path
 from starlet._internal.pmtiles.paths import discover_pmtiles_path
 from starlet._internal.internal_columns import QUERY_INTERNAL_COLS
 
@@ -134,7 +135,9 @@ def get_dataset_metadata(dataset_dir: str | Path) -> dict[str, Any]:
         missing.append("dataset_dir")
     if not (root / "parquet_tiles").is_dir():
         missing.append("parquet_tiles")
-    if not ((root / "histograms" / "global_prefix.npy").exists() or (root / "histograms" / "global.npy").exists()):
+    try:
+        resolve_histogram_path(root / "histograms" / "global")
+    except FileNotFoundError:
         missing.append("histograms")
     if stats is None:
         missing.append("stats")
@@ -192,18 +195,12 @@ def estimate_range_count(
     ``rectangle`` is ``(minx, miny, maxx, maxy)``. By default it is interpreted
     as longitude/latitude and transformed to the histogram CRS (EPSG:3857).
     """
-    import numpy as np
-
     root = Path(dataset_dir)
     hist_dir = root / "histograms"
-    hist_path = hist_dir / "global_prefix.npy"
-    if not hist_path.exists():
-        hist_path = hist_dir / "global.npy"
-    if not hist_path.exists():
-        raise FileNotFoundError(f"Histogram not found under {hist_dir}")
-
-    arr = np.load(hist_path, allow_pickle=False)
-    prefix = arr if hist_path.stem.endswith("_prefix") else arr.cumsum(axis=0).cumsum(axis=1)
+    try:
+        prefix = load_prefix_histogram(hist_dir)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Histogram not found under {hist_dir}") from exc
     bbox_3857 = _rectangle_to_3857(rectangle, rectangle_crs)
     return float(_prefix_sum_rectangle(prefix, bbox_3857))
 

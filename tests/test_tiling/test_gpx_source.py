@@ -223,7 +223,6 @@ def test_gpx_spatial_sample_uses_all_points_and_infers_compact_schema(temp_dir):
 
     sample = read_spatial_sample(
         str(temp_dir),
-        sample_ratio=1.0,
         source_workers=1,
     )
 
@@ -246,10 +245,6 @@ def test_gpx_spatial_sample_uses_all_points_and_infers_compact_schema(temp_dir):
         "point_time",
         "geometry",
     ]
-    assert sample.mbr.getMinCoord(0) == pytest.approx(-118.0)
-    assert sample.mbr.getMaxCoord(0) == pytest.approx(-117.0)
-    assert sample.mbr.getMinCoord(1) == pytest.approx(40.0)
-    assert sample.mbr.getMaxCoord(1) == pytest.approx(41.0)
 
     source = source_for_path(str(temp_dir))
     source.set_schema(sample.schema)
@@ -260,6 +255,43 @@ def test_gpx_spatial_sample_uses_all_points_and_infers_compact_schema(temp_dir):
     assert "track_comment" not in table.column_names
     assert "route_index" not in table.column_names
     assert "point_name" not in table.column_names
+
+
+def test_gpx_tar_spatial_sample_applies_cap_across_members(temp_dir):
+    archive_path = temp_dir / "tracks.tar"
+
+    def gpx_member(start: int) -> str:
+        points = "\n".join(
+            f'<trkpt lat="{40.0 + start + index}" lon="{-118.0 - start - index}" />'
+            for index in range(3)
+        )
+        return (
+            "<?xml version='1.0' encoding='utf-8'?>\n"
+            "<gpx version=\"1.1\" creator=\"pytest\">\n"
+            "<trk><trkseg>\n"
+            f"{points}\n"
+            "</trkseg></trk>\n"
+            "</gpx>\n"
+        )
+
+    _write_tar(
+        archive_path,
+        {
+            "a.gpx": gpx_member(0),
+            "b.gpx": gpx_member(10),
+            "c.gpx": gpx_member(20),
+        },
+    )
+
+    sample = read_spatial_sample(
+        str(archive_path),
+        sample_cap=3,
+        source_workers=1,
+    )
+
+    assert sample.total_seen == 9
+    assert sample.total_sampled == 3
+    assert sample.sample_points.shape == (2, 3)
 
 
 def test_gpx_source_reports_context_for_invalid_points(temp_dir):

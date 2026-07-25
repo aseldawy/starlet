@@ -31,9 +31,6 @@ compression = "zstd"
 # Reservoir sample size used during partitioning.
 sample_cap = 10000
 
-# Bernoulli sample ratio used during partitioning.
-sample_ratio = 1.0
-
 # Target byte size for CSV source splits.
 csv_split_size = "32mb"
 
@@ -58,6 +55,10 @@ pmtiles = false
 
 # Maximum retained features per intermediate tile reservoir.
 feature_capacity = 10000
+
+# Maximum live features across active mapper tiles before spilling least-recently-used tiles.
+# Leave unset to use the default of about one million retained tile-features.
+mapper_feature_budget = 10000000
 
 # Vector tile extent.
 extent = 4096

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 import json
 from dataclasses import dataclass, replace
 import io
+import logging
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence
 import xml.etree.ElementTree as ET
@@ -13,6 +14,7 @@ import pyarrow as pa
 from shapely import points, to_wkb
 
 from starlet._internal.tiling.RSGrove import EnvelopeNDLite
+from starlet._internal.executor import create_process_executor
 from starlet._internal.tiling.datasource import (
     DataSource,
     TarFileSplit,
@@ -30,6 +32,8 @@ from starlet._internal.tiling.datasource import (
     _source_files,
     SpatialSample,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,11 @@ _GPX_BASE_FIELDS = (
     "latitude",
     "longitude",
 )
+_GPX_FIELD_INDEX = {
+    name: index
+    for index, (name, _field_type) in enumerate(_GPX_VALUE_FIELDS)
+}
+_GPX_BASE_FIELD_MASK = sum(1 << _GPX_FIELD_INDEX[name] for name in _GPX_BASE_FIELDS)
 _ROOT_TEXT_FIELDS = {
     "name": "gpx_name",
     "desc": "gpx_description",
@@ -144,10 +153,17 @@ _POINT_FIELDS = {
 _POINT_TAGS = {"wpt", "rtept", "trkpt"}
 
 
+def _gpx_field_mask(*field_names: str) -> int:
+    mask = 0
+    for name in field_names:
+        mask |= 1 << _GPX_FIELD_INDEX[name]
+    return mask
+
+
 @dataclass
 class _GPXScanContainer:
     index: int
-    fields: set[str]
+    field_mask: int
     point_index: int = -1
     segment_index: int = -1
 
@@ -199,7 +215,6 @@ class GPXSource(DataSource):
         cls,
         path: str,
         *,
-        sample_ratio: float,
         sample_cap: Optional[int],
         seed: int,
         workers: Optional[int],
@@ -209,12 +224,15 @@ class GPXSource(DataSource):
         splits = source.create_splits()
         sample_caps = _split_sample_cap(sample_cap, len(splits))
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with create_process_executor(
+            max_workers=workers,
+            logger=logger,
+            context="GPX spatial sampling",
+        ) as executor:
             futures = [
                 executor.submit(
                     _read_gpx_file_spatial_sample,
                     split,
-                    sample_ratio,
                     sample_caps[index],
                     seed + index,
                     geom_col,
@@ -224,20 +242,16 @@ class GPXSource(DataSource):
             parts = [future.result() for future in as_completed(futures)]
 
         sample = _combine_spatial_samples(parts)
-        schema_fields = {
-            field.name
-            for part in parts
-            if part.schema is not None
-            for field in part.schema
-            if field.name != geom_col
-        }
+        field_mask = 0
+        for part in parts:
+            field_mask |= part.gpx_field_mask
         return SpatialSample(
             sample_points=sample.sample_points,
-            mbr=sample.mbr,
             total_seen=sample.total_seen,
             total_sampled=sample.total_sampled,
             batches_read=sample.batches_read,
-            schema=_schema_for_gpx_fields(schema_fields, geom_col=geom_col),
+            schema=_schema_for_gpx_field_mask(field_mask, geom_col=geom_col),
+            gpx_field_mask=field_mask,
         )
 
     def schema(self) -> pa.Schema:
@@ -254,22 +268,16 @@ class GPXSource(DataSource):
         return sum(path.stat().st_size for path in [*self._files, *self._tar_files])
 
     def _infer_schema(self) -> pa.Schema:
-        schema_fields: set[str] = set()
+        field_mask = 0
         for split in self.create_splits():
             sample = _read_gpx_file_spatial_sample(
                 split,
-                sample_ratio=0.0,
                 sample_cap=0,
                 seed=0,
                 geom_col=self.geom_col,
             )
-            if sample.schema is not None:
-                schema_fields.update(
-                    field.name
-                    for field in sample.schema
-                    if field.name != self.geom_col
-                )
-        return _schema_for_gpx_fields(schema_fields, geom_col=self.geom_col)
+            field_mask |= sample.gpx_field_mask
+        return _schema_for_gpx_field_mask(field_mask, geom_col=self.geom_col)
 
     def create_splits(self, num_splits: Optional[int] = None) -> List[GPXSplit]:
         splits = [GPXSplit(path=str(path)) for path in self._files]
@@ -463,6 +471,20 @@ def _schema_for_gpx_fields(field_names: Iterable[str], *, geom_col: str) -> pa.S
     )
 
 
+def _schema_for_gpx_field_mask(field_mask: int, *, geom_col: str) -> pa.Schema:
+    fields = [
+        pa.field(name, field_type)
+        for index, (name, field_type) in enumerate(_GPX_VALUE_FIELDS)
+        if field_mask & (1 << index)
+    ]
+    fields.append(pa.field(geom_col, pa.binary()))
+    return _attach_geoparquet_metadata(
+        pa.schema(fields),
+        "EPSG:4326",
+        geom_col=geom_col,
+    )
+
+
 def _gpx_metadata(root: ET.Element, selected_fields: set[str]) -> dict[str, Any]:
     metadata = _first_child(root, "metadata")
     scalar_parent = metadata if metadata is not None else root
@@ -611,7 +633,6 @@ def _put_selected(
 
 def _read_gpx_file_spatial_sample(
     split: GPXSplit,
-    sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
     geom_col: str,
@@ -621,75 +642,50 @@ def _read_gpx_file_spatial_sample(
             Path(split.path).read_bytes(),
             filename=Path(split.path).name,
             source_label=split.path,
-            sample_ratio=sample_ratio,
             sample_cap=sample_cap,
             seed=seed,
             geom_col=geom_col,
         )
 
-    parts = [
-        _read_gpx_bytes_spatial_sample(
+    rng = np.random.default_rng(seed)
+    x_sample: List[float] = []
+    y_sample: List[float] = []
+    n_seen = 0
+    batches_read = 0
+    field_mask = 0
+
+    for member in _iter_tar_members_for_split(
+        split.path,
+        offset=split.tar_offset,
+        length=split.tar_length,
+        suffixes=_GPX_SUFFIXES,
+    ):
+        member_sample = _read_gpx_bytes_spatial_sample(
             member.data,
             filename=Path(member.name).name,
             source_label=member.name,
-            sample_ratio=sample_ratio,
             sample_cap=sample_cap,
-            seed=seed + index,
+            seed=seed,
             geom_col=geom_col,
+            rng=rng,
+            x_sample=x_sample,
+            y_sample=y_sample,
+            n_seen_start=n_seen,
         )
-        for index, member in enumerate(
-            _iter_tar_members_for_split(
-                split.path,
-                offset=split.tar_offset,
-                length=split.tar_length,
-                suffixes=_GPX_SUFFIXES,
-            )
-        )
-    ]
-    if not parts:
-        return _spatial_sample_from_state(
-            x_sample=[],
-            y_sample=[],
-            mins=np.array([+np.inf, +np.inf], dtype=np.float64),
-            maxs=np.array([-np.inf, -np.inf], dtype=np.float64),
-            n_seen=0,
-            batches_read=0,
-            schema=_schema_for_gpx_fields((), geom_col=geom_col),
-        )
-    non_empty = [part for part in parts if part.total_seen > 0]
-    if non_empty:
-        mins = np.minimum.reduce([part.mbr.mins for part in non_empty])
-        maxs = np.maximum.reduce([part.mbr.maxs for part in non_empty])
-        sampled = [part.sample_points for part in non_empty if part.sample_points.shape[1] > 0]
-        sample_points = (
-            np.concatenate(sampled, axis=1)
-            if sampled
-            else np.empty((2, 0), dtype=np.float64)
-        )
-        combined = SpatialSample(
-            sample_points=sample_points,
-            mbr=EnvelopeNDLite(mins, maxs),
-            total_seen=sum(part.total_seen for part in parts),
-            total_sampled=sample_points.shape[1],
-            batches_read=sum(part.batches_read for part in parts),
-        )
-    else:
-        combined = _spatial_sample_from_state(
-            x_sample=[],
-            y_sample=[],
-            mins=np.array([+np.inf, +np.inf], dtype=np.float64),
-            maxs=np.array([-np.inf, -np.inf], dtype=np.float64),
-            n_seen=0,
-            batches_read=sum(part.batches_read for part in parts),
-        )
-    schema_fields = {
-        field.name
-        for part in parts
-        if part.schema is not None
-        for field in part.schema
-        if field.name != geom_col
-    }
-    return replace(combined, schema=_schema_for_gpx_fields(schema_fields, geom_col=geom_col))
+        batches_read += member_sample.batches_read
+        field_mask |= member_sample.gpx_field_mask
+        if member_sample.total_seen <= 0:
+            continue
+
+        n_seen += member_sample.total_seen
+
+    return _spatial_sample_from_state(
+        x_sample=x_sample,
+        y_sample=y_sample,
+        n_seen=n_seen,
+        batches_read=batches_read,
+        gpx_field_mask=field_mask,
+    )
 
 
 def _read_gpx_bytes_spatial_sample(
@@ -697,20 +693,21 @@ def _read_gpx_bytes_spatial_sample(
     *,
     filename: str,
     source_label: str,
-    sample_ratio: float,
     sample_cap: Optional[int],
     seed: int,
     geom_col: str,
+    rng: np.random.Generator | None = None,
+    x_sample: List[float] | None = None,
+    y_sample: List[float] | None = None,
+    n_seen_start: int = 0,
 ) -> SpatialSample:
-    rng = np.random.default_rng(seed)
-    mins = np.array([+np.inf, +np.inf], dtype=np.float64)
-    maxs = np.array([-np.inf, -np.inf], dtype=np.float64)
-    x_sample: List[float] = []
-    y_sample: List[float] = []
+    rng = rng if rng is not None else np.random.default_rng(seed)
+    x_sample = x_sample if x_sample is not None else []
+    y_sample = y_sample if y_sample is not None else []
     n_seen = 0
 
-    emitted_fields: set[str] = set()
-    file_fields: set[str] = set()
+    emitted_field_mask = 0
+    file_field_mask = 0
     stack: list[str] = []
     route_stack: list[_GPXScanContainer] = []
     track_stack: list[_GPXScanContainer] = []
@@ -728,37 +725,42 @@ def _read_gpx_bytes_spatial_sample(
                 parent = stack[-2] if len(stack) >= 2 else None
                 if tag == "gpx":
                     if element.attrib.get("version") is not None:
-                        file_fields.add("gpx_version")
+                        file_field_mask |= _gpx_field_mask("gpx_version")
                     if element.attrib.get("creator") is not None:
-                        file_fields.add("gpx_creator")
+                        file_field_mask |= _gpx_field_mask("gpx_creator")
                 elif tag == "metadata" and parent == "gpx":
-                    file_fields.add("gpx_metadata_xml")
+                    file_field_mask |= _gpx_field_mask("gpx_metadata_xml")
                 elif tag == "bounds" and parent in {"gpx", "metadata"}:
-                    file_fields.add("gpx_bounds")
+                    file_field_mask |= _gpx_field_mask("gpx_bounds")
                 elif tag == "author" and parent in {"gpx", "metadata"}:
-                    file_fields.add("gpx_author")
+                    file_field_mask |= _gpx_field_mask("gpx_author")
                 elif tag == "extensions":
-                    _mark_extension_field(
-                        file_fields,
+                    file_field_mask = _mark_extension_field(
+                        file_field_mask,
                         route_stack,
                         track_stack,
                         segment_stack,
                         parent,
                     )
                 elif tag in {"link", "url"}:
-                    _mark_link_field(file_fields, route_stack, track_stack, parent)
+                    file_field_mask = _mark_link_field(
+                        file_field_mask,
+                        route_stack,
+                        track_stack,
+                        parent,
+                    )
                 elif tag == "rte":
                     route_index += 1
-                    route_stack.append(_GPXScanContainer(index=route_index, fields=set()))
+                    route_stack.append(_GPXScanContainer(index=route_index, field_mask=0))
                 elif tag == "trk":
                     track_index += 1
-                    track_stack.append(_GPXScanContainer(index=track_index, fields=set()))
+                    track_stack.append(_GPXScanContainer(index=track_index, field_mask=0))
                 elif tag == "trkseg" and track_stack:
                     track_stack[-1].segment_index += 1
                     segment_stack.append(
                         _GPXScanContainer(
                             index=track_stack[-1].segment_index,
-                            fields=set(),
+                            field_mask=0,
                         )
                     )
                 continue
@@ -768,23 +770,23 @@ def _read_gpx_bytes_spatial_sample(
 
             if parent in {"gpx", "metadata"} and tag in _ROOT_TEXT_FIELDS:
                 if _direct_text(element) is not None:
-                    file_fields.add(_ROOT_TEXT_FIELDS[tag])
+                    file_field_mask |= _gpx_field_mask(_ROOT_TEXT_FIELDS[tag])
             elif parent == "author" and grandparent in {"gpx", "metadata"}:
                 if _direct_text(element) is not None or element.attrib:
-                    file_fields.add("gpx_author")
+                    file_field_mask |= _gpx_field_mask("gpx_author")
             elif parent == "trk" and track_stack and tag in _TRACK_FIELDS:
                 if _direct_text(element) is not None:
-                    track_stack[-1].fields.add(_TRACK_FIELDS[tag])
+                    track_stack[-1].field_mask |= _gpx_field_mask(_TRACK_FIELDS[tag])
             elif parent == "rte" and route_stack and tag in _ROUTE_FIELDS:
                 if _direct_text(element) is not None:
-                    route_stack[-1].fields.add(_ROUTE_FIELDS[tag])
+                    route_stack[-1].field_mask |= _gpx_field_mask(_ROUTE_FIELDS[tag])
             elif parent in _POINT_TAGS and tag in _POINT_FIELDS:
                 if _direct_text(element) is not None:
-                    emitted_fields.add(_POINT_FIELDS[tag])
+                    emitted_field_mask |= _gpx_field_mask(_POINT_FIELDS[tag])
             elif parent in _POINT_TAGS and tag in {"link", "url"}:
-                emitted_fields.add("point_links")
+                emitted_field_mask |= _gpx_field_mask("point_links")
             elif parent in _POINT_TAGS and tag == "extensions":
-                emitted_fields.add("point_extensions_xml")
+                emitted_field_mask |= _gpx_field_mask("point_extensions_xml")
 
             if tag in _POINT_TAGS:
                 _, point_index, context, structural_fields = _point_scan_context(
@@ -797,9 +799,9 @@ def _read_gpx_bytes_spatial_sample(
                 )
                 if tag == "wpt":
                     waypoint_index = point_index
-                emitted_fields.update(_GPX_BASE_FIELDS)
-                emitted_fields.update(file_fields)
-                emitted_fields.update(structural_fields)
+                emitted_field_mask |= _GPX_BASE_FIELD_MASK
+                emitted_field_mask |= file_field_mask
+                emitted_field_mask |= structural_fields
 
                 x = _required_float_attr(
                     element,
@@ -813,23 +815,13 @@ def _read_gpx_bytes_spatial_sample(
                     path=Path(filename),
                     context=context,
                 )
-                if x < mins[0]:
-                    mins[0] = x
-                if y < mins[1]:
-                    mins[1] = y
-                if x > maxs[0]:
-                    maxs[0] = x
-                if y > maxs[1]:
-                    maxs[1] = y
-
                 n_seen += 1
                 _reservoir_add(
                     rng=rng,
                     sample_cap=sample_cap,
-                    sample_ratio=sample_ratio,
                     x_sample=x_sample,
                     y_sample=y_sample,
-                    n_seen=n_seen,
+                    n_seen=n_seen_start + n_seen,
                     x=x,
                     y=y,
                 )
@@ -849,43 +841,43 @@ def _read_gpx_bytes_spatial_sample(
     return _spatial_sample_from_state(
         x_sample=x_sample,
         y_sample=y_sample,
-        mins=mins,
-        maxs=maxs,
         n_seen=n_seen,
         batches_read=1 if n_seen else 0,
-        schema=_schema_for_gpx_fields(emitted_fields, geom_col=geom_col),
+        gpx_field_mask=emitted_field_mask,
     )
 
 
 def _mark_extension_field(
-    file_fields: set[str],
+    file_field_mask: int,
     route_stack: list[_GPXScanContainer],
     track_stack: list[_GPXScanContainer],
     segment_stack: list[_GPXScanContainer],
     parent: str | None,
-) -> None:
+) -> int:
     if parent in {"gpx", "metadata"}:
-        file_fields.add("gpx_extensions_xml")
+        file_field_mask |= _gpx_field_mask("gpx_extensions_xml")
     elif parent == "rte" and route_stack:
-        route_stack[-1].fields.add("route_extensions_xml")
+        route_stack[-1].field_mask |= _gpx_field_mask("route_extensions_xml")
     elif parent == "trk" and track_stack:
-        track_stack[-1].fields.add("track_extensions_xml")
+        track_stack[-1].field_mask |= _gpx_field_mask("track_extensions_xml")
     elif parent == "trkseg" and segment_stack:
-        segment_stack[-1].fields.add("segment_extensions_xml")
+        segment_stack[-1].field_mask |= _gpx_field_mask("segment_extensions_xml")
+    return file_field_mask
 
 
 def _mark_link_field(
-    file_fields: set[str],
+    file_field_mask: int,
     route_stack: list[_GPXScanContainer],
     track_stack: list[_GPXScanContainer],
     parent: str | None,
-) -> None:
+) -> int:
     if parent == "author":
-        file_fields.add("gpx_author")
+        file_field_mask |= _gpx_field_mask("gpx_author")
     elif parent == "rte" and route_stack:
-        route_stack[-1].fields.add("route_links")
+        route_stack[-1].field_mask |= _gpx_field_mask("route_links")
     elif parent == "trk" and track_stack:
-        track_stack[-1].fields.add("track_links")
+        track_stack[-1].field_mask |= _gpx_field_mask("track_links")
+    return file_field_mask
 
 
 def _point_scan_context(
@@ -895,10 +887,10 @@ def _point_scan_context(
     route_stack: list[_GPXScanContainer],
     track_stack: list[_GPXScanContainer],
     segment_stack: list[_GPXScanContainer],
-) -> tuple[str, int, str, set[str]]:
+) -> tuple[str, int, str, int]:
     if tag == "wpt":
         point_index = waypoint_index + 1
-        return "waypoint", point_index, f"waypoint[{point_index}]", set()
+        return "waypoint", point_index, f"waypoint[{point_index}]", 0
     if tag == "rtept":
         if not route_stack:
             raise ValueError(f"Invalid GPX point in {path}: route point outside <rte>")
@@ -908,7 +900,7 @@ def _point_scan_context(
             "route",
             route.point_index,
             f"route[{route.index}]/point[{route.point_index}]",
-            {"route_index", *route.fields},
+            _gpx_field_mask("route_index") | route.field_mask,
         )
     if not track_stack or not segment_stack:
         raise ValueError(f"Invalid GPX point in {path}: track point outside <trkseg>")
@@ -919,7 +911,7 @@ def _point_scan_context(
         "track",
         segment.point_index,
         f"track[{track.index}]/segment[{segment.index}]/point[{segment.point_index}]",
-        {"track_index", "segment_index", *track.fields, *segment.fields},
+        _gpx_field_mask("track_index", "segment_index") | track.field_mask | segment.field_mask,
     )
 
 

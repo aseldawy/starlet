@@ -10,6 +10,7 @@ from starlet._internal.config import (
     parse_size_value,
     resolve_command_value,
 )
+from starlet._internal.histogram.io import resolve_histogram_path
 from starlet._types import TileResult, MVTResult, Dataset
 
 ensure_config_loaded()
@@ -54,7 +55,6 @@ def tile(
     sort: str | None = None,
     compression: str | None = None,
     sample_cap: int | None = None,
-    sample_ratio: float | None = None,
     seed: int | None = None,
     geom_col: str | None = None,
     sfc_bits: int | None = None,
@@ -95,8 +95,6 @@ def tile(
         Parquet compression codec (default ``"zstd"``).
     sample_cap : int | None
         Reservoir sampling cap for centroid sampling.
-    sample_ratio : float
-        Bernoulli sampling ratio for centroids (0 < r <= 1).
     seed : int
         Random seed for RSGrove partitioner.
     geom_col : str
@@ -141,6 +139,7 @@ def tile(
     from starlet._internal.tiling.datasource import read_spatial_sample, source_for_path
     from starlet._internal.tiling.geojson_source import is_geojson_path
     from starlet._internal.tiling.assigner import RSGroveAssigner
+    from starlet._internal.tiling.RSGrove import EnvelopeNDLite
     from starlet._internal.tiling.two_stage_orchestrator import TwoStageOrchestrator
     from starlet._internal.tiling.writer_pool import SortMode
     from starlet._internal.histogram.hist_pyramid import build_histograms_for_dir
@@ -151,7 +150,6 @@ def tile(
     sort = str(resolve_command_value("tile", "sort", sort))
     compression = str(resolve_command_value("tile", "compression", compression))
     sample_cap = resolve_command_value("tile", "sample_cap", sample_cap)
-    sample_ratio = float(resolve_command_value("tile", "sample_ratio", sample_ratio))
     seed = int(seed if seed is not None else 42)
     geom_col = str(geom_col or "geometry")
     sfc_bits = int(resolve_command_value("tile", "sfc_bits", sfc_bits))
@@ -209,7 +207,6 @@ def tile(
         input,
         geom_col=geom_col,
         seed=seed,
-        sample_ratio=sample_ratio,
         sample_cap=sample_cap,
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
@@ -225,9 +222,14 @@ def tile(
     )
     if spatial_sample.schema is not None:
         source.set_schema(spatial_sample.schema)
-    assigner = RSGroveAssigner.from_sample_and_mbr(
-        sample_points=spatial_sample.sample_points,
-        mbr=spatial_sample.mbr,
+    sample_points = spatial_sample.sample_points
+    sample_bounds = EnvelopeNDLite(
+        sample_points.min(axis=1),
+        sample_points.max(axis=1),
+    )
+    assigner = RSGroveAssigner.from_sample_and_bounds(
+        sample_points=sample_points,
+        bounds=sample_bounds,
         num_partitions=target_partitions,
         geom_col=geom_col,
     )
@@ -275,7 +277,7 @@ def tile(
         num_files=len(tile_files),
         total_rows=total_rows,
         bbox=result_bbox,
-        histogram_path=str(Path(hist_dir) / "global_prefix.npy"),
+        histogram_path=str(resolve_histogram_path(Path(hist_dir) / "global")),
     )
 
 
@@ -290,6 +292,7 @@ def generate_mvt(
     parallelism: int | None = None,
     temp_dir: str | None = None,
     feature_capacity: int | None = None,
+    mapper_feature_budget: int | None = None,
     extent: int | None = None,
     buffer: int | None = None,
 ) -> MVTResult:
@@ -315,6 +318,10 @@ def generate_mvt(
         ``<tile_dir>/tmp``.
     feature_capacity : int
         Maximum retained features per intermediate tile reservoir.
+    mapper_feature_budget : int
+        Maximum retained features kept in memory by one MVT mapper before
+        spilling least-recently-used partial tiles to disk. When omitted,
+        Starlet uses about ten million retained tile-features.
     extent : int
         Vector tile extent.
     buffer : int
@@ -333,6 +340,12 @@ def generate_mvt(
     parallelism = command_parallelism("mvt", explicit=parallelism)
     temp_dir = resolve_command_value("mvt", "temp_dir", temp_dir)
     feature_capacity = int(resolve_command_value("mvt", "feature_capacity", feature_capacity))
+    mapper_feature_budget_value = resolve_command_value("mvt", "mapper_feature_budget", mapper_feature_budget)
+    mapper_feature_budget = (
+        None
+        if mapper_feature_budget_value is None
+        else int(mapper_feature_budget_value)
+    )
     extent = int(resolve_command_value("mvt", "extent", extent))
     buffer = int(resolve_command_value("mvt", "buffer", buffer))
 
@@ -355,6 +368,7 @@ def generate_mvt(
         workers=parallelism,
         temp_dir=temp_dir,
         feature_capacity=feature_capacity,
+        mapper_feature_budget=mapper_feature_budget,
         extent=extent,
         buffer=buffer,
     ).run()
@@ -385,6 +399,7 @@ def build(
     pmtiles_compression: str | None = None,
     temp_dir: str | None = None,
     feature_capacity: int | None = None,
+    mapper_feature_budget: int | None = None,
     extent: int | None = None,
     buffer: int | None = None,
     **tile_kwargs,
@@ -417,6 +432,10 @@ def build(
         values override the process-wide Starlet temp directory.
     feature_capacity : int
         Maximum retained features per intermediate tile reservoir.
+    mapper_feature_budget : int
+        Maximum retained features kept in memory by one MVT mapper before
+        spilling partial tiles to disk. When omitted, Starlet uses about one
+        million retained tile-features.
     extent : int
         Vector tile extent.
     buffer : int
@@ -450,6 +469,17 @@ def build(
     feature_capacity = int(
         resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))
     )
+    mapper_feature_budget_value = resolve_command_value(
+        "build",
+        "mapper_feature_budget",
+        mapper_feature_budget,
+        fallback_sections=("mvt",),
+    )
+    mapper_feature_budget = (
+        None
+        if mapper_feature_budget_value is None
+        else int(mapper_feature_budget_value)
+    )
     extent = int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",)))
     buffer = int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",)))
     tile_kwargs.setdefault(
@@ -470,17 +500,6 @@ def build(
     tile_kwargs.setdefault(
         "sample_cap",
         resolve_command_value("build", "sample_cap", tile_kwargs.get("sample_cap"), fallback_sections=("tile",)),
-    )
-    tile_kwargs.setdefault(
-        "sample_ratio",
-        float(
-            resolve_command_value(
-                "build",
-                "sample_ratio",
-                tile_kwargs.get("sample_ratio"),
-                fallback_sections=("tile",),
-            )
-        ),
     )
     tile_kwargs.setdefault(
         "csv_split_size",
@@ -523,6 +542,7 @@ def build(
         temp_dir=temp_dir,
         parallelism=parallelism,
         feature_capacity=feature_capacity,
+        mapper_feature_budget=mapper_feature_budget,
         extent=extent,
         buffer=buffer,
     )

@@ -21,7 +21,6 @@ partition_size = "256mb"
 sort = "hilbert"
 compression = "gzip"
 sample_cap = 123
-sample_ratio = 0.5
 csv_split_size = "64mb"
 grid_size = 1024
 dtype = "float32"
@@ -61,7 +60,6 @@ sfc_bits = 20
     assert captured["sort"] == "hilbert"
     assert captured["compression"] == "gzip"
     assert captured["sample_cap"] == 123
-    assert captured["sample_ratio"] == 0.5
     assert captured["csv_split_size"] == 64 * 1024 * 1024
     assert captured["parallelism"] == 6
     assert captured["grid_size"] == 1024
@@ -82,6 +80,7 @@ zoom = 5
 threshold = 777
 pmtiles = true
 feature_capacity = 333
+mapper_feature_budget = 4444
 extent = 2048
 buffer = 64
 """.strip()
@@ -89,7 +88,7 @@ buffer = 64
 
     captured = {}
 
-    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, extent, buffer):
+    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, mapper_feature_budget, extent, buffer):
         captured.update(
             tile_dir=tile_dir,
             zoom=zoom,
@@ -100,6 +99,7 @@ buffer = 64
             parallelism=parallelism,
             temp_dir=temp_dir,
             feature_capacity=feature_capacity,
+            mapper_feature_budget=mapper_feature_budget,
             extent=extent,
             buffer=buffer,
         )
@@ -128,6 +128,7 @@ buffer = 64
     assert captured["pmtiles_compression"] == "gzip"
     assert captured["parallelism"] == 4
     assert captured["feature_capacity"] == 333
+    assert captured["mapper_feature_budget"] == 4444
     assert captured["extent"] == 2048
     assert captured["buffer"] == 64
 

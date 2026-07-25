@@ -18,6 +18,12 @@ Requires Python 3.10+. This installs the `starlet` command-line tool.
 > Want to work on Starlet itself (run from a clone, run the tests)? See
 > [DEVELOPMENT.md](DEVELOPMENT.md).
 
+For local development and testing, install the project with dev dependencies:
+
+```bash
+pip install -e ".[dev]"
+```
+
 ## Quick start
 
 Turn a supported geospatial source into a running tile server in two commands:

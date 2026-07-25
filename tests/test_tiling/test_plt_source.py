@@ -114,16 +114,12 @@ def test_plt_spatial_sample_uses_all_points(temp_dir):
 
     sample = read_spatial_sample(
         str(temp_dir),
-        sample_ratio=1.0,
         source_workers=1,
     )
 
     assert sample.total_seen == 2
     assert sample.total_sampled == 2
-    assert sample.mbr.getMinCoord(0) == pytest.approx(116.0)
-    assert sample.mbr.getMaxCoord(0) == pytest.approx(118.0)
-    assert sample.mbr.getMinCoord(1) == pytest.approx(40.0)
-    assert sample.mbr.getMaxCoord(1) == pytest.approx(41.0)
+    assert sample.sample_points.shape == (2, 2)
 
 
 def test_plt_source_reports_file_and_line_for_invalid_records(temp_dir):

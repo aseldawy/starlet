@@ -1,6 +1,7 @@
 """Tests for the two-stage dataset MVT generator helpers."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import mapbox_vector_tile
@@ -10,16 +11,21 @@ from shapely import wkb
 from shapely.geometry import Point
 
 from starlet._internal.mvt.mvt_generator import (
+    _MapperTileCache,
+    _ReduceTileInput,
     _TableBatch,
     _bucket_tile_ids,
     _group_splits,
     _group_table_batches,
+    _intermediate_tile_part_filename,
     _positive_bounds_tuple,
+    _reduce_tile_group,
     _sample_single_tile_records,
     _single_tile_index_cache,
     _single_tile_parquet_index,
     generate_single_mvt_tile,
 )
+from starlet._internal.mvt.intermediate_tile import IntermediateVectorTile
 from starlet._internal.mvt import mvt_generator
 from starlet._internal.server.tiler.parquet_index import ParquetIndex
 from starlet._internal.tiling.geoparquet_source import GeoParquetSplit
@@ -64,6 +70,66 @@ def test_positive_bounds_tuple_expands_zero_sized_bounds():
     assert miny == 2.0
     assert maxx > minx
     assert maxy > miny
+
+
+def test_mapper_tile_cache_spills_lru_when_feature_budget_is_exceeded(tmp_path):
+    cache = _MapperTileCache(
+        mapper_index=0,
+        intermediate_dir=tmp_path / "mapper",
+        feature_capacity=2,
+        mapper_feature_budget=2,
+        extent=4096,
+        buffer=256,
+    )
+    first = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
+    second = IntermediateVectorTile(1, 0, 0, feature_capacity=2)
+
+    cache.put(first.tile_id, first)
+    first.add_feature(Point(0, 0), {"id": 1}, priority=1)
+    cache.account_feature_change(first.tile_id)
+    first.add_feature(Point(1, 1), {"id": 2}, priority=2)
+    cache.account_feature_change(first.tile_id)
+
+    cache.put(second.tile_id, second)
+    second.add_feature(Point(2, 2), {"id": 3}, priority=3)
+    cache.account_feature_change(second.tile_id)
+
+    assert first.tile_id not in cache.tiles
+    assert second.tile_id in cache.tiles
+    assert cache.live_features == 1
+    assert cache.tile_part_counts == {first.tile_id: 1}
+
+    tile_part_counts = dict(cache.flush_remaining())
+    assert tile_part_counts == {first.tile_id: 1, second.tile_id: 1}
+    paths = list((tmp_path / "mapper").iterdir())
+    assert len(paths) == 2
+    assert all(path.parent == tmp_path / "mapper" for path in paths)
+
+
+def test_reduce_merges_multiple_spills_for_same_tile(tmp_path):
+    tile_id = IntermediateVectorTile(0, 0, 0, feature_capacity=1).tile_id
+    mapper_dir = tmp_path / "mapper"
+    mapper_dir.mkdir()
+    left_path = mapper_dir / _intermediate_tile_part_filename(0, 0, 0, 0)
+    right_path = mapper_dir / _intermediate_tile_part_filename(0, 0, 0, 1)
+    left = IntermediateVectorTile(0, 0, 0, feature_capacity=1)
+    right = IntermediateVectorTile(0, 0, 0, feature_capacity=1)
+    left.add_feature(Point(0, 0), {"id": 1}, priority=1)
+    right.add_feature(Point(0, 0), {"id": 2}, priority=9)
+    left.write_features(left_path)
+    right.write_features(right_path)
+
+    outdir = tmp_path / "mvt"
+    _reduce_tile_group(
+        [_ReduceTileInput(tile_id, ((str(mapper_dir), 2),))],
+        str(outdir),
+        feature_capacity=1,
+        extent=4096,
+        buffer=256,
+    )
+
+    decoded = mapbox_vector_tile.decode((outdir / "0" / "0" / "0.mvt").read_bytes())
+    assert decoded["layer0"]["features"][0]["properties"] == {"id": 2}
 
 
 def test_generate_single_mvt_tile_uses_partition_and_row_bbox_pruning(tmp_path):
@@ -434,7 +500,7 @@ def test_dataset_generator_removes_mvt_dir_after_pmtiles_export(monkeypatch, tmp
     hist_dir = dataset_dir / "histograms"
     parquet_dir.mkdir(parents=True)
     hist_dir.mkdir(parents=True)
-    (hist_dir / "global_prefix.npy").write_bytes(b"fake")
+    (hist_dir / "global.npy.gz").write_bytes(b"fake")
 
     generator = DatasetMVTGenerator(
         str(dataset_dir),
@@ -457,7 +523,7 @@ def test_dataset_generator_removes_mvt_dir_after_pmtiles_export(monkeypatch, tmp
     monkeypatch.setattr(
         DatasetMVTGenerator,
         "_run_map_stage",
-        lambda self, groups, source, temp_root: [_MapStageResult("tmp", [1])],
+        lambda self, groups, source, temp_root: [_MapStageResult("tmp", ())],
     )
     monkeypatch.setattr(
         DatasetMVTGenerator,
@@ -490,7 +556,7 @@ def test_dataset_generator_skips_pmtiles_export_when_threshold_filters_all_tiles
     hist_dir = dataset_dir / "histograms"
     parquet_dir.mkdir(parents=True)
     hist_dir.mkdir(parents=True)
-    (hist_dir / "global_prefix.npy").write_bytes(b"fake")
+    (hist_dir / "global.npy.gz").write_bytes(b"fake")
 
     generator = DatasetMVTGenerator(
         str(dataset_dir),
@@ -510,7 +576,7 @@ def test_dataset_generator_skips_pmtiles_export_when_threshold_filters_all_tiles
     monkeypatch.setattr(
         DatasetMVTGenerator,
         "_run_map_stage",
-        lambda self, groups, source, temp_root: [_MapStageResult("tmp", [])],
+        lambda self, groups, source, temp_root: [_MapStageResult("tmp", ())],
     )
 
     def make_empty_output(self, map_results):

@@ -1,5 +1,7 @@
 """Tests for the standalone intermediate vector tile helper."""
 
+from datetime import date, datetime, time
+
 import mapbox_vector_tile
 import pytest
 from shapely.geometry import LineString, Point, Polygon
@@ -119,6 +121,32 @@ def test_encode_flattens_loaded_arrow_map_properties_for_mvt_only(tmp_path):
         "tagsMap.name": "Oak Hill",
         "tagsMap.landuse": "cemetery",
     }
+
+
+def test_feature_arrow_roundtrip_serializes_date_like_properties(tmp_path):
+    path = tmp_path / "0-0-0.pyarrow"
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=1)
+    tile.add_feature(
+        Point(0, 0),
+        {
+            "created": date(2026, 7, 26),
+            "updated": datetime(2026, 7, 26, 16, 34, 22),
+            "clock": time(16, 34, 22),
+        },
+        priority=9,
+    )
+
+    tile.write_features(path)
+
+    loaded = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    loaded.load_features(path)
+
+    assert loaded._features[0].properties == {
+        "created": "2026-07-26",
+        "updated": "2026-07-26T16:34:22",
+        "clock": "16:34:22",
+    }
+
 
 
 def test_feature_can_be_skipped_by_lower_priority():

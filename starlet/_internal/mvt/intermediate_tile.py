@@ -24,6 +24,7 @@ import json
 import random
 import struct
 import zlib
+from datetime import date, datetime, time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -230,7 +231,7 @@ class IntermediateVectorTile:
                 ),
                 "properties": pa.array(
                     [
-                        json.dumps(entry[2].properties, separators=(",", ":"))
+                        json.dumps(entry[2].properties, separators=(",", ":"), default=_json_safe_value)
                         for entry in entries
                     ],
                     type=pa.string(),
@@ -295,6 +296,12 @@ class IntermediateVectorTile:
                     }
                 )
         return out
+
+
+def _json_safe_value(value: Any) -> Any:
+    if isinstance(value, datetime | date | time):
+        return value.isoformat()
+    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 def _mvt_properties(properties: dict[str, Any]) -> dict[str, Any]:

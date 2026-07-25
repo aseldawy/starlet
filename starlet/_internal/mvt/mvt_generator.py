@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import shapely
 from shapely import from_wkb
 
+from starlet._internal.histogram.io import resolve_histogram_path
 from starlet._internal.histogram.loader import HistogramLoader
 from starlet._internal.config import config_value, resolve_temp_dir
 from starlet._internal.mvt.helpers import (
@@ -60,13 +61,21 @@ class DatasetMVTGenerationResult:
 @dataclass(frozen=True)
 class _MapStageResult:
     intermediate_dir: str
-    tile_ids: list[int]
+    tile_part_counts: tuple[tuple[int, int], ...]
+
+    @property
+    def tile_ids(self) -> list[int]:
+        return [tile_id for tile_id, _ in self.tile_part_counts]
+
+    @property
+    def total_parts(self) -> int:
+        return sum(part_count for _, part_count in self.tile_part_counts)
 
 
 @dataclass(frozen=True)
 class _ReduceTileInput:
     tile_id: int
-    intermediate_dirs: tuple[str, ...]
+    mapper_parts: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,89 @@ class _TableBatch:
 
 
 _MapInput = GeoParquetSplit | _TableBatch
+DEFAULT_MAPPER_FEATURE_BUDGET = 10_000_000
+
+
+def _resolve_mapper_feature_budget(
+    *,
+    feature_capacity: int,
+    mapper_feature_budget: Any,
+) -> int:
+    feature_capacity = max(1, int(feature_capacity))
+    if mapper_feature_budget is None:
+        return max(feature_capacity, DEFAULT_MAPPER_FEATURE_BUDGET)
+    budget = int(mapper_feature_budget)
+    if budget <= 0:
+        return max(feature_capacity, DEFAULT_MAPPER_FEATURE_BUDGET)
+    return max(feature_capacity, budget)
+
+
+class _MapperTileCache:
+    def __init__(
+        self,
+        *,
+        mapper_index: int,
+        intermediate_dir: Path,
+        feature_capacity: int,
+        mapper_feature_budget: int,
+        extent: int,
+        buffer: int,
+    ) -> None:
+        self.mapper_index = int(mapper_index)
+        self.intermediate_dir = intermediate_dir
+        self.intermediate_dir.mkdir(parents=True, exist_ok=True)
+        self.feature_capacity = int(feature_capacity)
+        self.mapper_feature_budget = max(self.feature_capacity, int(mapper_feature_budget))
+        self.extent = int(extent)
+        self.buffer = int(buffer)
+        self.tiles: OrderedDict[int, IntermediateVectorTile] = OrderedDict()
+        self.feature_counts: dict[int, int] = {}
+        self.live_features = 0
+        self.tile_part_counts: dict[int, int] = {}
+
+    def get(self, tile_id: int) -> IntermediateVectorTile | None:
+        tile = self.tiles.get(tile_id)
+        if tile is not None:
+            self.tiles.move_to_end(tile_id)
+        return tile
+
+    def put(self, tile_id: int, tile: IntermediateVectorTile) -> None:
+        self.tiles[tile_id] = tile
+        self.tiles.move_to_end(tile_id)
+        self.feature_counts[tile_id] = tile.feature_count
+
+    def account_feature_change(self, tile_id: int) -> None:
+        tile = self.tiles[tile_id]
+        old_count = self.feature_counts.get(tile_id, 0)
+        new_count = tile.feature_count
+        self.live_features += new_count - old_count
+        self.feature_counts[tile_id] = new_count
+        self._evict_until_within_budget()
+
+    def flush_remaining(self) -> tuple[tuple[int, int], ...]:
+        while self.tiles:
+            self._write_lru_tile()
+        return tuple(sorted(self.tile_part_counts.items()))
+
+    def _evict_until_within_budget(self) -> None:
+        while self.live_features > self.mapper_feature_budget and self.tiles:
+            self._write_lru_tile()
+
+    def _write_lru_tile(self) -> None:
+        tile_id, tile = self.tiles.popitem(last=False)
+        self.live_features -= self.feature_counts.pop(tile_id, 0)
+        if tile.feature_count == 0:
+            return
+        z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
+        part_index = self.tile_part_counts.get(tile_id, 0)
+        path = self.intermediate_dir / _intermediate_tile_part_filename(
+            z,
+            x,
+            y,
+            part_index,
+        )
+        tile.write_features(path)
+        self.tile_part_counts[tile_id] = part_index + 1
 
 
 class DatasetMVTGenerator:
@@ -96,6 +188,7 @@ class DatasetMVTGenerator:
         pmtiles_compression: str = "gzip",
         workers: int | None = None,
         feature_capacity: int | None = None,
+        mapper_feature_budget: int | None = None,
         extent: int | None = None,
         buffer: int | None = None,
         geom_col: str = "geometry",
@@ -104,7 +197,7 @@ class DatasetMVTGenerator:
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.parquet_dir = self.dataset_dir / "parquet_tiles"
-        self.hist_path = self.dataset_dir / "histograms" / "global_prefix.npy"
+        self.hist_path = self.dataset_dir / "histograms" / "global"
         self.num_zoom_levels = int(num_zoom_levels)
         self.threshold = float(threshold)
         self.output_format = output_format.strip().lower()
@@ -115,6 +208,15 @@ class DatasetMVTGenerator:
         self.workers = max(1, int(workers or cpu_default))
         self.feature_capacity = int(
             feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
+        )
+        configured_mapper_feature_budget = config_value("mvt", "mapper_feature_budget")
+        self.mapper_feature_budget = _resolve_mapper_feature_budget(
+            feature_capacity=self.feature_capacity,
+            mapper_feature_budget=(
+                mapper_feature_budget
+                if mapper_feature_budget is not None
+                else configured_mapper_feature_budget
+            ),
         )
         self.extent = int(extent if extent is not None else config_value("mvt", "extent"))
         self.buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
@@ -135,8 +237,12 @@ class DatasetMVTGenerator:
     def run(self) -> DatasetMVTGenerationResult:
         if not self.parquet_dir.is_dir():
             raise FileNotFoundError(f"GeoParquet tile directory not found: {self.parquet_dir}")
-        if not self.hist_path.exists():
-            raise FileNotFoundError(f"Prefix histogram not found: {self.hist_path}")
+        try:
+            self.hist_path = resolve_histogram_path(self.hist_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Histogram not found under {self.dataset_dir / 'histograms'}"
+            ) from exc
 
         source = GeoParquetSource(str(self.parquet_dir), geom_col=self.geom_col)
         map_groups = _create_map_groups(source, self.workers)
@@ -185,9 +291,10 @@ class DatasetMVTGenerator:
         temp_root: Path,
     ) -> list[_MapStageResult]:
         logger.info(
-            "DatasetMVTGenerator map stage: groups=%d workers=%d",
+            "DatasetMVTGenerator map stage: groups=%d workers=%d mapper_feature_budget=%d",
             len(map_groups),
             self.workers,
+            self.mapper_feature_budget,
         )
         with ProcessPoolExecutor(max_workers=self.workers) as executor:
             futures = [
@@ -200,6 +307,7 @@ class DatasetMVTGenerator:
                     self.threshold,
                     self.partition_buffer,
                     self.feature_capacity,
+                    self.mapper_feature_budget,
                     self.extent,
                     self.buffer,
                     self.seed + index,
@@ -216,14 +324,14 @@ class DatasetMVTGenerator:
             return
 
         self.outdir.mkdir(parents=True, exist_ok=True)
-        tile_locations: dict[int, list[str]] = defaultdict(list)
+        tile_locations: dict[int, list[tuple[str, int]]] = defaultdict(list)
         for result in map_results:
-            for tile_id in result.tile_ids:
-                tile_locations[tile_id].append(result.intermediate_dir)
+            for tile_id, part_count in result.tile_part_counts:
+                tile_locations[tile_id].append((result.intermediate_dir, part_count))
 
         reduce_inputs = [
-            _ReduceTileInput(tile_id, tuple(intermediate_dirs))
-            for tile_id, intermediate_dirs in sorted(tile_locations.items())
+            _ReduceTileInput(tile_id, tuple(mapper_parts))
+            for tile_id, mapper_parts in sorted(tile_locations.items())
         ]
         reduce_groups = _chunk_reduce_inputs(reduce_inputs)
         logger.info(
@@ -257,6 +365,7 @@ def _map_split_group(
     threshold: float,
     partition_buffer: float,
     feature_capacity: int,
+    mapper_feature_budget: int,
     extent: int,
     buffer: int,
     seed: int,
@@ -271,7 +380,16 @@ def _map_split_group(
         size_threshold=threshold,
         buffer=partition_buffer,
     )
-    tiles: dict[int, IntermediateVectorTile] = {}
+    intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    tiles = _MapperTileCache(
+        mapper_index=mapper_index,
+        intermediate_dir=intermediate_dir,
+        feature_capacity=feature_capacity,
+        mapper_feature_budget=mapper_feature_budget,
+        extent=extent,
+        buffer=buffer,
+    )
 
     for table in _iter_map_input_tables(source, inputs):
         for geom, attrs, priority in _iter_web_mercator_features(table, source.geom_col):
@@ -291,22 +409,21 @@ def _map_split_group(
                         extent=extent,
                         buffer=buffer,
                     )
-                    tiles[tile_id] = tile
+                    tiles.put(tile_id, tile)
                 tile.add_feature(
                     geom,
                     attrs,
                     priority=priority,
                 )
-    intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
-    intermediate_dir.mkdir(parents=True, exist_ok=True)
-    tile_ids = []
-    for tile_id, tile in tiles.items():
-        if tile.feature_count == 0:
-            continue
-        z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
-        tile.write_features(intermediate_dir / _intermediate_tile_filename(z, x, y))
-        tile_ids.append(tile_id)
-    return _MapStageResult(str(intermediate_dir), tile_ids)
+                tiles.account_feature_change(tile_id)
+    tile_part_counts = tiles.flush_remaining()
+    total_parts = sum(part_count for _, part_count in tile_part_counts)
+    logger.info(
+        "DatasetMVTGenerator mapper %d wrote %d intermediate tile parts",
+        mapper_index,
+        total_parts,
+    )
+    return _MapStageResult(str(intermediate_dir), tile_part_counts)
 
 
 def _iter_map_input_tables(
@@ -331,7 +448,6 @@ def _reduce_tile_group(
     for reduce_input in reduce_inputs:
         tile_id = reduce_input.tile_id
         z, x, y = PyramidPartitioner.decode_tile_id(tile_id)
-        filename = _intermediate_tile_filename(z, x, y)
         merged = IntermediateVectorTile(
             z,
             x,
@@ -342,24 +458,30 @@ def _reduce_tile_group(
             rng=random.Random(tile_id),
         )
         first_tile = True
-        for intermediate_dir in reduce_input.intermediate_dirs:
-            path = Path(intermediate_dir) / filename
-            if not path.exists():
-                continue
-            if first_tile:
-                merged.load_features(path)
-                first_tile = False
-            else:
-                partial = IntermediateVectorTile(
+        for intermediate_dir, part_count in reduce_input.mapper_parts:
+            for part_index in range(part_count):
+                path = Path(intermediate_dir) / _intermediate_tile_part_filename(
                     z,
                     x,
                     y,
-                    feature_capacity=feature_capacity,
-                    extent=extent,
-                    buffer=buffer,
+                    part_index,
                 )
-                partial.load_features(path)
-                merged.merge(partial)
+                if not path.exists():
+                    continue
+                if first_tile:
+                    merged.load_features(path)
+                    first_tile = False
+                else:
+                    partial = IntermediateVectorTile(
+                        z,
+                        x,
+                        y,
+                        feature_capacity=feature_capacity,
+                        extent=extent,
+                        buffer=buffer,
+                    )
+                    partial.load_features(path)
+                    merged.merge(partial)
 
         if merged.feature_count == 0:
             continue
@@ -369,8 +491,8 @@ def _reduce_tile_group(
             output.write(merged.encode())
 
 
-def _intermediate_tile_filename(z: int, x: int, y: int) -> str:
-    return f"{z}-{x}-{y}.pyarrow"
+def _intermediate_tile_part_filename(z: int, x: int, y: int, part_index: int) -> str:
+    return f"{z}-{x}-{y}-part-{int(part_index):06d}.pyarrow"
 
 
 def generate_single_mvt_tile(

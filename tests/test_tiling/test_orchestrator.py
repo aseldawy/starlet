@@ -26,9 +26,9 @@ class TestTwoStageOrchestrator:
             np.array([0.0, 0.0], dtype=np.float64),
             np.array([10.0, 10.0], dtype=np.float64),
         )
-        assigner = RSGroveAssigner.from_sample_and_mbr(
+        assigner = RSGroveAssigner.from_sample_and_bounds(
             sample_points=np.array([[1.0, 5.0], [1.0, 5.0]], dtype=np.float64),
-            mbr=mbr,
+            bounds=mbr,
             num_partitions=2,
         )
         table = pa.table(
@@ -161,9 +161,9 @@ class TestTwoStageOrchestrator:
             np.array([bounds[:, 0].min(), bounds[:, 1].min()], dtype=np.float64),
             np.array([bounds[:, 2].max(), bounds[:, 3].max()], dtype=np.float64),
         )
-        assigner = RSGroveAssigner.from_sample_and_mbr(
+        assigner = RSGroveAssigner.from_sample_and_bounds(
             sample_points=centers,
-            mbr=mbr,
+            bounds=mbr,
             num_partitions=2,
         )
         outdir = temp_dir / "two_stage_tiles"
@@ -199,9 +199,9 @@ class TestTwoStageOrchestrator:
             np.array([bounds[:, 0].min(), bounds[:, 1].min()], dtype=np.float64),
             np.array([bounds[:, 2].max(), bounds[:, 3].max()], dtype=np.float64),
         )
-        assigner = RSGroveAssigner.from_sample_and_mbr(
+        assigner = RSGroveAssigner.from_sample_and_bounds(
             sample_points=centers,
-            mbr=mbr,
+            bounds=mbr,
             num_partitions=2,
         )
         temp_parent = temp_dir / "large_tmp"
@@ -241,9 +241,9 @@ class TestTwoStageOrchestrator:
             np.array([bounds[:, 0].min(), bounds[:, 1].min()], dtype=np.float64),
             np.array([bounds[:, 2].max(), bounds[:, 3].max()], dtype=np.float64),
         )
-        assigner = RSGroveAssigner.from_sample_and_mbr(
+        assigner = RSGroveAssigner.from_sample_and_bounds(
             sample_points=centers,
-            mbr=mbr,
+            bounds=mbr,
             num_partitions=2,
         )
 

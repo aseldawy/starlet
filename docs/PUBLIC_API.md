@@ -562,6 +562,18 @@ result = starlet.tile(
 )
 ```
 
+UCR Star also supports CSV line segments through its CLI by converting four endpoint columns into temporary WKT `LINESTRING` values before calling Starlet. For a headered CSV:
+
+```bash
+ucrstar add-dataset data/roads.csv --name roads --csv-segment-cols x1,y1,x2,y2
+```
+
+For a headerless CSV:
+
+```bash
+ucrstar add-dataset data/roads-no-header.csv --name roads --csv-segment-indexes 0,1,2,3
+```
+
 Useful CSV options:
 
 ```python

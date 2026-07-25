@@ -65,7 +65,6 @@ def main(ctx: click.Context, config_path: str | None):
 @click.option("--sort", default=None, help="Row sort order within each tile.")
 @click.option("--compression", default=None, help="Parquet compression codec.")
 @click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
-@click.option("--sample-ratio", type=float, default=None, help="Bernoulli sampling ratio for centroids.")
 @click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
 @click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
 @click.option("--dtype", "histogram_dtype", default=None, help="Histogram data type.")
@@ -92,7 +91,6 @@ def tile(
     sort,
     compression,
     sample_cap,
-    sample_ratio,
     csv_split_size,
     grid_size,
     histogram_dtype,
@@ -121,7 +119,6 @@ def tile(
         sort=str(resolve_command_value("tile", "sort", sort)),
         compression=str(resolve_command_value("tile", "compression", compression)),
         sample_cap=resolve_command_value("tile", "sample_cap", sample_cap),
-        sample_ratio=float(resolve_command_value("tile", "sample_ratio", sample_ratio)),
         seed=seed,
         geom_col=geom_col,
         csv_x_col=csv_x_col,
@@ -151,12 +148,13 @@ def tile(
 @click.option("--parallelism", type=int, default=None, help="Shared worker count used for MVT generation.")
 @click.option("--temp-dir", default=None, help="Parent directory for temporary MVT files.")
 @click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
+@click.option("--mapper-feature-budget", type=int, default=None, help="Maximum retained features per MVT mapper before spilling.")
 @click.option("--extent", type=int, default=None, help="Vector tile extent.")
 @click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
 @click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
 @click.option("--pmtiles/--no-pmtiles", default=None, help="Export generated tiles to a PMTiles archive.")
 @click.option("--log-level", default=None, help="Logging level.")
-def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capacity, extent, buffer, pmtiles_compression, pmtiles, log_level):
+def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capacity, mapper_feature_budget, extent, buffer, pmtiles_compression, pmtiles, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
     _setup_logging(_resolved_log_level("mvt", log_level))
     import starlet
@@ -171,6 +169,7 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
         temp_dir=resolve_command_value("mvt", "temp_dir", temp_dir),
         parallelism=command_parallelism("mvt", explicit=parallelism),
         feature_capacity=int(resolve_command_value("mvt", "feature_capacity", feature_capacity)),
+        mapper_feature_budget=resolve_command_value("mvt", "mapper_feature_budget", mapper_feature_budget),
         extent=int(resolve_command_value("mvt", "extent", extent)),
         buffer=int(resolve_command_value("mvt", "buffer", buffer)),
     )
@@ -192,13 +191,13 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
 @click.option("--sort", default=None, help="Row sort order within each tile.")
 @click.option("--compression", default=None, help="Parquet compression codec.")
 @click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
-@click.option("--sample-ratio", type=float, default=None, help="Bernoulli sampling ratio for centroids.")
 @click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
 @click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
 @click.option("--dtype", "histogram_dtype", default=None, help="Histogram data type.")
 @click.option("--sfc-bits", type=int, default=None, help="Bits per axis for Z-order / Hilbert key.")
 @click.option("--threshold", type=float, default=None, help="Minimum feature threshold.")
 @click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
+@click.option("--mapper-feature-budget", type=int, default=None, help="Maximum retained features per MVT mapper before spilling.")
 @click.option("--extent", type=int, default=None, help="Vector tile extent.")
 @click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
 @click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
@@ -224,13 +223,13 @@ def build(
     sort,
     compression,
     sample_cap,
-    sample_ratio,
     csv_split_size,
     grid_size,
     histogram_dtype,
     sfc_bits,
     threshold,
     feature_capacity,
+    mapper_feature_budget,
     extent,
     buffer,
     pmtiles_compression,
@@ -261,12 +260,12 @@ def build(
         temp_dir=resolve_command_value("build", "temp_dir", temp_dir),
         parallelism=parallelism,
         feature_capacity=int(resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))),
+        mapper_feature_budget=resolve_command_value("build", "mapper_feature_budget", mapper_feature_budget, fallback_sections=("mvt",)),
         extent=int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",))),
         buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",))),
         sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",))),
         compression=str(resolve_command_value("build", "compression", compression, fallback_sections=("tile",))),
         sample_cap=resolve_command_value("build", "sample_cap", sample_cap, fallback_sections=("tile",)),
-        sample_ratio=float(resolve_command_value("build", "sample_ratio", sample_ratio, fallback_sections=("tile",))),
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,
         csv_wkt_col=csv_wkt_col,

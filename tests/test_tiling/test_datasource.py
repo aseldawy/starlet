@@ -31,13 +31,21 @@ from starlet._internal.tiling.datasource import (
     GeoParquetSource,
     GeoParquetSplit,
     CSVSource,
+    BZ2DecompressedBlock,
     GDBSource,
     ShapefileSource,
+    _read_bz2_split_payload,
     _properties_dataframe_to_arrow_table,
     read_spatial_sample,
     source_for_path,
 )
-from starlet._internal.tiling.geojson_source import iter_geojson_xy
+from starlet._internal.tiling.geojson_source import (
+    _iter_bz2_geojson_batches,
+    _iter_feature_collection_batches_from_bytes,
+    _read_geojson_partition_spatial_sample,
+    iter_geojson_xy,
+)
+from starlet._internal.tiling.csv_source import CSVSplit, _iter_bz2_csv_split_byte_batches
 from starlet._internal.tiling.geoparquet_source import _read_geoparquet_split_spatial_sample
 from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
 from starlet._internal.tiling.vector_source import _zip_gdb_member_dirs
@@ -162,14 +170,12 @@ class TestGeoParquetSource:
             str(parquet_path),
             source.create_splits()[0],
             source.geom_col,
-            sample_ratio=1.0,
             sample_cap=None,
             seed=42,
         )
 
         assert sample.total_seen == 1
-        assert sample.mbr.getMinCoord(0) == pytest.approx(1)
-        assert sample.mbr.getMinCoord(1) == pytest.approx(2)
+        assert sample.sample_points.tolist() == [[1.0], [2.0]]
 
     def test_geoparquet_source_preserves_native_crs(self, temp_dir):
         lon, lat = -118.25, 34.05
@@ -262,6 +268,183 @@ class TestGeoParquetSource:
             for table in source.iter_tables(split)
         ) == 2
 
+
+class TestGeoJSONSpatialSampleErrors:
+    def test_bz2_split_payload_does_not_read_entire_file(self, temp_dir, monkeypatch):
+        path = temp_dir / "guarded.geojson.bz2"
+        payload = json.dumps({
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"id": i, "blob": os.urandom(64).hex()},
+                    "geometry": {"type": "Point", "coordinates": [float(i), float(i)]},
+                }
+                for i in range(4_000)
+            ],
+        }).encode("utf-8")
+        _write_bz2(path, payload, compresslevel=1)
+        original_open = open
+
+        class NoReadAll:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                self._wrapped.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._wrapped.__exit__(*args)
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    raise AssertionError("bz2 split reader should not read the whole file")
+                return self._wrapped.read(size)
+
+            def seek(self, *args):
+                return self._wrapped.seek(*args)
+
+            def tell(self):
+                return self._wrapped.tell()
+
+        def guarded_open(file, mode="r", *args, **kwargs):
+            handle = original_open(file, mode, *args, **kwargs)
+            if Path(file) == path and "b" in mode:
+                return NoReadAll(handle)
+            return handle
+
+        monkeypatch.setattr("builtins.open", guarded_open)
+
+        decoded = _read_bz2_split_payload(
+            str(path),
+            offset=0,
+            length=max(1, path.stat().st_size // 2),
+        )
+
+        assert decoded is not None
+        assert decoded.payload
+
+    def test_bz2_csv_batches_yield_before_reading_next_block(self, monkeypatch):
+        consumed: list[int] = []
+
+        def fake_blocks(*args, **kwargs):
+            consumed.append(1)
+            yield BZ2DecompressedBlock(b"1,0,0\n", 4, True, True, 100)
+            consumed.append(2)
+            yield BZ2DecompressedBlock(b"2,0,0\n", 10, True, False, 100)
+
+        monkeypatch.setattr(
+            "starlet._internal.tiling.csv_source._iter_bz2_decompressed_blocks",
+            fake_blocks,
+        )
+
+        batches = _iter_bz2_csv_split_byte_batches(
+            CSVSplit("points.csv.bz2", 0, 100),
+            has_header=False,
+        )
+
+        assert next(batches) == b"1,0,0\n"
+        assert consumed == [1]
+
+    def test_bz2_geojson_batches_yield_before_reading_next_block(self, monkeypatch):
+        consumed: list[int] = []
+
+        def fake_blocks(*args, **kwargs):
+            consumed.append(1)
+            yield BZ2DecompressedBlock(
+                b'{"type":"Feature","properties":{"id":1},"geometry":null}\n',
+                4,
+                True,
+                True,
+                100,
+            )
+            consumed.append(2)
+            yield BZ2DecompressedBlock(
+                b'{"type":"Feature","properties":{"id":2},"geometry":null}\n',
+                10,
+                True,
+                False,
+                100,
+            )
+
+        monkeypatch.setattr(
+            "starlet._internal.tiling.geojson_source._iter_bz2_decompressed_blocks",
+            fake_blocks,
+        )
+
+        batches = _iter_bz2_geojson_batches(
+            "features.geojsonl.bz2",
+            0,
+            100,
+            batch_size=1,
+        )
+
+        assert next(batches) == ['{"type":"Feature","properties":{"id":1},"geometry":null}']
+        assert consumed == [1]
+
+    def test_bz2_feature_collection_batches_skip_partial_leading_feature(self):
+        payload = (
+            b'\t\t"type": "Feature",\n'
+            b'  "geometry": {"type": "Point", "coordinates": [0, 0]}\n'
+            b'},\n'
+            b'{"type": "Feature", "properties": {"id": 1}, '
+            b'"geometry": {"type": "Point", "coordinates": [1, 2]}},\n'
+            b'{"type": "Feature", "properties": {"id": 2}, '
+            b'"geometry": {"type": "Point", "coordinates": [3, 4]}}'
+        )
+
+        batches = list(
+            _iter_feature_collection_batches_from_bytes(
+                payload,
+                batch_size=10,
+                owned_output_len=len(payload),
+            )
+        )
+
+        assert [json.loads(feature)["properties"]["id"] for feature in batches[0]] == [1, 2]
+
+    def test_bz2_feature_collection_batches_read_concatenated_streams(self, temp_dir):
+        path = temp_dir / "concat.geojson.bz2"
+        first_member = (
+            b'{"type": "FeatureCollection", "features": ['
+            b'{"type": "Feature", "properties": {"id": 1}, '
+            b'"geometry": {"type": "Point", "coordinates": [1, 2]}},'
+        )
+        second_member = (
+            b'{"type": "Feature", "properties": {"id": 2}, '
+            b'"geometry": {"type": "Point", "coordinates": [3, 4]}}'
+            b']}'
+        )
+        path.write_bytes(bz2.compress(first_member) + bz2.compress(second_member))
+
+        batches = list(
+            GeoJSONSource(str(path), batch_rows=10)._iter_feature_batches_for_split(
+                GeoJSONSplit(str(path), 0, path.stat().st_size)
+            )
+        )
+
+        assert [[feature["properties"]["id"] for feature in batch] for batch in batches] == [[1, 2]]
+
+    def test_partition_error_includes_split_context(self, monkeypatch):
+        def fail_iter(*args, **kwargs):
+            raise ValueError('Could not find the object containing a "type": "Feature" member')
+
+        monkeypatch.setattr(
+            "starlet._internal.tiling.geojson_source._iter_feature_json_batches",
+            fail_iter,
+        )
+
+        with pytest.raises(ValueError, match=r"split_index=7 .*broken\.geojson\.bz2.*offset=1024.*length=2048"):
+            _read_geojson_partition_spatial_sample(
+                7,
+                "/tmp/broken.geojson.bz2",
+                1024,
+                2048,
+                100,
+                42,
+            )
+
     def test_schema_validation(self, sample_parquet_file):
         """Test that schema is accessible and valid."""
         source = GeoParquetSource(str(sample_parquet_file))
@@ -310,7 +493,8 @@ class TestGeoJSONSource:
             json.dump(geojson, f)
 
         source = GeoJSONSource(str(json_path))
-        tables = list(source.iter_tables())
+        source.set_schema(source.infer_schema())
+        tables = list(source.iter_tables(*source.create_splits()))
         ids = sorted(
             row_id
             for table in tables
@@ -333,7 +517,8 @@ class TestGeoJSONSource:
             json.dump(geojson, f)
 
         source = GeoJSONSource(str(json_path))
-        assert list(source.iter_tables()) == []
+        source.set_schema(source.infer_schema())
+        assert list(source.iter_tables(*source.create_splits())) == []
         assert "geometry" in source.schema().names
 
     def test_partition_reader_returns_each_feature_once(self, temp_dir):
@@ -355,18 +540,20 @@ class TestGeoJSONSource:
             json.dump(geojson, f, indent=2)
 
         file_size = json_path.stat().st_size
+        payload = json_path.read_bytes()
         partition_size = max(1, file_size // 4)
         decoded = []
 
         for offset in range(0, file_size, partition_size):
+            split_end = min(offset + partition_size, file_size)
             reader = GeoJSONPartitionReader(
-                json_path,
-                offset,
-                min(partition_size, file_size - offset),
-                batch_size=2,
+                [
+                    payload[offset:split_end],
+                    b"\0",
+                    payload[split_end:],
+                ]
             )
-            for batch in reader:
-                decoded.extend(json.loads(feature) for feature in batch)
+            decoded.extend(json.loads(feature) for feature in reader)
 
         ids = sorted(feature["properties"]["id"] for feature in decoded)
         assert ids == list(range(12))
@@ -390,7 +577,8 @@ class TestGeoJSONSource:
             json.dump(geojson, f, indent=2)
 
         source = GeoJSONSource(str(json_path), batch_rows=3)
-        tables = list(source.iter_tables())
+        source.set_schema(source.infer_schema())
+        tables = list(source.iter_tables(*source.create_splits()))
         ids = sorted(
             row_id
             for table in tables
@@ -399,6 +587,31 @@ class TestGeoJSONSource:
 
         assert ids == list(range(20))
         assert sum(table.num_rows for table in tables) == 20
+
+    def test_geojson_source_extracts_crs_hint_from_file_header(self, temp_dir):
+        geojson = {
+            "type": "FeatureCollection",
+            "crs": {
+                "type": "name",
+                "properties": {"name": "EPSG:3857"},
+            },
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"id": 1},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+                }
+            ],
+        }
+
+        json_path = temp_dir / "crs_hint.geojson"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(geojson, f, indent=2)
+
+        source = GeoJSONSource(str(json_path))
+
+        assert source._crs_hint == "EPSG:3857"
+        assert source.infer_schema().metadata[b"geo"].decode("utf-8")
 
     def test_geojson_nested_properties_have_stable_schema_across_batches(self, temp_dir):
         """Test dynamic JSON object properties do not infer different struct schemas."""
@@ -423,8 +636,8 @@ class TestGeoJSONSource:
             json.dump(geojson, f, indent=2)
 
         source = GeoJSONSource(str(json_path), batch_rows=1)
-        source.schema()
-        tables = list(source.iter_tables())
+        source.set_schema(source.infer_schema())
+        tables = list(source.iter_tables(*source.create_splits()))
 
         _tags_types = {table.schema.field("tagsMap").type for table in tables}
         assert _tags_types == {pa.map_(pa.string(), pa.string())}
@@ -455,8 +668,8 @@ class TestGeoJSONSource:
             json.dump(geojson, f)
 
         source = GeoJSONSource(str(json_path), batch_rows=1)
-        source.schema()
-        tables = list(source.iter_tables())
+        source.set_schema(source.infer_schema())
+        tables = list(source.iter_tables(*source.create_splits()))
 
         promoted_type = tables[-1].schema.field("OLD_BLD_ID").type
         assert pa.types.is_large_string(promoted_type) or pa.types.is_string(promoted_type)
@@ -484,8 +697,9 @@ class TestGeoJSONSource:
             json.dump(geojson, f)
 
         source = GeoJSONSource(str(json_path), batch_rows=1)
-        schema = source.schema()
-        tables = list(source.iter_tables())
+        schema = source.infer_schema()
+        source.set_schema(schema)
+        tables = list(source.iter_tables(*source.create_splits()))
 
         assert pa.types.is_large_string(schema.field("parcel_id").type)
         assert {table.schema.field("parcel_id").type for table in tables} == {
@@ -518,8 +732,9 @@ class TestGeoJSONSource:
             json.dump(geojson, f)
 
         source = GeoJSONSource(str(json_path), batch_rows=1)
-        schema = source.schema()
-        tables = list(source.iter_tables())
+        schema = source.infer_schema()
+        source.set_schema(schema)
+        tables = list(source.iter_tables(*source.create_splits()))
 
         assert schema.field("TOTAL_UNITS").type == pa.float64()
         assert schema.field("STATUS").type == pa.string()
@@ -560,6 +775,7 @@ class TestGeoJSONSource:
             json.dump(geojson, f, indent=2)
 
         source = GeoJSONSource(str(json_path), batch_rows=4)
+        source.set_schema(source.infer_schema())
         file_size = json_path.stat().st_size
         split_size = max(1, (file_size + 3) // 4)
         splits = [
@@ -604,6 +820,7 @@ class TestGeoJSONSource:
             }))
 
         source = GeoJSONSource(str(data_dir))
+        source.set_schema(source.infer_schema())
         splits = source.create_splits()
         ids = sorted(
             row_id
@@ -632,6 +849,7 @@ class TestGeoJSONSource:
         _write_bz2(json_path, payload, compresslevel=1)
 
         source = GeoJSONSource(str(json_path), batch_rows=256)
+        source.set_schema(source.infer_schema())
         splits = source.create_splits(num_splits=4)
         ids = [
             row_id
@@ -643,8 +861,8 @@ class TestGeoJSONSource:
         assert len(splits) == 4
         assert ids == list(range(8_000))
 
-    def test_read_spatial_sample_returns_mbr_and_sample(self, temp_dir):
-        """Test standalone sampling reads centroids and global MBR from a file."""
+    def test_read_spatial_sample_returns_sample_and_schema(self, temp_dir):
+        """Test standalone sampling reads centroids and schema from a file."""
         geojson = {
             "type": "FeatureCollection",
             "features": [
@@ -668,7 +886,6 @@ class TestGeoJSONSource:
         spatial_sample = read_spatial_sample(
             str(json_path),
             sample_cap=None,
-            sample_ratio=1.0,
             seed=42,
             geojson_workers=1,
         )
@@ -679,8 +896,6 @@ class TestGeoJSONSource:
         assert spatial_sample.schema is not None
         assert spatial_sample.schema.field("id").type == pa.int64()
         assert spatial_sample.schema.field("geometry").type == pa.binary()
-        assert spatial_sample.mbr.mins.tolist() == [0.0, 2.0]
-        assert spatial_sample.mbr.maxs.tolist() == [10.0, 12.0]
 
     def test_geojson_sampling_schema_can_be_reused_for_tiling(self, temp_dir, monkeypatch):
         data_dir = temp_dir / "sample_schema"
@@ -700,7 +915,6 @@ class TestGeoJSONSource:
 
         spatial_sample = read_spatial_sample(
             str(data_dir),
-            sample_ratio=1.0,
             sample_cap=None,
             seed=42,
             geojson_workers=1,
@@ -736,15 +950,12 @@ class TestGeoJSONSource:
         spatial_sample = read_spatial_sample(
             str(json_path),
             sample_cap=4,
-            sample_ratio=1.0,
             seed=42,
             geojson_workers=4,
         )
 
         assert spatial_sample.total_seen == 24
         assert spatial_sample.total_sampled <= 4
-        assert spatial_sample.mbr.mins.tolist() == [0.0, 0.0]
-        assert spatial_sample.mbr.maxs.tolist() == [23.0, 46.0]
 
     def test_read_spatial_sample_geoparquet_uses_parallel_splits(self, temp_dir):
         """Test GeoParquet sampling merges row-group splits under one cap."""
@@ -759,7 +970,6 @@ class TestGeoJSONSource:
         spatial_sample = read_spatial_sample(
             str(parquet_path),
             sample_cap=3,
-            sample_ratio=1.0,
             seed=42,
             geoparquet_workers=2,
         )
@@ -768,8 +978,6 @@ class TestGeoJSONSource:
         assert spatial_sample.total_sampled == 3
         assert spatial_sample.batches_read == 5
         assert spatial_sample.sample_points.shape == (2, 3)
-        assert spatial_sample.mbr.mins.tolist() == [0.0, 1.0]
-        assert spatial_sample.mbr.maxs.tolist() == [9.0, 10.0]
 
     def test_iter_geojson_xy_walks_geometry_collections(self):
         """Test stack traversal over geometry objects and nested coordinates."""
@@ -1018,7 +1226,6 @@ class TestCSVSource:
             csv_x_col="x",
             csv_y_col="y",
             csv_split_size=30,
-            sample_ratio=1.0,
             source_workers=1,
         )
 
@@ -1195,6 +1402,77 @@ class TestShapefileSource:
         assert ids == [1, 2, 10, 11, 12]
         assert datasets == ["a", "a", "b", "b", "b"]
         assert source.input_size_bytes() == zip_path.stat().st_size
+
+    def test_directory_shapefile_schema_promotes_mismatched_integer_fields(
+        self,
+        temp_dir,
+        monkeypatch,
+    ):
+        import pyogrio
+        from starlet._internal import tiling as tiling_pkg
+
+        shapes_dir = temp_dir / "shapes"
+        shapes_dir.mkdir()
+        alpha = shapes_dir / "alpha.shp"
+        beta = shapes_dir / "beta.shp"
+        alpha.touch()
+        beta.touch()
+
+        monkeypatch.setattr(pyogrio, "list_layers", lambda path: [["points", "Point"]])
+        monkeypatch.setattr(
+            pyogrio,
+            "read_info",
+            lambda path, layer=None, force_feature_count=False: {
+                "features": 2,
+                "geometry_type": "Point",
+            },
+        )
+
+        def read_arrow(path, **kwargs):
+            assert kwargs.get("max_features") != 1
+            value_type = pa.int32() if str(path).endswith("alpha.shp") else pa.int64()
+            max_features = kwargs.get("max_features")
+            row_count = 1 if max_features == 1 else 2
+            return (
+                {
+                    "geometry_name": "SHAPE",
+                    "fid_column": "OBJECTID",
+                    "crs": "EPSG:4326",
+                },
+                pa.table(
+                    {
+                        "OBJECTID": pa.array(range(row_count), type=pa.int64()),
+                        "Technology": pa.array([1] * row_count, type=value_type),
+                        "SHAPE": pa.array(
+                            [wkb.dumps(Point(float(i), float(i))) for i in range(row_count)],
+                            type=pa.binary(),
+                        ),
+                    }
+                ),
+            )
+
+        monkeypatch.setattr(pyogrio, "read_arrow", read_arrow)
+        monkeypatch.setattr(
+            tiling_pkg.datasource,
+            "create_process_executor",
+            lambda max_workers=None, logger=None, context="parallel work": ThreadPoolExecutor(
+                max_workers=max_workers
+            ),
+        )
+
+        sample = read_spatial_sample(
+            str(shapes_dir),
+            sample_cap=None,
+            source_workers=1,
+        )
+        source = ShapefileSource(str(shapes_dir))
+        source.set_schema(sample.schema)
+        tables = list(source.iter_tables())
+
+        assert sample.schema is not None
+        assert sample.schema.field("Technology").type == pa.int64()
+        assert {table.schema.field("Technology").type for table in tables} == {pa.int64()}
+        pa.concat_tables(tables, promote_options="default")
 
     def test_source_for_path_detects_zipped_shapefile(self, temp_dir):
         source_dir = temp_dir / "zip-shp"

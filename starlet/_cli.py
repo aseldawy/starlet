@@ -148,13 +148,13 @@ def tile(
 @click.option("--parallelism", type=int, default=None, help="Shared worker count used for MVT generation.")
 @click.option("--temp-dir", default=None, help="Parent directory for temporary MVT files.")
 @click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
-@click.option("--mapper-feature-budget", type=int, default=None, help="Maximum retained features per MVT mapper before spilling.")
+@click.option("--mvt-memory-budget", default=None, help="Total memory target for concurrent MVT mappers (e.g. auto, 24gb, none).")
 @click.option("--extent", type=int, default=None, help="Vector tile extent.")
 @click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
 @click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
 @click.option("--pmtiles/--no-pmtiles", default=None, help="Export generated tiles to a PMTiles archive.")
 @click.option("--log-level", default=None, help="Logging level.")
-def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capacity, mapper_feature_budget, extent, buffer, pmtiles_compression, pmtiles, log_level):
+def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capacity, mvt_memory_budget, extent, buffer, pmtiles_compression, pmtiles, log_level):
     """Generate Mapbox Vector Tiles from a tiled dataset."""
     _setup_logging(_resolved_log_level("mvt", log_level))
     import starlet
@@ -169,7 +169,7 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
         temp_dir=resolve_command_value("mvt", "temp_dir", temp_dir),
         parallelism=command_parallelism("mvt", explicit=parallelism),
         feature_capacity=int(resolve_command_value("mvt", "feature_capacity", feature_capacity)),
-        mapper_feature_budget=resolve_command_value("mvt", "mapper_feature_budget", mapper_feature_budget),
+        mvt_memory_budget=resolve_command_value("mvt", "mvt_memory_budget", mvt_memory_budget),
         extent=int(resolve_command_value("mvt", "extent", extent)),
         buffer=int(resolve_command_value("mvt", "buffer", buffer)),
     )
@@ -197,7 +197,7 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
 @click.option("--sfc-bits", type=int, default=None, help="Bits per axis for Z-order / Hilbert key.")
 @click.option("--threshold", type=float, default=None, help="Minimum feature threshold.")
 @click.option("--feature-capacity", type=int, default=None, help="Maximum retained features per intermediate tile.")
-@click.option("--mapper-feature-budget", type=int, default=None, help="Maximum retained features per MVT mapper before spilling.")
+@click.option("--mvt-memory-budget", default=None, help="Total memory target for concurrent MVT mappers (e.g. auto, 24gb, none).")
 @click.option("--extent", type=int, default=None, help="Vector tile extent.")
 @click.option("--buffer", type=int, default=None, help="Vector tile buffer in extent units.")
 @click.option("--pmtiles-compression", default=None, help="Compression for PMTiles export.")
@@ -229,7 +229,7 @@ def build(
     sfc_bits,
     threshold,
     feature_capacity,
-    mapper_feature_budget,
+    mvt_memory_budget,
     extent,
     buffer,
     pmtiles_compression,
@@ -260,7 +260,7 @@ def build(
         temp_dir=resolve_command_value("build", "temp_dir", temp_dir),
         parallelism=parallelism,
         feature_capacity=int(resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))),
-        mapper_feature_budget=resolve_command_value("build", "mapper_feature_budget", mapper_feature_budget, fallback_sections=("mvt",)),
+        mvt_memory_budget=resolve_command_value("build", "mvt_memory_budget", mvt_memory_budget, fallback_sections=("mvt",)),
         extent=int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",))),
         buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",))),
         sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",))),

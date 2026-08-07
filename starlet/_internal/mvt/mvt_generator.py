@@ -88,27 +88,84 @@ class _TableBatch:
 
 
 _MapInput = GeoParquetSplit | _TableBatch
-# This is a per-process limit, so the aggregate upper bound is this value
-# multiplied by the MVT worker count.  Tile features are Python objects and can
-# contain large attribute maps; ten million per mapper has been observed to use
-# several GiB in each worker.
-DEFAULT_MAPPER_FEATURE_BUDGET = 1_000_000
 _MAPPER_PROGRESS_ROWS = 1_000_000
+_MAPPER_MEMORY_CHECK_FEATURES = 10_000
 _MIB = 1024 * 1024
 
 
-def _resolve_mapper_feature_budget(
+@dataclass(frozen=True)
+class _MapperMemoryBudget:
+    high_watermark_bytes: int
+    low_watermark_bytes: int
+    total_budget_bytes: int
+
+    @property
+    def high_watermark_mib(self) -> float:
+        return self.high_watermark_bytes / _MIB
+
+    @property
+    def low_watermark_mib(self) -> float:
+        return self.low_watermark_bytes / _MIB
+
+
+def _resolve_total_mvt_memory_budget(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "off", "false", "0"}:
+            return None
+        if normalized == "auto":
+            available = _system_available_memory_bytes() or _system_total_memory_bytes()
+            if available is None:
+                return None
+            return int(available * 0.70)
+    else:
+        if int(value) <= 0:
+            return None
+
+    parsed = _parse_memory_size_bytes(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _mvt_memory_budget_for_stage(
     *,
-    feature_capacity: int,
-    mapper_feature_budget: Any,
-) -> int:
-    feature_capacity = max(1, int(feature_capacity))
-    if mapper_feature_budget is None:
-        return max(feature_capacity, DEFAULT_MAPPER_FEATURE_BUDGET)
-    budget = int(mapper_feature_budget)
-    if budget <= 0:
-        return max(feature_capacity, DEFAULT_MAPPER_FEATURE_BUDGET)
-    return max(feature_capacity, budget)
+    total_budget_bytes: int | None,
+    active_mappers: int,
+) -> _MapperMemoryBudget | None:
+    if total_budget_bytes is None:
+        return None
+    active_mappers = max(1, int(active_mappers))
+    high = max(_MIB, int(total_budget_bytes / active_mappers))
+    low = max(_MIB, int(high * 0.85))
+    return _MapperMemoryBudget(
+        high_watermark_bytes=high,
+        low_watermark_bytes=low,
+        total_budget_bytes=total_budget_bytes,
+    )
+
+
+def _parse_memory_size_bytes(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s.isdigit():
+            return int(s)
+        suffixes = {
+            "kb": 1024,
+            "mb": 1024 ** 2,
+            "gb": 1024 ** 3,
+            "tb": 1024 ** 4,
+        }
+        for suffix, mul in suffixes.items():
+            if s.endswith(suffix):
+                return int(float(s[: -len(suffix)].strip()) * mul)
+    raise ValueError(f"Invalid MVT memory budget: {value!r}")
 
 
 class _MapperTileCache:
@@ -118,7 +175,7 @@ class _MapperTileCache:
         mapper_index: int,
         intermediate_dir: Path,
         feature_capacity: int,
-        mapper_feature_budget: int,
+        memory_budget: _MapperMemoryBudget | None,
         extent: int,
         buffer: int,
     ) -> None:
@@ -126,7 +183,7 @@ class _MapperTileCache:
         self.intermediate_dir = intermediate_dir
         self.intermediate_dir.mkdir(parents=True, exist_ok=True)
         self.feature_capacity = int(feature_capacity)
-        self.mapper_feature_budget = max(self.feature_capacity, int(mapper_feature_budget))
+        self.memory_budget = memory_budget
         self.extent = int(extent)
         self.buffer = int(buffer)
         self.tiles: OrderedDict[int, IntermediateVectorTile] = OrderedDict()
@@ -135,8 +192,10 @@ class _MapperTileCache:
         self.tile_part_counts: dict[int, int] = {}
         self.peak_live_features = 0
         self.peak_active_tiles = 0
-        self.budget_evictions = 0
+        self.memory_evictions = 0
+        self.memory_spill_events = 0
         self.total_parts = 0
+        self._features_since_memory_check = 0
 
     def get(self, tile_id: int) -> IntermediateVectorTile | None:
         tile = self.tiles.get(tile_id)
@@ -154,20 +213,56 @@ class _MapperTileCache:
         tile = self.tiles[tile_id]
         old_count = self.feature_counts.get(tile_id, 0)
         new_count = tile.feature_count
-        self.live_features += new_count - old_count
+        delta = new_count - old_count
+        self.live_features += delta
         self.feature_counts[tile_id] = new_count
         self.peak_live_features = max(self.peak_live_features, self.live_features)
-        self._evict_until_within_budget()
+        if delta > 0:
+            self._features_since_memory_check += delta
+            self._evict_under_memory_pressure()
 
     def flush_remaining(self) -> tuple[tuple[int, int], ...]:
         while self.tiles:
             self._write_lru_tile()
         return tuple(sorted(self.tile_part_counts.items()))
 
-    def _evict_until_within_budget(self) -> None:
-        while self.live_features > self.mapper_feature_budget and self.tiles:
-            self.budget_evictions += 1
+    def _evict_under_memory_pressure(self) -> None:
+        if self.memory_budget is None:
+            return
+        if self._features_since_memory_check < _MAPPER_MEMORY_CHECK_FEATURES:
+            return
+        self._features_since_memory_check = 0
+        current_rss, peak_rss = _process_rss_mib()
+        current_rss = current_rss if current_rss is not None else peak_rss
+        if current_rss is None:
+            return
+        if current_rss * _MIB <= self.memory_budget.high_watermark_bytes:
+            return
+
+        self.memory_spill_events += 1
+        spill_start_rss = current_rss
+        evictions_before = self.memory_evictions
+        while self.tiles and current_rss * _MIB > self.memory_budget.low_watermark_bytes:
+            self.memory_evictions += 1
             self._write_lru_tile()
+            current_rss, peak_rss = _process_rss_mib()
+            current_rss = current_rss if current_rss is not None else peak_rss
+            if current_rss is None:
+                break
+        logger.info(
+            "DatasetMVTGenerator mapper %d memory spill: rss_mib=%s "
+            "after_rss_mib=%s high_mib=%.1f low_mib=%.1f "
+            "evicted_tiles=%d live_features=%d active_tiles=%d parts=%d",
+            self.mapper_index,
+            _metric(spill_start_rss),
+            _metric(current_rss),
+            self.memory_budget.high_watermark_mib,
+            self.memory_budget.low_watermark_mib,
+            self.memory_evictions - evictions_before,
+            self.live_features,
+            len(self.tiles),
+            self.total_parts,
+        )
 
     def _write_lru_tile(self) -> None:
         tile_id, tile = self.tiles.popitem(last=False)
@@ -206,7 +301,7 @@ class DatasetMVTGenerator:
         pmtiles_compression: str = "gzip",
         workers: int | None = None,
         feature_capacity: int | None = None,
-        mapper_feature_budget: int | None = None,
+        mvt_memory_budget: str | int | None = None,
         extent: int | None = None,
         buffer: int | None = None,
         geom_col: str = "geometry",
@@ -227,14 +322,11 @@ class DatasetMVTGenerator:
         self.feature_capacity = int(
             feature_capacity if feature_capacity is not None else config_value("mvt", "feature_capacity")
         )
-        configured_mapper_feature_budget = config_value("mvt", "mapper_feature_budget")
-        self.mapper_feature_budget = _resolve_mapper_feature_budget(
-            feature_capacity=self.feature_capacity,
-            mapper_feature_budget=(
-                mapper_feature_budget
-                if mapper_feature_budget is not None
-                else configured_mapper_feature_budget
-            ),
+        configured_mvt_memory_budget = config_value("mvt", "mvt_memory_budget")
+        self.mvt_memory_budget = _resolve_total_mvt_memory_budget(
+            mvt_memory_budget
+            if mvt_memory_budget is not None
+            else configured_mvt_memory_budget
         )
         self.extent = int(extent if extent is not None else config_value("mvt", "extent"))
         self.buffer = int(buffer if buffer is not None else config_value("mvt", "buffer"))
@@ -308,15 +400,21 @@ class DatasetMVTGenerator:
         source: GeoParquetSource,
         temp_root: Path,
     ) -> list[_MapStageResult]:
+        active_mappers = min(self.workers, len(map_groups))
+        memory_budget = _mvt_memory_budget_for_stage(
+            total_budget_bytes=self.mvt_memory_budget,
+            active_mappers=active_mappers,
+        )
         logger.info(
             "DatasetMVTGenerator map stage: groups=%d workers=%d "
-            "feature_capacity=%d mapper_feature_budget=%d "
-            "aggregate_feature_budget=%d",
+            "feature_capacity=%d mvt_memory_budget_mib=%s "
+            "per_mapper_memory_high_mib=%s per_mapper_memory_low_mib=%s",
             len(map_groups),
             self.workers,
             self.feature_capacity,
-            self.mapper_feature_budget,
-            len(map_groups) * self.mapper_feature_budget,
+            _metric(None if self.mvt_memory_budget is None else self.mvt_memory_budget / _MIB),
+            _metric(None if memory_budget is None else memory_budget.high_watermark_mib),
+            _metric(None if memory_budget is None else memory_budget.low_watermark_mib),
         )
         try:
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
@@ -330,7 +428,7 @@ class DatasetMVTGenerator:
                         self.threshold,
                         self.partition_buffer,
                         self.feature_capacity,
-                        self.mapper_feature_budget,
+                        memory_budget,
                         self.extent,
                         self.buffer,
                         self.seed + index,
@@ -357,7 +455,7 @@ class DatasetMVTGenerator:
             logger.exception(
                 "DatasetMVTGenerator map stage failed. If a worker exited "
                 "abruptly, check the preceding mapper RSS/live_features logs "
-                "for an OOM kill; lower mapper_feature_budget or worker count."
+                "for an OOM kill; lower mvt_memory_budget or worker count."
             )
             raise
 
@@ -408,7 +506,7 @@ def _map_split_group(
     threshold: float,
     partition_buffer: float,
     feature_capacity: int,
-    mapper_feature_budget: int,
+    memory_budget: _MapperMemoryBudget | None,
     extent: int,
     buffer: int,
     seed: int,
@@ -419,11 +517,13 @@ def _map_split_group(
     current_rss, peak_rss = _process_rss_mib()
     logger.info(
         "DatasetMVTGenerator mapper %d starting: inputs=%d rss_mib=%s "
-        "peak_rss_mib=%s",
+        "peak_rss_mib=%s memory_high_mib=%s memory_low_mib=%s",
         mapper_index,
         len(inputs),
         _metric(current_rss),
         _metric(peak_rss),
+        _metric(None if memory_budget is None else memory_budget.high_watermark_mib),
+        _metric(None if memory_budget is None else memory_budget.low_watermark_mib),
     )
     prefix = HistogramLoader(hist_path).load()
     partitioner = PyramidPartitioner(
@@ -449,7 +549,7 @@ def _map_split_group(
         mapper_index=mapper_index,
         intermediate_dir=intermediate_dir,
         feature_capacity=feature_capacity,
-        mapper_feature_budget=mapper_feature_budget,
+        memory_budget=memory_budget,
         extent=extent,
         buffer=buffer,
     )
@@ -509,7 +609,7 @@ def _map_split_group(
     logger.info(
         "DatasetMVTGenerator mapper %d finished: input_rows=%d "
         "valid_features=%d tile_feature_offers=%d retained_offers=%d "
-        "tile_ids=%d parts=%d budget_evictions=%d "
+        "tile_ids=%d parts=%d memory_evictions=%d memory_spill_events=%d "
         "peak_live_features=%d peak_active_tiles=%d max_batch_mib=%.1f "
         "rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f elapsed_s=%.1f",
         mapper_index,
@@ -519,7 +619,8 @@ def _map_split_group(
         retained_offers,
         len(tile_part_counts),
         total_parts,
-        tiles.budget_evictions,
+        tiles.memory_evictions,
+        tiles.memory_spill_events,
         tiles.peak_live_features,
         tiles.peak_active_tiles,
         max_batch_bytes / _MIB,
@@ -546,7 +647,8 @@ def _log_mapper_progress(
     logger.info(
         "DatasetMVTGenerator mapper %d progress: input_rows=%d "
         "valid_features=%d tile_feature_offers=%d retained_offers=%d "
-        "live_features=%d active_tiles=%d parts=%d budget_evictions=%d "
+        "live_features=%d active_tiles=%d parts=%d "
+        "memory_evictions=%d memory_spill_events=%d "
         "max_batch_mib=%.1f rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f "
         "elapsed_s=%.1f",
         mapper_index,
@@ -557,7 +659,8 @@ def _log_mapper_progress(
         tiles.live_features,
         len(tiles.tiles),
         tiles.total_parts,
-        tiles.budget_evictions,
+        tiles.memory_evictions,
+        tiles.memory_spill_events,
         max_batch_bytes / _MIB,
         _metric(current_rss),
         _metric(peak_rss),
@@ -587,6 +690,58 @@ def _process_rss_mib() -> tuple[float | None, float | None]:
     except (OSError, ValueError):
         peak = None
     return current, peak
+
+
+def _system_available_memory_bytes() -> int | None:
+    values = []
+    if not sys.platform.startswith("linux"):
+        return _cgroup_available_memory_bytes()
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                values.append(int(line.split()[1]) * 1024)
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    cgroup_available = _cgroup_available_memory_bytes()
+    if cgroup_available is not None:
+        values.append(cgroup_available)
+    return min(values) if values else None
+
+
+def _cgroup_available_memory_bytes() -> int | None:
+    candidates = (
+        (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")),
+        (
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+        ),
+    )
+    for limit_path, current_path in candidates:
+        try:
+            raw_limit = limit_path.read_text().strip()
+            if raw_limit == "max":
+                continue
+            limit = int(raw_limit)
+            current = int(current_path.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        # Some cgroup v1 hosts expose a huge sentinel rather than a real limit.
+        if limit <= 0 or limit >= 2 ** 60:
+            continue
+        return max(0, limit - current)
+    return None
+
+
+def _system_total_memory_bytes() -> int | None:
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages) * int(page_size)
+    except (OSError, ValueError, AttributeError):
+        return None
+    return None
 
 
 def _iter_map_input_tables(

@@ -292,7 +292,7 @@ def generate_mvt(
     parallelism: int | None = None,
     temp_dir: str | None = None,
     feature_capacity: int | None = None,
-    mapper_feature_budget: int | None = None,
+    mvt_memory_budget: str | int | None = None,
     extent: int | None = None,
     buffer: int | None = None,
 ) -> MVTResult:
@@ -318,10 +318,10 @@ def generate_mvt(
         ``<tile_dir>/tmp``.
     feature_capacity : int
         Maximum retained features per intermediate tile reservoir.
-    mapper_feature_budget : int
-        Maximum retained features kept in memory by one MVT mapper before
-        spilling least-recently-used partial tiles to disk. When omitted,
-        Starlet uses about one million retained tile-features.
+    mvt_memory_budget : str | int
+        Total memory target for all concurrent MVT mappers, e.g. ``"24gb"``.
+        The default ``"auto"`` uses a fraction of available system memory and
+        lets each mapper spill partial tiles when its RSS crosses its share.
     extent : int
         Vector tile extent.
     buffer : int
@@ -340,12 +340,7 @@ def generate_mvt(
     parallelism = command_parallelism("mvt", explicit=parallelism)
     temp_dir = resolve_command_value("mvt", "temp_dir", temp_dir)
     feature_capacity = int(resolve_command_value("mvt", "feature_capacity", feature_capacity))
-    mapper_feature_budget_value = resolve_command_value("mvt", "mapper_feature_budget", mapper_feature_budget)
-    mapper_feature_budget = (
-        None
-        if mapper_feature_budget_value is None
-        else int(mapper_feature_budget_value)
-    )
+    mvt_memory_budget = resolve_command_value("mvt", "mvt_memory_budget", mvt_memory_budget)
     extent = int(resolve_command_value("mvt", "extent", extent))
     buffer = int(resolve_command_value("mvt", "buffer", buffer))
 
@@ -368,7 +363,7 @@ def generate_mvt(
         workers=parallelism,
         temp_dir=temp_dir,
         feature_capacity=feature_capacity,
-        mapper_feature_budget=mapper_feature_budget,
+        mvt_memory_budget=mvt_memory_budget,
         extent=extent,
         buffer=buffer,
     ).run()
@@ -399,7 +394,7 @@ def build(
     pmtiles_compression: str | None = None,
     temp_dir: str | None = None,
     feature_capacity: int | None = None,
-    mapper_feature_budget: int | None = None,
+    mvt_memory_budget: str | int | None = None,
     extent: int | None = None,
     buffer: int | None = None,
     **tile_kwargs,
@@ -432,10 +427,9 @@ def build(
         values override the process-wide Starlet temp directory.
     feature_capacity : int
         Maximum retained features per intermediate tile reservoir.
-    mapper_feature_budget : int
-        Maximum retained features kept in memory by one MVT mapper before
-        spilling partial tiles to disk. When omitted, Starlet uses about one
-        million retained tile-features.
+    mvt_memory_budget : str | int
+        Total memory target for all concurrent MVT mappers, e.g. ``"24gb"``.
+        The default ``"auto"`` uses a fraction of available system memory.
     extent : int
         Vector tile extent.
     buffer : int
@@ -469,16 +463,11 @@ def build(
     feature_capacity = int(
         resolve_command_value("build", "feature_capacity", feature_capacity, fallback_sections=("mvt",))
     )
-    mapper_feature_budget_value = resolve_command_value(
+    mvt_memory_budget = resolve_command_value(
         "build",
-        "mapper_feature_budget",
-        mapper_feature_budget,
+        "mvt_memory_budget",
+        mvt_memory_budget,
         fallback_sections=("mvt",),
-    )
-    mapper_feature_budget = (
-        None
-        if mapper_feature_budget_value is None
-        else int(mapper_feature_budget_value)
     )
     extent = int(resolve_command_value("build", "extent", extent, fallback_sections=("mvt",)))
     buffer = int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",)))
@@ -542,7 +531,7 @@ def build(
         temp_dir=temp_dir,
         parallelism=parallelism,
         feature_capacity=feature_capacity,
-        mapper_feature_budget=mapper_feature_budget,
+        mvt_memory_budget=mvt_memory_budget,
         extent=extent,
         buffer=buffer,
     )

@@ -80,7 +80,7 @@ zoom = 5
 threshold = 777
 pmtiles = true
 feature_capacity = 333
-mapper_feature_budget = 4444
+mvt_memory_budget = "8gb"
 extent = 2048
 buffer = 64
 """.strip()
@@ -88,7 +88,7 @@ buffer = 64
 
     captured = {}
 
-    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, mapper_feature_budget, extent, buffer):
+    def fake_generate_mvt(*, tile_dir, zoom, threshold, pmtiles, pmtiles_compression, outdir, parallelism, temp_dir, feature_capacity, mvt_memory_budget, extent, buffer):
         captured.update(
             tile_dir=tile_dir,
             zoom=zoom,
@@ -99,7 +99,7 @@ buffer = 64
             parallelism=parallelism,
             temp_dir=temp_dir,
             feature_capacity=feature_capacity,
-            mapper_feature_budget=mapper_feature_budget,
+            mvt_memory_budget=mvt_memory_budget,
             extent=extent,
             buffer=buffer,
         )
@@ -128,7 +128,7 @@ buffer = 64
     assert captured["pmtiles_compression"] == "gzip"
     assert captured["parallelism"] == 4
     assert captured["feature_capacity"] == 333
-    assert captured["mapper_feature_budget"] == 4444
+    assert captured["mvt_memory_budget"] == "8gb"
     assert captured["extent"] == 2048
     assert captured["buffer"] == 64
 

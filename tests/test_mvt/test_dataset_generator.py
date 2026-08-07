@@ -11,7 +11,7 @@ from shapely import wkb
 from shapely.geometry import Point
 
 from starlet._internal.mvt.mvt_generator import (
-    DEFAULT_MAPPER_FEATURE_BUDGET,
+    _MapperMemoryBudget,
     _MapperTileCache,
     _ReduceTileInput,
     _TableBatch,
@@ -19,9 +19,10 @@ from starlet._internal.mvt.mvt_generator import (
     _group_splits,
     _group_table_batches,
     _intermediate_tile_part_filename,
+    _mvt_memory_budget_for_stage,
     _positive_bounds_tuple,
+    _resolve_total_mvt_memory_budget,
     _reduce_tile_group,
-    _resolve_mapper_feature_budget,
     _sample_single_tile_records,
     _single_tile_index_cache,
     _single_tile_parquet_index,
@@ -74,49 +75,51 @@ def test_positive_bounds_tuple_expands_zero_sized_bounds():
     assert maxy > miny
 
 
-def test_default_mapper_feature_budget_is_bounded_per_worker():
-    assert DEFAULT_MAPPER_FEATURE_BUDGET == 1_000_000
-    assert _resolve_mapper_feature_budget(
-        feature_capacity=2_000,
-        mapper_feature_budget=None,
-    ) == 1_000_000
+def test_mvt_memory_budget_resolves_total_and_stage_share():
+    total = _resolve_total_mvt_memory_budget("8gb")
+    budget = _mvt_memory_budget_for_stage(
+        total_budget_bytes=total,
+        active_mappers=4,
+    )
+
+    assert total == 8 * 1024 ** 3
+    assert budget is not None
+    assert budget.high_watermark_bytes == 2 * 1024 ** 3
+    assert budget.low_watermark_bytes == int(2 * 1024 ** 3 * 0.85)
 
 
-def test_mapper_tile_cache_spills_lru_when_feature_budget_is_exceeded(tmp_path):
+def test_mvt_memory_budget_can_be_disabled():
+    assert _resolve_total_mvt_memory_budget("none") is None
+    assert _resolve_total_mvt_memory_budget(0) is None
+
+
+def test_mapper_tile_cache_spills_when_memory_watermark_is_exceeded(tmp_path, monkeypatch):
     cache = _MapperTileCache(
         mapper_index=0,
         intermediate_dir=tmp_path / "mapper",
-        feature_capacity=2,
-        mapper_feature_budget=2,
+        feature_capacity=10,
+        memory_budget=_MapperMemoryBudget(
+            high_watermark_bytes=100 * 1024 ** 2,
+            low_watermark_bytes=80 * 1024 ** 2,
+            total_budget_bytes=100 * 1024 ** 2,
+        ),
         extent=4096,
         buffer=256,
     )
-    first = IntermediateVectorTile(0, 0, 0, feature_capacity=2)
-    second = IntermediateVectorTile(1, 0, 0, feature_capacity=2)
+    monkeypatch.setattr(mvt_generator, "_MAPPER_MEMORY_CHECK_FEATURES", 1)
+    rss_values = iter([(120.0, 120.0), (70.0, 120.0)])
+    monkeypatch.setattr(mvt_generator, "_process_rss_mib", lambda: next(rss_values))
 
-    cache.put(first.tile_id, first)
-    first.add_feature(Point(0, 0), {"id": 1}, priority=1)
-    cache.account_feature_change(first.tile_id)
-    first.add_feature(Point(1, 1), {"id": 2}, priority=2)
-    cache.account_feature_change(first.tile_id)
+    tile = IntermediateVectorTile(0, 0, 0, feature_capacity=10)
+    cache.put(tile.tile_id, tile)
+    tile.add_feature(Point(0, 0), {"id": 1}, priority=1)
+    cache.account_feature_change(tile.tile_id)
 
-    cache.put(second.tile_id, second)
-    second.add_feature(Point(2, 2), {"id": 3}, priority=3)
-    cache.account_feature_change(second.tile_id)
-
-    assert first.tile_id not in cache.tiles
-    assert second.tile_id in cache.tiles
-    assert cache.live_features == 1
-    assert cache.tile_part_counts == {first.tile_id: 1}
-    assert cache.budget_evictions == 1
-    assert cache.peak_live_features == 3
-    assert cache.peak_active_tiles == 2
-
-    tile_part_counts = dict(cache.flush_remaining())
-    assert tile_part_counts == {first.tile_id: 1, second.tile_id: 1}
-    paths = list((tmp_path / "mapper").iterdir())
-    assert len(paths) == 2
-    assert all(path.parent == tmp_path / "mapper" for path in paths)
+    assert tile.tile_id not in cache.tiles
+    assert cache.live_features == 0
+    assert cache.memory_spill_events == 1
+    assert cache.memory_evictions == 1
+    assert cache.tile_part_counts == {tile.tile_id: 1}
 
 
 def test_reduce_merges_multiple_spills_for_same_tile(tmp_path):

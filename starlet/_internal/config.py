@@ -34,7 +34,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "threshold": 0,
         "pmtiles": False,
         "feature_capacity": 10_000,
-        "mapper_feature_budget": None,
+        "mvt_memory_budget": "auto",
         "extent": 4096,
         "buffer": 256,
         "pmtiles_compression": "gzip",

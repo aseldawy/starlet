@@ -9,10 +9,14 @@ import heapq
 import logging
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import random
+import resource
 import shutil
+import sys
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -84,7 +88,13 @@ class _TableBatch:
 
 
 _MapInput = GeoParquetSplit | _TableBatch
-DEFAULT_MAPPER_FEATURE_BUDGET = 10_000_000
+# This is a per-process limit, so the aggregate upper bound is this value
+# multiplied by the MVT worker count.  Tile features are Python objects and can
+# contain large attribute maps; ten million per mapper has been observed to use
+# several GiB in each worker.
+DEFAULT_MAPPER_FEATURE_BUDGET = 1_000_000
+_MAPPER_PROGRESS_ROWS = 1_000_000
+_MIB = 1024 * 1024
 
 
 def _resolve_mapper_feature_budget(
@@ -123,6 +133,10 @@ class _MapperTileCache:
         self.feature_counts: dict[int, int] = {}
         self.live_features = 0
         self.tile_part_counts: dict[int, int] = {}
+        self.peak_live_features = 0
+        self.peak_active_tiles = 0
+        self.budget_evictions = 0
+        self.total_parts = 0
 
     def get(self, tile_id: int) -> IntermediateVectorTile | None:
         tile = self.tiles.get(tile_id)
@@ -134,6 +148,7 @@ class _MapperTileCache:
         self.tiles[tile_id] = tile
         self.tiles.move_to_end(tile_id)
         self.feature_counts[tile_id] = tile.feature_count
+        self.peak_active_tiles = max(self.peak_active_tiles, len(self.tiles))
 
     def account_feature_change(self, tile_id: int) -> None:
         tile = self.tiles[tile_id]
@@ -141,6 +156,7 @@ class _MapperTileCache:
         new_count = tile.feature_count
         self.live_features += new_count - old_count
         self.feature_counts[tile_id] = new_count
+        self.peak_live_features = max(self.peak_live_features, self.live_features)
         self._evict_until_within_budget()
 
     def flush_remaining(self) -> tuple[tuple[int, int], ...]:
@@ -150,6 +166,7 @@ class _MapperTileCache:
 
     def _evict_until_within_budget(self) -> None:
         while self.live_features > self.mapper_feature_budget and self.tiles:
+            self.budget_evictions += 1
             self._write_lru_tile()
 
     def _write_lru_tile(self) -> None:
@@ -167,6 +184,7 @@ class _MapperTileCache:
         )
         tile.write_features(path)
         self.tile_part_counts[tile_id] = part_index + 1
+        self.total_parts += 1
 
 
 class DatasetMVTGenerator:
@@ -291,32 +309,57 @@ class DatasetMVTGenerator:
         temp_root: Path,
     ) -> list[_MapStageResult]:
         logger.info(
-            "DatasetMVTGenerator map stage: groups=%d workers=%d mapper_feature_budget=%d",
+            "DatasetMVTGenerator map stage: groups=%d workers=%d "
+            "feature_capacity=%d mapper_feature_budget=%d "
+            "aggregate_feature_budget=%d",
             len(map_groups),
             self.workers,
+            self.feature_capacity,
             self.mapper_feature_budget,
+            len(map_groups) * self.mapper_feature_budget,
         )
-        with ProcessPoolExecutor(max_workers=self.workers) as executor:
-            futures = [
-                executor.submit(
-                    _map_split_group,
-                    group,
-                    source,
-                    str(self.hist_path),
-                    self.num_zoom_levels,
-                    self.threshold,
-                    self.partition_buffer,
-                    self.feature_capacity,
-                    self.mapper_feature_budget,
-                    self.extent,
-                    self.buffer,
-                    self.seed + index,
-                    str(temp_root),
-                    index,
-                )
-                for index, group in enumerate(map_groups)
-            ]
-            return [future.result() for future in as_completed(futures)]
+        try:
+            with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(
+                        _map_split_group,
+                        group,
+                        source,
+                        str(self.hist_path),
+                        self.num_zoom_levels,
+                        self.threshold,
+                        self.partition_buffer,
+                        self.feature_capacity,
+                        self.mapper_feature_budget,
+                        self.extent,
+                        self.buffer,
+                        self.seed + index,
+                        str(temp_root),
+                        index,
+                    ): index
+                    for index, group in enumerate(map_groups)
+                }
+                results = []
+                for future in as_completed(futures):
+                    mapper_index = futures[future]
+                    result = future.result()
+                    results.append(result)
+                    logger.info(
+                        "DatasetMVTGenerator map progress: completed=%d/%d "
+                        "mapper=%d parts=%d",
+                        len(results),
+                        len(futures),
+                        mapper_index,
+                        result.total_parts,
+                    )
+                return results
+        except Exception:
+            logger.exception(
+                "DatasetMVTGenerator map stage failed. If a worker exited "
+                "abruptly, check the preceding mapper RSS/live_features logs "
+                "for an OOM kill; lower mapper_feature_budget or worker count."
+            )
+            raise
 
     def _run_reduce_stage(self, map_results: list[_MapStageResult]) -> None:
         if not map_results:
@@ -372,6 +415,16 @@ def _map_split_group(
     temp_root: str,
     mapper_index: int,
 ) -> _MapStageResult:
+    started = time.monotonic()
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d starting: inputs=%d rss_mib=%s "
+        "peak_rss_mib=%s",
+        mapper_index,
+        len(inputs),
+        _metric(current_rss),
+        _metric(peak_rss),
+    )
     prefix = HistogramLoader(hist_path).load()
     partitioner = PyramidPartitioner(
         (WORLD_MINX, WORLD_MINY, WORLD_MAXX, WORLD_MAXY),
@@ -379,6 +432,16 @@ def _map_split_group(
         prefix_histogram=prefix,
         size_threshold=threshold,
         buffer=partition_buffer,
+    )
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d initialized: histogram_mib=%.1f "
+        "rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f",
+        mapper_index,
+        int(getattr(prefix, "nbytes", 0)) / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
     )
     intermediate_dir = Path(temp_root) / f"mapper-{mapper_index:06d}"
     intermediate_dir.mkdir(parents=True, exist_ok=True)
@@ -391,12 +454,22 @@ def _map_split_group(
         buffer=buffer,
     )
 
+    input_rows = 0
+    valid_features = 0
+    tile_feature_offers = 0
+    retained_offers = 0
+    max_batch_bytes = 0
+    next_progress_row = _MAPPER_PROGRESS_ROWS
     for table in _iter_map_input_tables(source, inputs):
+        input_rows += table.num_rows
+        max_batch_bytes = max(max_batch_bytes, int(getattr(table, "nbytes", 0)))
         for geom, attrs, priority in _iter_web_mercator_features(table, source.geom_col):
+            valid_features += 1
             bounds = _positive_bounds_tuple(geom.bounds)
             tile_ids = partitioner.overlapping_tile_ids(bounds)
             if not tile_ids:
                 continue
+            tile_feature_offers += len(tile_ids)
             for tile_id in tile_ids:
                 tile = tiles.get(tile_id)
                 if tile is None:
@@ -410,20 +483,110 @@ def _map_split_group(
                         buffer=buffer,
                     )
                     tiles.put(tile_id, tile)
-                tile.add_feature(
+                retained = tile.add_feature(
                     geom,
                     attrs,
                     priority=priority,
                 )
-                tiles.account_feature_change(tile_id)
+                if retained:
+                    retained_offers += 1
+                    tiles.account_feature_change(tile_id)
+        if input_rows >= next_progress_row:
+            _log_mapper_progress(
+                mapper_index=mapper_index,
+                input_rows=input_rows,
+                valid_features=valid_features,
+                tile_feature_offers=tile_feature_offers,
+                retained_offers=retained_offers,
+                max_batch_bytes=max_batch_bytes,
+                tiles=tiles,
+                started=started,
+            )
+            next_progress_row = ((input_rows // _MAPPER_PROGRESS_ROWS) + 1) * _MAPPER_PROGRESS_ROWS
     tile_part_counts = tiles.flush_remaining()
     total_parts = sum(part_count for _, part_count in tile_part_counts)
+    current_rss, peak_rss = _process_rss_mib()
     logger.info(
-        "DatasetMVTGenerator mapper %d wrote %d intermediate tile parts",
+        "DatasetMVTGenerator mapper %d finished: input_rows=%d "
+        "valid_features=%d tile_feature_offers=%d retained_offers=%d "
+        "tile_ids=%d parts=%d budget_evictions=%d "
+        "peak_live_features=%d peak_active_tiles=%d max_batch_mib=%.1f "
+        "rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f elapsed_s=%.1f",
         mapper_index,
+        input_rows,
+        valid_features,
+        tile_feature_offers,
+        retained_offers,
+        len(tile_part_counts),
         total_parts,
+        tiles.budget_evictions,
+        tiles.peak_live_features,
+        tiles.peak_active_tiles,
+        max_batch_bytes / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
+        time.monotonic() - started,
     )
     return _MapStageResult(str(intermediate_dir), tile_part_counts)
+
+
+def _log_mapper_progress(
+    *,
+    mapper_index: int,
+    input_rows: int,
+    valid_features: int,
+    tile_feature_offers: int,
+    retained_offers: int,
+    max_batch_bytes: int,
+    tiles: _MapperTileCache,
+    started: float,
+) -> None:
+    current_rss, peak_rss = _process_rss_mib()
+    logger.info(
+        "DatasetMVTGenerator mapper %d progress: input_rows=%d "
+        "valid_features=%d tile_feature_offers=%d retained_offers=%d "
+        "live_features=%d active_tiles=%d parts=%d budget_evictions=%d "
+        "max_batch_mib=%.1f rss_mib=%s peak_rss_mib=%s arrow_mib=%.1f "
+        "elapsed_s=%.1f",
+        mapper_index,
+        input_rows,
+        valid_features,
+        tile_feature_offers,
+        retained_offers,
+        tiles.live_features,
+        len(tiles.tiles),
+        tiles.total_parts,
+        tiles.budget_evictions,
+        max_batch_bytes / _MIB,
+        _metric(current_rss),
+        _metric(peak_rss),
+        pa.total_allocated_bytes() / _MIB,
+        time.monotonic() - started,
+    )
+
+
+def _metric(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.1f}"
+
+
+def _process_rss_mib() -> tuple[float | None, float | None]:
+    """Return current and peak RSS for lightweight worker diagnostics."""
+    current = None
+    if sys.platform.startswith("linux"):
+        try:
+            resident_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            current = resident_pages * os.sysconf("SC_PAGE_SIZE") / _MIB
+        except (OSError, ValueError, IndexError):
+            pass
+
+    try:
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        # Linux reports KiB; macOS and the BSDs report bytes.
+        peak /= _MIB if sys.platform == "darwin" else 1024.0
+    except (OSError, ValueError):
+        peak = None
+    return current, peak
 
 
 def _iter_map_input_tables(

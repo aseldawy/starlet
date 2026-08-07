@@ -321,7 +321,7 @@ def generate_mvt(
     mapper_feature_budget : int
         Maximum retained features kept in memory by one MVT mapper before
         spilling least-recently-used partial tiles to disk. When omitted,
-        Starlet uses about ten million retained tile-features.
+        Starlet uses about one million retained tile-features.
     extent : int
         Vector tile extent.
     buffer : int

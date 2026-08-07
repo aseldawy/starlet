@@ -58,7 +58,7 @@ feature_capacity = 10000
 
 # Maximum live features across active mapper tiles before spilling least-recently-used tiles.
 # Leave unset to use the default of about one million retained tile-features.
-mapper_feature_budget = 10000000
+mapper_feature_budget = 1000000
 
 # Vector tile extent.
 extent = 4096

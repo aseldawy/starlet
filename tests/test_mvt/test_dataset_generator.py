@@ -11,6 +11,7 @@ from shapely import wkb
 from shapely.geometry import Point
 
 from starlet._internal.mvt.mvt_generator import (
+    DEFAULT_MAPPER_FEATURE_BUDGET,
     _MapperTileCache,
     _ReduceTileInput,
     _TableBatch,
@@ -20,6 +21,7 @@ from starlet._internal.mvt.mvt_generator import (
     _intermediate_tile_part_filename,
     _positive_bounds_tuple,
     _reduce_tile_group,
+    _resolve_mapper_feature_budget,
     _sample_single_tile_records,
     _single_tile_index_cache,
     _single_tile_parquet_index,
@@ -72,6 +74,14 @@ def test_positive_bounds_tuple_expands_zero_sized_bounds():
     assert maxy > miny
 
 
+def test_default_mapper_feature_budget_is_bounded_per_worker():
+    assert DEFAULT_MAPPER_FEATURE_BUDGET == 1_000_000
+    assert _resolve_mapper_feature_budget(
+        feature_capacity=2_000,
+        mapper_feature_budget=None,
+    ) == 1_000_000
+
+
 def test_mapper_tile_cache_spills_lru_when_feature_budget_is_exceeded(tmp_path):
     cache = _MapperTileCache(
         mapper_index=0,
@@ -98,6 +108,9 @@ def test_mapper_tile_cache_spills_lru_when_feature_budget_is_exceeded(tmp_path):
     assert second.tile_id in cache.tiles
     assert cache.live_features == 1
     assert cache.tile_part_counts == {first.tile_id: 1}
+    assert cache.budget_evictions == 1
+    assert cache.peak_live_features == 3
+    assert cache.peak_active_tiles == 2
 
     tile_part_counts = dict(cache.flush_remaining())
     assert tile_part_counts == {first.tile_id: 1, second.tile_id: 1}

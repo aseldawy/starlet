@@ -485,7 +485,15 @@ def _assignment_stage_worker(
         merged_path = split_dir / (
             f"mapper_{split_index:06d}_reducer_{reducer_id:06d}{_INTERMEDIATE_SUFFIX}"
         )
-        merged = _merge_sorted_partition_files(run_paths, str(merged_path), compression)
+        merge_inputs = _merge_sorted_partition_files_to_fan_in(
+            run_paths,
+            compression,
+            str(split_dir / f"reducer_{reducer_id:06d}_merge_runs"),
+        )
+        if not merge_inputs:
+            merged = None
+        else:
+            merged = _merge_sorted_partition_files(merge_inputs, str(merged_path), compression)
         if merged is not None:
             intermediate_by_reducer[reducer_id] = merged
             # The per-batch run files are folded into the merged per-reducer

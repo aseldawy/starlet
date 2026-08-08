@@ -80,6 +80,47 @@ class TestTwoStageOrchestrator:
         assert len(result) == 2
         assert all(Path(path).exists() for path in result)
 
+    def test_assignment_worker_uses_bounded_fan_in_for_batch_run_merge(self, monkeypatch, temp_dir):
+        table = pa.table({"geometry": [wkb.dumps(Point(1.0, 1.0))], "value": [1]})
+
+        class Source:
+            def iter_tables(self, split):
+                del split
+                for _ in range(5):
+                    yield table
+
+        class Assigner:
+            def partition_by_tile(self, table):
+                return pa.table({"partition_id": pa.array([0] * table.num_rows, type=pa.int64())})
+
+        observed_chunk_sizes = []
+
+        def fake_merge(chunk, output_path, compression):
+            del compression
+            observed_chunk_sizes.append(len(chunk))
+            if len(chunk) > 2:
+                raise OSError(errno.EMFILE, "Too many open files")
+            Path(output_path).touch()
+            return output_path
+
+        monkeypatch.setattr(two_stage_module, "_default_merge_fan_in", lambda _: 2)
+        monkeypatch.setattr(two_stage_module, "_merge_sorted_partition_files", fake_merge)
+
+        manifest = two_stage_module._assignment_stage_worker(
+            Source(),
+            object(),
+            0,
+            Assigner(),
+            1,
+            str(temp_dir),
+            None,
+            1,
+            False,
+        )
+
+        assert max(observed_chunk_sizes) == 2
+        assert sorted(manifest.intermediate_by_reducer) == [0]
+
     def test_merge_relaxes_non_nullable_fields_when_later_files_have_nulls(self, temp_dir):
         schema_non_nullable = pa.schema([
             pa.field("_tile_id", pa.int64(), nullable=False),

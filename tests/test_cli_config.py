@@ -20,6 +20,7 @@ log_level = "DEBUG"
 partition_size = "256mb"
 sort = "hilbert"
 compression = "gzip"
+intermediate_compression = "none"
 sample_cap = 123
 csv_split_size = "64mb"
 grid_size = 1024
@@ -59,6 +60,7 @@ sfc_bits = 20
     assert captured["partition_size"] == 256 * 1024 * 1024
     assert captured["sort"] == "hilbert"
     assert captured["compression"] == "gzip"
+    assert captured["intermediate_compression"] == "none"
     assert captured["sample_cap"] == 123
     assert captured["csv_split_size"] == 64 * 1024 * 1024
     assert captured["parallelism"] == 6
@@ -172,6 +174,7 @@ pmtiles_compression = "brotli"
     assert result.exit_code == 0
     assert captured["pmtiles"] is True
     assert captured["pmtiles_compression"] == "brotli"
+    assert captured["intermediate_compression"] == "gzip"
 
 
 def test_serve_command_uses_config_host_port_and_cache(tmp_path, monkeypatch):

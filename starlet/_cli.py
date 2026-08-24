@@ -64,6 +64,12 @@ def main(ctx: click.Context, config_path: str | None):
 @click.option("--partition-size", default=None, help="Target partition size for tiling (e.g. 128mb).")
 @click.option("--sort", default=None, help="Row sort order within each tile.")
 @click.option("--compression", default=None, help="Parquet compression codec.")
+@click.option(
+    "--tile-intermediate-compression",
+    "intermediate_compression",
+    default=None,
+    help="Compression for two-stage shuffle intermediate files: none or gzip.",
+)
 @click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
 @click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
 @click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
@@ -90,6 +96,7 @@ def tile(
     partition_size,
     sort,
     compression,
+    intermediate_compression,
     sample_cap,
     csv_split_size,
     grid_size,
@@ -118,6 +125,9 @@ def tile(
         partition_size=parse_size_value(resolve_command_value("tile", "partition_size", partition_size)),
         sort=str(resolve_command_value("tile", "sort", sort)),
         compression=str(resolve_command_value("tile", "compression", compression)),
+        intermediate_compression=str(
+            resolve_command_value("tile", "intermediate_compression", intermediate_compression)
+        ),
         sample_cap=resolve_command_value("tile", "sample_cap", sample_cap),
         seed=seed,
         geom_col=geom_col,
@@ -190,6 +200,12 @@ def mvt(tile_dir, zoom, outdir, threshold, parallelism, temp_dir, feature_capaci
 @click.option("--partition-size", default=None, help="Target partition size for tiling (e.g. 128mb).")
 @click.option("--sort", default=None, help="Row sort order within each tile.")
 @click.option("--compression", default=None, help="Parquet compression codec.")
+@click.option(
+    "--tile-intermediate-compression",
+    "intermediate_compression",
+    default=None,
+    help="Compression for two-stage shuffle intermediate files: none or gzip.",
+)
 @click.option("--sample-cap", type=int, default=None, help="Reservoir sampling cap for centroid sampling.")
 @click.option("--csv-split-size", default=None, help="Target byte length for each CSV source split.")
 @click.option("--grid-size", type=int, default=None, help="Histogram grid size per axis.")
@@ -222,6 +238,7 @@ def build(
     partition_size,
     sort,
     compression,
+    intermediate_compression,
     sample_cap,
     csv_split_size,
     grid_size,
@@ -265,6 +282,11 @@ def build(
         buffer=int(resolve_command_value("build", "buffer", buffer, fallback_sections=("mvt",))),
         sort=str(resolve_command_value("build", "sort", sort, fallback_sections=("tile",))),
         compression=str(resolve_command_value("build", "compression", compression, fallback_sections=("tile",))),
+        intermediate_compression=str(
+            resolve_command_value(
+                "build", "intermediate_compression", intermediate_compression, fallback_sections=("tile",)
+            )
+        ),
         sample_cap=resolve_command_value("build", "sample_cap", sample_cap, fallback_sections=("tile",)),
         csv_x_col=csv_x_col,
         csv_y_col=csv_y_col,

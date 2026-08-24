@@ -23,6 +23,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "partition_size": None,
         "sort": "zorder",
         "compression": "zstd",
+        "intermediate_compression": "gzip",
         "sample_cap": 10_000,
         "csv_split_size": "32mb",
         "grid_size": 4096,

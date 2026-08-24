@@ -28,6 +28,10 @@ sort = "zorder"
 # Compression codec for parquet output.
 compression = "zstd"
 
+# Compression for two-stage shuffle intermediate files written by mappers
+# before the reduce stage merges them: "gzip" or "none".
+intermediate_compression = "gzip"
+
 # Reservoir sample size used during partitioning.
 sample_cap = 10000
 

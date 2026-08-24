@@ -5,6 +5,7 @@ from concurrent.futures import as_completed
 from dataclasses import dataclass
 import errno
 import gc
+import gzip
 import heapq
 import logging
 import os
@@ -36,6 +37,38 @@ _INTERMEDIATE_SUFFIX = ".arrow"
 _INTERMEDIATE_BATCH_SIZE = 64_000
 _MIN_MERGE_FAN_IN = 16
 _OPEN_FILE_RESERVE = 32
+_VALID_INTERMEDIATE_COMPRESSIONS = ("none", "gzip")
+# Fast setting: intermediates are shuffled and re-read within the same run, so
+# a low compression level trades ratio for lower mapper/reducer CPU overhead.
+_INTERMEDIATE_GZIP_LEVEL = 1
+
+
+def _normalize_intermediate_compression(value: Optional[str]) -> str:
+    normalized = (value or "none").strip().lower()
+    if normalized not in _VALID_INTERMEDIATE_COMPRESSIONS:
+        raise ValueError(
+            f"Unsupported tile-intermediate-compression {value!r}; "
+            f"expected one of {_VALID_INTERMEDIATE_COMPRESSIONS}"
+        )
+    return normalized
+
+
+def _open_intermediate_sink(path: str, intermediate_compression: Optional[str]):
+    if _normalize_intermediate_compression(intermediate_compression) == "gzip":
+        return gzip.GzipFile(path, mode="wb", compresslevel=_INTERMEDIATE_GZIP_LEVEL)
+    return pa.OSFile(path, "wb")
+
+
+def _open_intermediate_source(path: str, intermediate_compression: Optional[str]) -> pa.NativeFile:
+    if _normalize_intermediate_compression(intermediate_compression) == "gzip":
+        # The Arrow IPC file format needs random access to read its trailing
+        # footer. gzip streams only support that via full re-decompression on
+        # every backward seek, so decompress once into memory instead and
+        # hand pyarrow a fast in-memory random-access buffer.
+        with open(path, "rb") as handle:
+            raw = gzip.decompress(handle.read())
+        return pa.BufferReader(raw)
+    return pa.memory_map(path, "r")
 
 
 @dataclass(frozen=True)
@@ -129,13 +162,15 @@ def _nullable_schema(schema: pa.Schema) -> pa.Schema:
     )
 
 
-def _ipc_file_schema(path: str) -> pa.Schema:
-    with pa.memory_map(path, "r") as source:
+def _ipc_file_schema(path: str, intermediate_compression: Optional[str] = "none") -> pa.Schema:
+    with _open_intermediate_source(path, intermediate_compression) as source:
         return ipc.open_file(source).schema
 
 
-def _unified_nullable_schema(input_paths: Sequence[str]) -> pa.Schema:
-    schemas = [_ipc_file_schema(path) for path in input_paths]
+def _unified_nullable_schema(
+    input_paths: Sequence[str], intermediate_compression: Optional[str] = "none"
+) -> pa.Schema:
+    schemas = [_ipc_file_schema(path, intermediate_compression) for path in input_paths]
     if not schemas:
         raise ValueError("Cannot unify schemas for an empty input path list")
     unified = pa.unify_schemas(schemas, promote_options="default")
@@ -158,9 +193,14 @@ def _cast_table_to_schema(table: pa.Table, schema: pa.Schema) -> pa.Table:
     return pa.table(columns, schema=schema)
 
 
-def _write_intermediate_table(path: str, table: pa.Table, schema: Optional[pa.Schema] = None) -> None:
+def _write_intermediate_table(
+    path: str,
+    table: pa.Table,
+    schema: Optional[pa.Schema] = None,
+    intermediate_compression: Optional[str] = "none",
+) -> None:
     writer_schema = schema or table.schema
-    with pa.OSFile(path, "wb") as sink:
+    with _open_intermediate_sink(path, intermediate_compression) as sink:
         with ipc.new_file(sink, writer_schema) as writer:
             writer.write_table(
                 _cast_table_to_schema(table, writer_schema),
@@ -171,8 +211,9 @@ def _write_intermediate_table(path: str, table: pa.Table, schema: Optional[pa.Sc
 def _iter_partition_groups(
     path: str,
     batch_size: int = _INTERMEDIATE_BATCH_SIZE,
+    intermediate_compression: Optional[str] = "none",
 ) -> Iterator[Tuple[int, pa.Table]]:
-    source = pa.memory_map(path, "r")
+    source = _open_intermediate_source(path, intermediate_compression)
     reader = ipc.open_file(source)
     current_partition: Optional[int] = None
     current_tables: List[pa.Table] = []
@@ -273,16 +314,16 @@ def _default_merge_fan_in(num_inputs: int) -> int:
 def _merge_sorted_partition_files(
     input_paths: Sequence[str],
     output_path: str,
-    compression: Optional[str],
+    intermediate_compression: Optional[str],
 ) -> Optional[str]:
-    # Arrow IPC intermediates are intentionally uncompressed: they are internal
-    # full-table shuffle files, so avoiding codec work is the fast path.
-    _ = compression
-    iterators = [iter(_iter_partition_groups(path)) for path in input_paths]
+    iterators = [
+        iter(_iter_partition_groups(path, intermediate_compression=intermediate_compression))
+        for path in input_paths
+    ]
     heap: List[Tuple[int, int, pa.Table]] = []
     writer: Optional[ipc.RecordBatchFileWriter] = None
-    sink: Optional[pa.OSFile] = None
-    writer_schema: Optional[pa.Schema] = _unified_nullable_schema(input_paths)
+    sink: Optional[Any] = None
+    writer_schema: Optional[pa.Schema] = _unified_nullable_schema(input_paths, intermediate_compression)
 
     for iterator_id, iterator in enumerate(iterators):
         try:
@@ -298,7 +339,7 @@ def _merge_sorted_partition_files(
         while heap:
             partition_id, iterator_id, table = heapq.heappop(heap)
             if writer is None:
-                sink = pa.OSFile(output_path, "wb")
+                sink = _open_intermediate_sink(output_path, intermediate_compression)
                 writer = ipc.new_file(sink, writer_schema)
             writer.write_table(
                 _cast_table_to_schema(table, writer_schema),
@@ -319,8 +360,13 @@ def _merge_sorted_partition_files(
     return output_path
 
 
-def _iter_merged_partition_groups(input_paths: Sequence[str]) -> Iterator[Tuple[int, List[pa.Table]]]:
-    iterators = [iter(_iter_partition_groups(path)) for path in input_paths]
+def _iter_merged_partition_groups(
+    input_paths: Sequence[str], intermediate_compression: Optional[str] = "none"
+) -> Iterator[Tuple[int, List[pa.Table]]]:
+    iterators = [
+        iter(_iter_partition_groups(path, intermediate_compression=intermediate_compression))
+        for path in input_paths
+    ]
     heap: List[Tuple[int, int, pa.Table]] = []
 
     for iterator_id, iterator in enumerate(iterators):
@@ -354,7 +400,7 @@ def _iter_merged_partition_groups(input_paths: Sequence[str]) -> Iterator[Tuple[
 
 def _merge_sorted_partition_files_to_fan_in(
     input_paths: Sequence[str],
-    compression: Optional[str],
+    intermediate_compression: Optional[str],
     temp_dir: str,
     max_fan_in: Optional[int] = None,
 ) -> List[str]:
@@ -389,7 +435,7 @@ def _merge_sorted_partition_files_to_fan_in(
                 for chunk_start in range(0, len(level_paths), fan_in):
                     chunk = level_paths[chunk_start:chunk_start + fan_in]
                     chunk_path = level_dir / f"run_{len(next_paths):06d}{_INTERMEDIATE_SUFFIX}"
-                    merged = _merge_sorted_partition_files(chunk, str(chunk_path), compression)
+                    merged = _merge_sorted_partition_files(chunk, str(chunk_path), intermediate_compression)
                     if merged is not None:
                         next_paths.append(merged)
 
@@ -426,7 +472,7 @@ def _assignment_stage_worker(
     assigner,
     num_reducers: int,
     temp_dir: str,
-    compression: Optional[str],
+    intermediate_compression: Optional[str],
     mapper_count: int,
     collect_stats: bool = False,
     geom_col: str = "geometry",
@@ -476,7 +522,9 @@ def _assignment_stage_worker(
             run_path = split_dir / (
                 f"reducer_{reducer_id:06d}_run_{batch_index:06d}{_INTERMEDIATE_SUFFIX}"
             )
-            _write_intermediate_table(str(run_path), sorted_table)
+            _write_intermediate_table(
+                str(run_path), sorted_table, intermediate_compression=intermediate_compression
+            )
             reducer_run_paths[reducer_id].append(str(run_path))
             rows_assigned += sorted_table.num_rows
 
@@ -487,13 +535,13 @@ def _assignment_stage_worker(
         )
         merge_inputs = _merge_sorted_partition_files_to_fan_in(
             run_paths,
-            compression,
+            intermediate_compression,
             str(split_dir / f"reducer_{reducer_id:06d}_merge_runs"),
         )
         if not merge_inputs:
             merged = None
         else:
-            merged = _merge_sorted_partition_files(merge_inputs, str(merged_path), compression)
+            merged = _merge_sorted_partition_files(merge_inputs, str(merged_path), intermediate_compression)
         if merged is not None:
             intermediate_by_reducer[reducer_id] = merged
             # The per-batch run files are folded into the merged per-reducer
@@ -528,6 +576,7 @@ def _reduce_stage_worker(
     intermediate_paths: Sequence[str],
     config: _WriterPoolConfig,
     temp_dir: str,
+    intermediate_compression: Optional[str] = "none",
 ) -> List[str]:
     written: List[str] = []
     reducer_dir = Path(temp_dir) / f"reducer_{reducer_id:06d}"
@@ -539,7 +588,7 @@ def _reduce_stage_worker(
     while True:
         merge_inputs = _merge_sorted_partition_files_to_fan_in(
             intermediate_paths,
-            config.compression,
+            intermediate_compression,
             str(merge_runs_dir / f"final_attempt_{attempt:02d}"),
             max_fan_in=fan_in,
         )
@@ -547,7 +596,9 @@ def _reduce_stage_worker(
             return written
 
         try:
-            for partition_id, tables in _iter_merged_partition_groups(merge_inputs):
+            for partition_id, tables in _iter_merged_partition_groups(
+                merge_inputs, intermediate_compression=intermediate_compression
+            ):
                 written.append(_finalize_one_tile(partition_id, tables, config))
             return written
         except OSError as error:
@@ -593,6 +644,7 @@ class TwoStageOrchestrator:
         write_workers: Optional[int] = None,
         num_reducers: Optional[int] = None,
         compression: Optional[str] = "zstd",
+        intermediate_compression: Optional[str] = "gzip",
         sort_mode: str = SortMode.ZORDER,
         sort_keys: Optional[Sequence[Union[SortKey, Tuple[str, bool], str]]] = None,
         sfc_bits: int = 16,
@@ -612,6 +664,10 @@ class TwoStageOrchestrator:
         self.write_workers = write_workers if write_workers is not None else parallelism
         self.num_reducers = num_reducers if num_reducers is not None else parallelism
         self.compression = compression
+        # Compression for two-stage shuffle intermediates written by mappers
+        # and re-read/re-merged before the reduce stage's final tile write;
+        # independent of `compression`, which is the final Parquet codec.
+        self.intermediate_compression = _normalize_intermediate_compression(intermediate_compression)
         self.sort_mode = sort_mode
         self.sort_keys = list(sort_keys or [])
         self.sfc_bits = int(sfc_bits)
@@ -709,7 +765,7 @@ class TwoStageOrchestrator:
                     self.assigner,
                     num_reducers,
                     str(temp_root),
-                    self.compression,
+                    self.intermediate_compression,
                     len(splits),
                     self.collect_stats,
                     self.geom_col,
@@ -778,7 +834,14 @@ class TwoStageOrchestrator:
             context="two-stage reduce",
         ) as executor:
             futures = {
-                executor.submit(_reduce_stage_worker, reducer_id, paths, config, str(temp_root)): reducer_id
+                executor.submit(
+                    _reduce_stage_worker,
+                    reducer_id,
+                    paths,
+                    config,
+                    str(temp_root),
+                    self.intermediate_compression,
+                ): reducer_id
                 for reducer_id, paths in intermediate_by_reducer.items()
             }
             for future in as_completed(futures):

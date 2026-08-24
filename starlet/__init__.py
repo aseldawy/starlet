@@ -54,6 +54,7 @@ def tile(
     partition_size: int | None = None,
     sort: str | None = None,
     compression: str | None = None,
+    intermediate_compression: str | None = None,
     sample_cap: int | None = None,
     seed: int | None = None,
     geom_col: str | None = None,
@@ -93,6 +94,10 @@ def tile(
         ``"columns"``, or ``"none"``.
     compression : str
         Parquet compression codec (default ``"zstd"``).
+    intermediate_compression : str
+        Compression for two-stage shuffle intermediate files written by
+        mappers before the reduce stage merges them: ``"gzip"`` or
+        ``"none"`` (default ``"gzip"``).
     sample_cap : int | None
         Reservoir sampling cap for centroid sampling.
     seed : int
@@ -149,6 +154,9 @@ def tile(
     partition_size = parse_size_value(resolve_command_value("tile", "partition_size", partition_size))
     sort = str(resolve_command_value("tile", "sort", sort))
     compression = str(resolve_command_value("tile", "compression", compression))
+    intermediate_compression = str(
+        resolve_command_value("tile", "intermediate_compression", intermediate_compression)
+    )
     sample_cap = resolve_command_value("tile", "sample_cap", sample_cap)
     seed = int(seed if seed is not None else 42)
     geom_col = str(geom_col or "geometry")
@@ -243,6 +251,7 @@ def tile(
         outdir=tiles_dir,
         geom_col=geom_col,
         compression=compression,
+        intermediate_compression=intermediate_compression,
         sort_mode=sort_mode,
         sfc_bits=sfc_bits,
         parallelism=parallelism,
@@ -482,6 +491,17 @@ def build(
                 "build",
                 "compression",
                 tile_kwargs.get("compression"),
+                fallback_sections=("tile",),
+            )
+        ),
+    )
+    tile_kwargs.setdefault(
+        "intermediate_compression",
+        str(
+            resolve_command_value(
+                "build",
+                "intermediate_compression",
+                tile_kwargs.get("intermediate_compression"),
                 fallback_sections=("tile",),
             )
         ),

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -256,7 +257,22 @@ def _read_config_file(path: Path) -> dict[str, Any]:
         loaded = tomllib.load(handle)
     if not isinstance(loaded, dict):
         raise ValueError(f"Invalid Starlet config file: {path}")
-    return loaded
+    return _expand_env(loaded)
+
+
+def _expand_env(value: Any) -> Any:
+    """Expand ``~`` and environment variables in strings from a config file.
+
+    Applied only to values parsed out of the TOML file, not to values
+    passed on the command line (the shell already expands those).
+    """
+    if isinstance(value, str):
+        return os.path.expandvars(os.path.expanduser(value))
+    if isinstance(value, dict):
+        return {key: _expand_env(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_env(item) for item in value]
+    return value
 
 
 def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> None:

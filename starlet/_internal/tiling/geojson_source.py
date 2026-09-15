@@ -11,6 +11,7 @@ from numbers import Number
 from pathlib import Path
 import random
 import re
+import sys
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
@@ -230,11 +231,21 @@ class GeoJSONSource(DataSource):
             )
             for idx, split in enumerate(splits)
         ]
+
+        total = len(jobs)
+        completed = 0
+
+        def report_progress() -> None:
+            nonlocal completed
+            completed += 1
+            percent = 100 * completed // total
+            print(f"\r{percent}% ({completed}/{total})", end="", flush=True, file=sys.stderr)
+
         if workers == 1:
-            parts = [
-                _read_geojson_partition_spatial_sample(*job)
-                for job in jobs
-            ]
+            parts = []
+            for job in jobs:
+                parts.append(_read_geojson_partition_spatial_sample(*job))
+                report_progress()
         else:
             with create_process_executor(
                 max_workers=workers,
@@ -248,6 +259,10 @@ class GeoJSONSource(DataSource):
                 parts = []
                 for future in as_completed(futures):
                     parts.append(future.result())
+                    report_progress()
+
+        if total:
+            print(file=sys.stderr)
 
         sample = _combine_spatial_samples(parts)
         properties_schema = _unify_tabular_schemas(

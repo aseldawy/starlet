@@ -32,15 +32,12 @@ from starlet._internal.tiling.datasource import (
     _split_sample_cap,
     _source_files,
 )
-from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader
+from starlet._internal.tiling.partition_reader import GeoJSONPartitionReader, OPEN_BRACE
 
 logger = logging.getLogger(__name__)
 
-# Decode only a bounded, representative set for property inference. Geometry
-# eligibility and representative coordinates are still scanned for every Feature.
-_GEOJSON_SCHEMA_RESERVOIR_SIZE = 10_000
-_GEOJSON_SCHEMA_RESERVOIR_SIZE_PER_SPLIT = 1_024
 _GEOMETRY_MEMBER = re.compile(rb'"geometry"\s*:\s*')
+_PROPERTIES_MEMBER = re.compile(rb'"properties"\s*:\s*')
 _COORDINATES_MEMBER = re.compile(rb'"coordinates"\s*:\s*\[')
 _JSON_NUMBER = re.compile(
     rb'-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?'
@@ -405,6 +402,101 @@ def _geojson_property_arrow_type(property_type: str) -> pa.DataType:
     return pa.null()
 
 
+_TYPE_WIDENING_CHAIN = (_PROPERTY_INT, _PROPERTY_FLOAT, _PROPERTY_STRING, _PROPERTY_LARGE_STRING)
+_TYPE_WIDENING_RANK = {property_type: rank for rank, property_type in enumerate(_TYPE_WIDENING_CHAIN)}
+
+
+def _upgrade_sampled_property_type(
+    name: str,
+    current: str,
+    incoming: str,
+    *,
+    context: str,
+) -> str:
+    """
+    Upgrade a sampled property's inferred type to accommodate a new observed
+    value. Compatible widenings (int -> float -> string -> large_string) are
+    applied silently. Anything else (e.g. bool vs int, or a scalar vs a map)
+    is incompatible: log a warning and keep the first type seen.
+    """
+    if current == incoming:
+        return current
+    if current == _PROPERTY_NULL:
+        return incoming
+    if incoming == _PROPERTY_NULL:
+        return current
+    if current in _TYPE_WIDENING_RANK and incoming in _TYPE_WIDENING_RANK:
+        return current if _TYPE_WIDENING_RANK[current] >= _TYPE_WIDENING_RANK[incoming] else incoming
+
+    logger.warning(
+        "GeoJSON property %r has incompatible types %r and %r (%s); keeping %r",
+        name, current, incoming, context, current,
+    )
+    return current
+
+
+def _update_sampled_property_types(
+    property_types: dict[str, str],
+    property_display_names: dict[str, str],
+    property_order: list[str],
+    properties: dict[str, Any],
+    *,
+    context: str,
+) -> None:
+    """Like `_update_geojson_property_row`, but case-insensitive by attribute name."""
+    for name, value in properties.items():
+        key = str(name).casefold()
+        value_type = _geojson_property_value_type(value)
+        current_type = property_types.get(key)
+        if current_type is None:
+            property_order.append(key)
+            property_display_names[key] = str(name)
+            property_types[key] = value_type
+        else:
+            property_types[key] = _upgrade_sampled_property_type(
+                property_display_names[key],
+                current_type,
+                value_type,
+                context=context,
+            )
+
+
+def _sampled_property_schema(
+    property_types: dict[str, str],
+    property_order: list[str],
+    property_display_names: dict[str, str],
+) -> pa.Schema:
+    return pa.schema(
+        pa.field(
+            property_display_names[key],
+            _geojson_property_arrow_type(property_types[key]),
+            nullable=True,
+        )
+        for key in property_order
+    )
+
+
+def _extract_geojson_properties(feature_json: bytes) -> dict[str, Any]:
+    """
+    Parse only a Feature's "properties" object, skipping the rest of the
+    Feature -- notably its geometry, which can be far larger (e.g. a complex
+    polygon) than the properties it comes with.
+    """
+    match = _PROPERTIES_MEMBER.search(feature_json)
+    if match is None:
+        return {}
+
+    start = match.end()
+    if start >= len(feature_json) or feature_json[start] != OPEN_BRACE:
+        return {}
+
+    try:
+        end = GeoJSONPartitionReader._find_json_object_end(feature_json, start)
+        return json.loads(feature_json[start:end])
+    except ValueError:
+        return {}
+
+
 def _read_geojson_partition_spatial_sample(
     split_index: int,
     path: str,
@@ -419,16 +511,13 @@ def _read_geojson_partition_spatial_sample(
     n_seen = 0
     n_batches = 0
     property_types: dict[str, str] = {}
+    property_display_names: dict[str, str] = {}
     property_order: list[str] = []
+    context = _describe_geojson_split(path, offset, length)
 
     requested_cap = None if sample_cap is None else max(0, int(sample_cap))
-    reservoir_cap = max(
-        requested_cap or 0,
-        _GEOJSON_SCHEMA_RESERVOIR_SIZE_PER_SPLIT,
-    )
-    schema_slots = min(reservoir_cap, _GEOJSON_SCHEMA_RESERVOIR_SIZE)
-    schema_prefix: list[bytes] = []
-    reservoir: list[tuple[float, float, bytes | None]] = []
+    reservoir_cap = max(requested_cap, 1) if requested_cap is not None else 0
+    reservoir: list[tuple[float, float]] = []
     reservoir_weight = 0.0
     reservoir_skip = 0
 
@@ -441,8 +530,14 @@ def _read_geojson_partition_spatial_sample(
             decode=False,
         ):
             for feature_json in batch:
-                if len(schema_prefix) < _GEOJSON_SCHEMA_RESERVOIR_SIZE_PER_SPLIT:
-                    schema_prefix.append(feature_json)
+                _update_sampled_property_types(
+                    property_types,
+                    property_display_names,
+                    property_order,
+                    _extract_geojson_properties(feature_json),
+                    context=context,
+                )
+
                 coordinate = _first_geojson_coordinate(feature_json)
                 if coordinate is None:
                     continue
@@ -453,12 +548,8 @@ def _read_geojson_partition_spatial_sample(
                 if requested_cap is None:
                     x_sample.append(x)
                     y_sample.append(y)
-
-                if len(reservoir) < reservoir_cap:
-                    slot = len(reservoir)
-                    reservoir.append(
-                        (x, y, feature_json if slot < schema_slots else None)
-                    )
+                elif len(reservoir) < reservoir_cap:
+                    reservoir.append((x, y))
                     if len(reservoir) == reservoir_cap:
                         reservoir_weight = _initial_reservoir_weight(
                             rng,
@@ -472,11 +563,7 @@ def _read_geojson_partition_spatial_sample(
                     reservoir_skip -= 1
                 else:
                     slot = rng.randrange(reservoir_cap)
-                    reservoir[slot] = (
-                        x,
-                        y,
-                        feature_json if slot < schema_slots else None,
-                    )
+                    reservoir[slot] = (x, y)
                     reservoir_weight *= _initial_reservoir_weight(
                         rng,
                         reservoir_cap,
@@ -490,7 +577,7 @@ def _read_geojson_partition_spatial_sample(
     except Exception as exc:
         raise ValueError(
             "GeoJSON spatial sampling failed for "
-            f"split_index={split_index} ({_describe_geojson_split(path, offset, length)})"
+            f"split_index={split_index} ({context})"
         ) from exc
 
     if requested_cap is not None:
@@ -502,50 +589,30 @@ def _read_geojson_partition_spatial_sample(
         x_sample = [entry[0] for entry in selected]
         y_sample = [entry[1] for entry in selected]
 
-    _update_geojson_property_types_from_features(
-        property_types,
-        property_order,
-        schema_prefix,
-    )
-    _update_geojson_property_types_from_features(
-        property_types,
-        property_order,
-        (
-            feature_json
-            for _, _, feature_json in reservoir[:schema_slots]
-            if feature_json is not None
-        ),
-    )
-
     return _spatial_sample_from_state(
         x_sample=x_sample,
         y_sample=y_sample,
         n_seen=n_seen,
         batches_read=n_batches,
-        schema=_geojson_property_schema(property_types, property_order),
+        schema=_sampled_property_schema(property_types, property_order, property_display_names),
     )
 
 
 def _first_geojson_coordinate(feature_json: bytes) -> tuple[float, float] | None:
-    """Return one representative XY pair without materializing the geometry."""
+    """
+    Return one representative XY pair by locating "coordinates" and reading
+    its first two numbers directly -- no json.loads, and no byte scan across
+    the geometry beyond finding these two small matches.
+    """
     geometry = _GEOMETRY_MEMBER.search(feature_json)
-    while geometry is not None:
-        value_start = geometry.end()
-        if feature_json.find(b'"geometry"', value_start) != -1:
-            feature = json.loads(feature_json)
-            return next(
-                _iter_geojson_geometry_xy(feature.get("geometry")),
-                None,
-            )
-        if feature_json.startswith(b"null", value_start):
-            return None
-        if value_start < len(feature_json) and feature_json[value_start] == ord("{"):
-            break
-        geometry = _GEOMETRY_MEMBER.search(feature_json, value_start)
     if geometry is None:
         return None
 
-    coordinates = _COORDINATES_MEMBER.search(feature_json, geometry.end())
+    value_start = geometry.end()
+    if value_start >= len(feature_json) or feature_json[value_start] != OPEN_BRACE:
+        return None  # null geometry, or not an object
+
+    coordinates = _COORDINATES_MEMBER.search(feature_json, value_start)
     if coordinates is None:
         return None
     x_match = _JSON_NUMBER.search(feature_json, coordinates.end())
@@ -555,20 +622,6 @@ def _first_geojson_coordinate(feature_json: bytes) -> tuple[float, float] | None
     if y_match is None:
         return None
     return float(x_match.group()), float(y_match.group())
-
-
-def _update_geojson_property_types_from_features(
-    property_types: dict[str, str],
-    property_order: list[str],
-    features: Iterable[bytes],
-) -> None:
-    for feature_json in features:
-        feature = json.loads(feature_json)
-        _update_geojson_property_row(
-            property_types,
-            property_order,
-            feature.get("properties") or {},
-        )
 
 
 def _initial_reservoir_weight(rng: random.Random, capacity: int) -> float:

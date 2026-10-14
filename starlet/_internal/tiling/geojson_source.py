@@ -7,17 +7,22 @@ import bz2
 import json
 import logging
 import math
+import multiprocessing
 from numbers import Number
+import os
 from pathlib import Path
+import queue
 import random
 import re
 import sys
+import traceback
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 
+from starlet._internal._parallel import pool_context
 from starlet._internal.executor import create_process_executor
 from starlet._internal.tiling.datasource import (
     DataSource,
@@ -290,6 +295,214 @@ def _read_geojson_spatial_sample(
         workers=geojson_workers,
         src_crs=src_crs,
     )
+
+
+def convert_geojson_to_geoparquet(
+    path: str,
+    output_dir: str,
+    *,
+    workers: Optional[int] = None,
+    schema: Optional[pa.Schema] = None,
+    src_crs: str = "EPSG:4326",
+    row_group_rows: int = 128 * 1024,
+    compression: str = "zstd",
+) -> List[str]:
+    """
+    Convert a GeoJSON file (or directory of files) to GeoParquet using all
+    available processors.
+
+    One long-lived worker process is started per processor. Workers pull
+    splits from a shared queue (so fast workers take more splits) and each
+    worker appends everything it converts to its own output file, so the
+    result is at most `workers` files named part-NNNNN.parquet in
+    `output_dir`, regardless of how many splits the input has.
+
+    All output files share one schema. If `schema` is not given it is
+    discovered with a parallel properties-only pre-scan (the same one
+    read_spatial_sample does), which is much cheaper than the conversion.
+
+    Returns the paths of the files written.
+    """
+    source = GeoJSONSource(path, src_crs=src_crs)
+    splits = source.create_splits()
+    if workers is None:
+        workers = _available_processors()
+    workers = max(1, min(int(workers), len(splits)))
+
+    if schema is None:
+        logger.info("Discovering GeoJSON schema for %s", path)
+        schema = GeoJSONSource.read_spatial_sample(
+            path, sample_cap=1, seed=0, workers=workers, src_crs=src_crs,
+        ).schema
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    output_paths = [str(output / f"part-{index:05d}.parquet") for index in range(workers)]
+    writer_args = (path, src_crs, schema, row_group_rows, compression)
+
+    logger.info(
+        "Converting %s to GeoParquet: %d splits over %d worker processes -> %s",
+        path, len(splits), workers, output,
+    )
+
+    total = len(splits)
+    completed = 0
+
+    def report_progress() -> None:
+        nonlocal completed
+        completed += 1
+        percent = 100 * completed // total
+        print(f"\r{percent}% ({completed}/{total})", end="", flush=True, file=sys.stderr)
+
+    if workers == 1:
+        written = _convert_geojson_splits_to_parquet(
+            *writer_args, output_paths[0], iter(splits), lambda _rows: report_progress(),
+        )
+        if total:
+            print(file=sys.stderr)
+        return [output_paths[0]] if written else []
+
+    ctx = pool_context() or multiprocessing.get_context()
+    split_queue = ctx.Queue()
+    event_queue = ctx.Queue()
+    for split in splits:
+        split_queue.put(split)
+    for _ in range(workers):
+        split_queue.put(None)
+
+    processes = [
+        ctx.Process(
+            target=_geojson_to_geoparquet_worker,
+            args=(index, *writer_args, output_paths[index], split_queue, event_queue),
+            daemon=True,
+        )
+        for index in range(workers)
+    ]
+    for process in processes:
+        process.start()
+
+    written_paths: List[str] = []
+    finished: set[int] = set()
+    try:
+        while len(finished) < workers:
+            try:
+                kind, index, payload = event_queue.get(timeout=1.0)
+            except queue.Empty:
+                for index, process in enumerate(processes):
+                    if index not in finished and process.exitcode not in (None, 0):
+                        raise RuntimeError(
+                            f"GeoParquet conversion worker {index} died "
+                            f"with exit code {process.exitcode}"
+                        )
+                continue
+
+            if kind == "split":
+                report_progress()
+            elif kind == "done":
+                finished.add(index)
+                if payload:
+                    written_paths.append(output_paths[index])
+            else:
+                raise RuntimeError(
+                    f"GeoParquet conversion worker {index} failed:\n{payload}"
+                )
+    finally:
+        if total:
+            print(file=sys.stderr)
+        for process in processes:
+            if process.is_alive() and len(finished) < workers:
+                process.terminate()
+            process.join()
+
+    return sorted(written_paths)
+
+
+def _available_processors() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def _geojson_to_geoparquet_worker(
+    worker_index: int,
+    path: str,
+    src_crs: str,
+    schema: pa.Schema,
+    row_group_rows: int,
+    compression: str,
+    output_path: str,
+    split_queue,
+    event_queue,
+) -> None:
+    """Process entry point: convert splits from `split_queue` until a None sentinel."""
+    try:
+        splits = iter(split_queue.get, None)
+        written = _convert_geojson_splits_to_parquet(
+            path,
+            src_crs,
+            schema,
+            row_group_rows,
+            compression,
+            output_path,
+            splits,
+            lambda rows: event_queue.put(("split", worker_index, rows)),
+        )
+        event_queue.put(("done", worker_index, written))
+    except BaseException:
+        event_queue.put(("error", worker_index, traceback.format_exc()))
+
+
+def _convert_geojson_splits_to_parquet(
+    path: str,
+    src_crs: str,
+    schema: pa.Schema,
+    row_group_rows: int,
+    compression: str,
+    output_path: str,
+    splits: Iterable[GeoJSONSplit],
+    on_split_done,
+) -> bool:
+    """
+    Append every split in `splits` to one Parquet file at `output_path`.
+
+    Tables are buffered up to `row_group_rows` so row groups are not as small
+    as GeoJSONSource's per-batch tables. The file is only created once there
+    is something to write; returns whether it was.
+    """
+    import pyarrow.parquet as pq
+
+    source = GeoJSONSource(path, src_crs=src_crs)
+    source.set_schema(schema)
+
+    writer = None
+    pending: List[pa.Table] = []
+    pending_rows = 0
+
+    def flush() -> None:
+        nonlocal writer, pending, pending_rows
+        if not pending:
+            return
+        if writer is None:
+            writer = pq.ParquetWriter(output_path, schema, compression=compression)
+        writer.write_table(pa.concat_tables(pending), row_group_size=row_group_rows)
+        pending = []
+        pending_rows = 0
+
+    try:
+        for split in splits:
+            split_rows = 0
+            for table in source.iter_tables(split):
+                pending.append(table)
+                pending_rows += table.num_rows
+                split_rows += table.num_rows
+                if pending_rows >= row_group_rows:
+                    flush()
+            on_split_done(split_rows)
+        flush()
+    finally:
+        if writer is not None:
+            writer.close()
+    return writer is not None
 
 
 def _iter_geojson_geometry_xy(geometry):
